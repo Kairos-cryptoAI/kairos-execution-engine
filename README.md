@@ -28,4 +28,4 @@ KAIROS_DRY_RUN=true python -m kairos_execution
 Consumes `kairos.risk.validated_order` + `kairos.system.control`; emits `kairos.execution.report`.
 
 ---
-Part of the [Kairos](https://github.com/TheLitis/kairos) system. MIT licensed.
+Part of the [Kairos](https://github.com/Kairos-cryptoAI/kairos) system. MIT licensed.
