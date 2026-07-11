@@ -81,7 +81,7 @@ class EvedexAdapter(ExchangeAdapter):
         if intent.order_type is OrderType.LIMIT and notional < MIN_NOTIONAL_USD:
             return self._report(intent, OrderStatus.REJECTED, msg="below $5 min notional")
 
-        order_id = str(uuid.uuid4())
+        order_id = intent.client_order_id or str(uuid.uuid4())
         if intent.order_type is OrderType.MARKET:
             message = {
                 "id": order_id, "instrument": intent.symbol, "side": intent.side.value,
@@ -130,8 +130,10 @@ class EvedexAdapter(ExchangeAdapter):
         self, intent: OrderIntent, status: OrderStatus, *, exch_id=None, client_id=None, msg=""
     ) -> ExecutionReport:
         return ExecutionReport(
-            source="execution-engine", client_order_id=client_id or "", exchange_order_id=exch_id,
-            symbol=intent.symbol, side=intent.side, status=status, message=msg,
+            source="execution-engine", client_order_id=client_id or intent.client_order_id or "unknown",
+            exchange_order_id=exch_id, exchange=self.name,
+            symbol=intent.symbol, side=intent.side, status=status,
+            requested_qty=intent.quantity, remaining_qty=intent.quantity, message=msg,
         )
 
     async def close(self) -> None:  # pragma: no cover

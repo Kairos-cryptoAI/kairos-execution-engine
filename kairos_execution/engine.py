@@ -7,6 +7,7 @@ from kairos_core.logging import get_logger
 
 from .adapters.base import ExchangeAdapter
 from .reason_router import Action, action_for
+from .state_machine import client_order_id
 from .trailing import TrailingStopManager
 
 log = get_logger("execution")
@@ -39,25 +40,33 @@ class ExecutionEngine:
             await self.adapter.set_leverage(order.intent.symbol, max(1.0, order.intent.leverage / 2))
             return None
 
-        # OPEN: place the order, then immediately arm a server-side trailing stop.
-        intent = order.intent
-        if side is not None:
-            intent = intent.model_copy(update={"side": side})
+        # OPEN: assign idempotency identity before the first exchange call.
+        intent = order.intent.model_copy(update={
+            "client_order_id": order.intent.client_order_id
+            or client_order_id(order.message_id, self.adapter.name),
+            **({"side": side} if side is not None else {}),
+        })
         report = await self.adapter.place_order(intent)
-        # Market orders carry no intent.price -> fall back to the exchange fill price
-        # so the position is NEVER left without a protective stop (spec, Layer 6).
+        # Market orders carry no intent.price -> fall back to the exchange fill price.
+        # If protection cannot be established, compensate by closing immediately.
         entry = report.avg_price or intent.price or 0.0
-        if entry > 0:
-            ts = self.trailing.open(intent.symbol, intent.side, entry)
-            stop_side = "SELL" if intent.side is OrderSide.BUY else "BUY"
+        if entry <= 0:
+            log.error("execution.unprotected_position", symbol=intent.symbol, detail="no entry price")
+            await self.adapter.close_position(intent.symbol)
+            return report.model_copy(update={
+                "message": "entry submitted but no protection price; emergency close requested",
+                "retryable": False,
+            })
+        ts = self.trailing.open(intent.symbol, intent.side, entry)
+        stop_side = "SELL" if intent.side is OrderSide.BUY else "BUY"
+        try:
             await self.adapter.set_trailing_stop(intent.symbol, ts.stop_price, stop_side)
-            log.info("execution.armed_trailing", symbol=intent.symbol, stop=round(ts.stop_price, 2))
-        else:
-            log.error(
-                "execution.unprotected_position",
-                symbol=intent.symbol,
-                detail="no entry price (intent.price and report.avg_price empty); trailing stop NOT armed",
-            )
+        except Exception:
+            self.trailing.close(intent.symbol)
+            log.exception("execution.protection_failed_emergency_close", symbol=intent.symbol)
+            await self.adapter.close_position(intent.symbol)
+            raise
+        log.info("execution.armed_trailing", symbol=intent.symbol, stop=round(ts.stop_price, 2))
         log.info("execution.placed", symbol=intent.symbol, side=intent.side.value, status=report.status.value)
         return report
 

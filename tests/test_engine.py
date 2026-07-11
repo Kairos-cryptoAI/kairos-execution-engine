@@ -9,11 +9,12 @@ from kairos_core.enums import OrderStatus
 
 class FakeAdapter(ExchangeAdapter):
     name = "fake"
-    def __init__(self, fill_price=0.0):
+    def __init__(self, fill_price=0.0, fail_stop=False):
         self.placed = []
         self.trailing = []
         self.closed = []
         self.fill_price = fill_price
+        self.fail_stop = fail_stop
     async def place_order(self, intent):
         self.placed.append(intent)
         return ExecutionReport(source="x", client_order_id="1", symbol=intent.symbol,
@@ -25,6 +26,8 @@ class FakeAdapter(ExchangeAdapter):
                                side=OrderSide.SELL, status=OrderStatus.NEW)
     async def set_leverage(self, symbol, leverage): ...
     async def set_trailing_stop(self, symbol, stop_price, side):
+        if self.fail_stop:
+            raise RuntimeError("stop rejected")
         self.trailing.append((symbol, stop_price, side))
 
 
@@ -53,6 +56,33 @@ def test_open_places_order_and_arms_trailing_stop():
     assert len(a.trailing) == 1  # protective stop armed
     sym, stop, side = a.trailing[0]
     assert side == "SELL" and stop < 65000
+
+
+def test_same_validated_order_gets_same_exchange_client_id():
+    adapter = FakeAdapter()
+    engine = ExecutionEngine(adapter)
+    order = _order()
+    asyncio.run(engine.handle(order))
+    first_id = adapter.placed[0].client_order_id
+    asyncio.run(engine.handle(order))
+    assert adapter.placed[1].client_order_id == first_id
+    assert first_id.startswith("krs-")
+
+
+def test_stop_failure_requests_emergency_close():
+    adapter = FakeAdapter(fail_stop=True)
+    with __import__("pytest").raises(RuntimeError, match="stop rejected"):
+        asyncio.run(ExecutionEngine(adapter).handle(_order()))
+    assert adapter.closed == ["BTCUSD"]
+
+
+def test_missing_entry_price_requests_emergency_close():
+    adapter = FakeAdapter(fill_price=0)
+    report = asyncio.run(ExecutionEngine(adapter).handle(
+        _order(price=None, order_type=OrderType.MARKET)
+    ))
+    assert adapter.closed == ["BTCUSD"]
+    assert "emergency close" in report.message
 
 
 def test_unapproved_order_is_ignored():
