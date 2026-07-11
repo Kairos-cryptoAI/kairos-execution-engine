@@ -21,7 +21,9 @@ class ExecutionService:
         self.settings = settings or ExecSettings()
         self.bus = build_bus(self.settings)
         self.engine = ExecutionEngine(
-            build_adapter(self.settings), default_trail_pct=self.settings.default_trail_pct
+            build_adapter(self.settings),
+            default_trail_pct=self.settings.default_trail_pct,
+            allowed_symbols=set(self.settings.trading_symbols),
         )
 
     async def _consume_control(self) -> None:

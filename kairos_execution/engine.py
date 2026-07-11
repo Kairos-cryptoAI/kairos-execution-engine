@@ -14,12 +14,23 @@ log = get_logger("execution")
 
 
 class ExecutionEngine:
-    def __init__(self, adapter: ExchangeAdapter, *, default_trail_pct: float = 0.01) -> None:
+    def __init__(
+        self,
+        adapter: ExchangeAdapter,
+        *,
+        default_trail_pct: float = 0.01,
+        allowed_symbols: set[str] | None = None,
+    ) -> None:
         self.adapter = adapter
         self.trailing = TrailingStopManager(default_trail_pct)
+        self.allowed_symbols = {symbol.upper() for symbol in (allowed_symbols or set())}
         self.system_mode = SystemMode.NORMAL
 
     async def handle(self, order: ValidatedOrder) -> ExecutionReport | None:
+        symbol = order.intent.symbol.upper()
+        if symbol not in self.allowed_symbols:
+            log.error("execution.symbol_rejected", symbol=symbol)
+            return None
         if not order.approved:
             log.info("execution.skip_unapproved", reason=order.reason_code.value)
             return None
