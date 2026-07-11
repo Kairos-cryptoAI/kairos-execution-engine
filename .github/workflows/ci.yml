@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install package with dev deps
+        run: pip install -e ".[dev]"
+      - name: Lint (Ruff)
+        run: ruff check .
+      - name: Type check (mypy)
+        run: mypy $(find . -maxdepth 1 -type d -name 'kairos_*' | head -1) || true
+      - name: Security scan (Bandit)
+        run: bandit -q -r $(find . -maxdepth 1 -type d -name 'kairos_*' | head -1) -x tests || true
+      - name: Test (pytest)
+        run: pytest -q --tb=short
+      - name: Build check
+        run: pip install build && python -m build && pip install dist/*.whl && python -c "import $(ls -d kairos_* | head -1 | tr -d /)"
