@@ -44,12 +44,20 @@ class ExecutionEngine:
         if side is not None:
             intent = intent.model_copy(update={"side": side})
         report = await self.adapter.place_order(intent)
-        entry = intent.price or 0.0
+        # Market orders carry no intent.price -> fall back to the exchange fill price
+        # so the position is NEVER left without a protective stop (spec, Layer 6).
+        entry = report.avg_price or intent.price or 0.0
         if entry > 0:
             ts = self.trailing.open(intent.symbol, intent.side, entry)
             stop_side = "SELL" if intent.side is OrderSide.BUY else "BUY"
             await self.adapter.set_trailing_stop(intent.symbol, ts.stop_price, stop_side)
             log.info("execution.armed_trailing", symbol=intent.symbol, stop=round(ts.stop_price, 2))
+        else:
+            log.error(
+                "execution.unprotected_position",
+                symbol=intent.symbol,
+                detail="no entry price available (intent.price and report.avg_price empty); trailing stop NOT armed",
+            )
         log.info("execution.placed", symbol=intent.symbol, side=intent.side.value, status=report.status.value)
         return report
 

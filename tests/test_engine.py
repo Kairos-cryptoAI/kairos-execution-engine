@@ -9,14 +9,15 @@ from kairos_core.enums import OrderStatus
 
 class FakeAdapter(ExchangeAdapter):
     name = "fake"
-    def __init__(self):
+    def __init__(self, fill_price=0.0):
         self.placed = []
         self.trailing = []
         self.closed = []
+        self.fill_price = fill_price
     async def place_order(self, intent):
         self.placed.append(intent)
         return ExecutionReport(source="x", client_order_id="1", symbol=intent.symbol,
-                               side=intent.side, status=OrderStatus.NEW)
+                               side=intent.side, status=OrderStatus.NEW, avg_price=self.fill_price)
     async def cancel_order(self, symbol, order_id): ...
     async def close_position(self, symbol):
         self.closed.append(symbol)
@@ -26,10 +27,21 @@ class FakeAdapter(ExchangeAdapter):
         self.trailing.append((symbol, stop_price, side))
 
 
-def _order(reason=ReasonCode.ENTER_LONG_TREND, approved=True):
-    intent = OrderIntent(source="risk", symbol="BTCUSD", side=OrderSide.BUY, order_type=OrderType.LIMIT,
-                         quantity=0.1, price=65000, reason_code=reason)
+def _order(reason=ReasonCode.ENTER_LONG_TREND, approved=True, price=65000, order_type=OrderType.LIMIT):
+    intent = OrderIntent(source="risk", symbol="BTCUSD", side=OrderSide.BUY, order_type=order_type,
+                         quantity=0.1, price=price, reason_code=reason)
     return ValidatedOrder(source="risk", intent=intent, approved=approved, reason_code=reason)
+
+
+def test_market_order_arms_trailing_stop_from_fill_price():
+    # Market orders have no intent.price; the stop must be armed off the exchange fill.
+    a = FakeAdapter(fill_price=64500.0)
+    eng = ExecutionEngine(a)
+    asyncio.run(eng.handle(_order(price=None, order_type=OrderType.MARKET)))
+    assert len(a.placed) == 1
+    assert len(a.trailing) == 1  # protective stop MUST still be armed
+    _sym, stop, side = a.trailing[0]
+    assert side == "SELL" and stop < 64500.0
 
 
 def test_open_places_order_and_arms_trailing_stop():
