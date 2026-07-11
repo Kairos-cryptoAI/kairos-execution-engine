@@ -1,4 +1,3 @@
-from decimal import Decimal
 from kairos_execution.crypto import to_eth_number, EIP712_SCHEMAS, build_domain
 
 

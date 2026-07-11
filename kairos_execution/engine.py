@@ -56,7 +56,7 @@ class ExecutionEngine:
             log.error(
                 "execution.unprotected_position",
                 symbol=intent.symbol,
-                detail="no entry price available (intent.price and report.avg_price empty); trailing stop NOT armed",
+                detail="no entry price (intent.price and report.avg_price empty); trailing stop NOT armed",
             )
         log.info("execution.placed", symbol=intent.symbol, side=intent.side.value, status=report.status.value)
         return report

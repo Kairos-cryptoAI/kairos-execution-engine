@@ -10,13 +10,18 @@ def build_adapter(settings: ExecSettings) -> ExchangeAdapter:
         from .adapters.evedex import EvedexAdapter
         from .crypto import EthAccountSigner
 
-        signer = EthAccountSigner(settings.evedex_private_key) if settings.evedex_private_key and not settings.dry_run             else _NullSigner()
-        return EvedexAdapter(exchange_base_url=settings.evedex_exchange_url, signer=signer,
-                             chain_id=settings.evedex_chain_id, jwt=settings.evedex_jwt, dry_run=settings.dry_run)
+        use_real_signer = bool(settings.evedex_private_key) and not settings.dry_run
+        signer = EthAccountSigner(settings.evedex_private_key) if use_real_signer else _NullSigner()
+        return EvedexAdapter(
+            exchange_base_url=settings.evedex_exchange_url, signer=signer,
+            chain_id=settings.evedex_chain_id, jwt=settings.evedex_jwt, dry_run=settings.dry_run,
+        )
     if settings.exchange == "ccxt":
         from .adapters.ccxt_adapter import CCXTAdapter
-        return CCXTAdapter(settings.ccxt_exchange_id, api_key=settings.ccxt_api_key,
-                           secret=settings.ccxt_secret, sandbox=settings.ccxt_sandbox, dry_run=settings.dry_run)
+        return CCXTAdapter(
+            settings.ccxt_exchange_id, api_key=settings.ccxt_api_key,
+            secret=settings.ccxt_secret, sandbox=settings.ccxt_sandbox, dry_run=settings.dry_run,
+        )
     raise ValueError(f"Unknown exchange: {settings.exchange!r}")
 
 

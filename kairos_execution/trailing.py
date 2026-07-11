@@ -43,7 +43,9 @@ class TrailingStopManager:
         self.default_trail_pct = default_trail_pct
         self._stops: Dict[str, TrailingStop] = {}
 
-    def open(self, symbol: str, side: OrderSide, entry_price: float, trail_pct: float | None = None) -> TrailingStop:
+    def open(
+        self, symbol: str, side: OrderSide, entry_price: float, trail_pct: float | None = None
+    ) -> TrailingStop:
         ts = TrailingStop(side=side, trail_pct=trail_pct or self.default_trail_pct, anchor=entry_price)
         self._stops[symbol] = ts
         return ts

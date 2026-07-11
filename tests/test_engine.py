@@ -21,7 +21,8 @@ class FakeAdapter(ExchangeAdapter):
     async def cancel_order(self, symbol, order_id): ...
     async def close_position(self, symbol):
         self.closed.append(symbol)
-        return ExecutionReport(source="x", client_order_id="2", symbol=symbol, side=OrderSide.SELL, status=OrderStatus.NEW)
+        return ExecutionReport(source="x", client_order_id="2", symbol=symbol,
+                               side=OrderSide.SELL, status=OrderStatus.NEW)
     async def set_leverage(self, symbol, leverage): ...
     async def set_trailing_stop(self, symbol, stop_price, side):
         self.trailing.append((symbol, stop_price, side))
@@ -45,7 +46,8 @@ def test_market_order_arms_trailing_stop_from_fill_price():
 
 
 def test_open_places_order_and_arms_trailing_stop():
-    a = FakeAdapter(); eng = ExecutionEngine(a)
+    a = FakeAdapter()
+    eng = ExecutionEngine(a)
     asyncio.run(eng.handle(_order()))
     assert len(a.placed) == 1
     assert len(a.trailing) == 1  # protective stop armed
@@ -54,13 +56,15 @@ def test_open_places_order_and_arms_trailing_stop():
 
 
 def test_unapproved_order_is_ignored():
-    a = FakeAdapter(); eng = ExecutionEngine(a)
+    a = FakeAdapter()
+    eng = ExecutionEngine(a)
     asyncio.run(eng.handle(_order(approved=False)))
     assert not a.placed
 
 
 def test_local_quant_mode_blocks_new_entries():
-    a = FakeAdapter(); eng = ExecutionEngine(a)
+    a = FakeAdapter()
+    eng = ExecutionEngine(a)
     eng.set_mode(SystemMode.LOCAL_QUANT_MODE)
     asyncio.run(eng.handle(_order()))
     assert not a.placed  # opening blocked while LLM detached

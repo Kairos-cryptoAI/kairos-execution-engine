@@ -97,7 +97,8 @@ class EvedexAdapter(ExchangeAdapter):
             signature = self._sign("New limit order", message)
             resp = await self._post("/api/v2/order/limit", {**message, "signature": signature})
 
-        status = OrderStatus(resp.get("status", "NEW")) if resp.get("status") in OrderStatus.__members__             else OrderStatus.NEW
+        raw_status = resp.get("status")
+        status = OrderStatus(raw_status) if raw_status in OrderStatus.__members__ else OrderStatus.NEW
         return self._report(intent, status, exch_id=resp.get("id"), client_id=order_id)
 
     async def close_position(self, symbol: str) -> ExecutionReport:  # pragma: no cover - thin
@@ -125,7 +126,9 @@ class EvedexAdapter(ExchangeAdapter):
         async with session.delete(f"{self.base}/api/order/{order_id}") as resp:
             resp.raise_for_status()
 
-    def _report(self, intent: OrderIntent, status: OrderStatus, *, exch_id=None, client_id=None, msg="") -> ExecutionReport:
+    def _report(
+        self, intent: OrderIntent, status: OrderStatus, *, exch_id=None, client_id=None, msg=""
+    ) -> ExecutionReport:
         return ExecutionReport(
             source="execution-engine", client_order_id=client_id or "", exchange_order_id=exch_id,
             symbol=intent.symbol, side=intent.side, status=status, message=msg,
