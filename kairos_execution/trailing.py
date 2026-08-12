@@ -4,10 +4,10 @@ A trailing stop follows the best price reached since entry by ``trail_pct``. The
 engine pushes the computed stop to the exchange as a TP/SL order so the position
 stays protected even if the bot disconnects (spec, Layer 6).
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
 
 from kairos_core.enums import OrderSide
 
@@ -16,10 +16,10 @@ from kairos_core.enums import OrderSide
 class TrailingStop:
     side: OrderSide
     trail_pct: float
-    anchor: float            # best price seen so far (high for longs, low for shorts)
+    anchor: float  # best price seen so far (high for longs, low for shorts)
 
     def update(self, price: float) -> float:
-        if self.side is OrderSide.BUY:      # long: trail below the highest price
+        if self.side is OrderSide.BUY:  # long: trail below the highest price
             self.anchor = max(self.anchor, price)
             return self.anchor * (1 - self.trail_pct)
         self.anchor = min(self.anchor, price)  # short: trail above the lowest price
@@ -41,7 +41,7 @@ class TrailingStop:
 class TrailingStopManager:
     def __init__(self, default_trail_pct: float = 0.01) -> None:
         self.default_trail_pct = default_trail_pct
-        self._stops: Dict[str, TrailingStop] = {}
+        self._stops: dict[str, TrailingStop] = {}
 
     def open(
         self, symbol: str, side: OrderSide, entry_price: float, trail_pct: float | None = None
