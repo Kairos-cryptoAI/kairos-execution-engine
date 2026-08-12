@@ -1,4 +1,5 @@
 """Exchange adapter interface — the engine only ever talks to this."""
+
 from __future__ import annotations
 
 import abc
@@ -16,7 +17,7 @@ class ExchangeAdapter(abc.ABC):
     async def cancel_order(self, symbol: str, order_id: str) -> None: ...
 
     @abc.abstractmethod
-    async def close_position(self, symbol: str) -> ExecutionReport: ...
+    async def close_position(self, symbol: str, *, client_order_id: str | None = None) -> ExecutionReport: ...
 
     @abc.abstractmethod
     async def set_leverage(self, symbol: str, leverage: float) -> None: ...
