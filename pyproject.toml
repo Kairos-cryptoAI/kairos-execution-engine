@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.28,<2"]
 build-backend = "hatchling.build"
 
 [project]
@@ -11,18 +11,27 @@ license = { text = "MIT" }
 requires-python = ">=3.11"
 authors = [{ name = "TheLitis" }]
 dependencies = [
-    "kairos-core>=0.1.0",
-    "aiohttp>=3.9",
-    "redis>=5.0",
-    "structlog>=24.1",
-    "pydantic>=2.6",
-    "pydantic-settings>=2.2"
+    "kairos-core>=0.2,<0.3",
+    "aiohttp>=3.9,<4",
+    "redis>=6.4,<9",
+    "structlog>=24.1,<27",
+    "pydantic>=2.6,<3",
+    "pydantic-settings>=2.2,<3",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.4", "mypy>=1.10"]
-evedex = ["eth-account>=0.11"]
-ccxt = ["ccxt>=4.3"]
+evedex = ["eth-account>=0.11,<1"]
+ccxt = ["ccxt>=4.3,<5"]
+
+[dependency-groups]
+dev = [
+    "bandit>=1.8,<2",
+    "build>=1.2,<2",
+    "mypy>=1.10,<3",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.16,<0.17",
+]
 
 [project.scripts]
 kairos-execution-engine = "kairos_execution.service:main"
@@ -30,11 +39,26 @@ kairos-execution-engine = "kairos_execution.service:main"
 [tool.hatch.build.targets.wheel]
 packages = ["kairos_execution"]
 
+[tool.uv]
+required-version = "==0.12.3"
+
+[tool.uv.sources]
+kairos-core = { git = "https://github.com/Kairos-cryptoAI/kairos-core.git", rev = "c2b9ba192521f9843b245e1eae8a501d408a6bfa" }
+
 [tool.ruff]
 line-length = 110
 target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+plugins = ["pydantic.mypy"]
+python_version = "3.11"
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = ["ccxt", "ccxt.*", "eth_account", "eth_account.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
