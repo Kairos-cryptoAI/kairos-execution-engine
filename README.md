@@ -16,6 +16,29 @@ deterministically submits orders with protective trailing stops.
 Both adapters are optional installation extras. The service is in `dry_run` mode by
 default and makes no real exchange calls unless that setting is explicitly disabled.
 
+## Account reconciliation
+
+Execution is the authoritative producer of `kairos.account.snapshot`. It publishes a
+snapshot immediately at startup, every `KAIROS_ACCOUNT_SNAPSHOT_INTERVAL_S` seconds,
+and after an exchange action. Risk Manager remains fail-closed until it receives a
+fresh `reconciled=true` snapshot.
+
+For EVEDEX, each refresh reads `/api/user/me`, `/api/market/available-balance`,
+`/api/position`, `/api/order/opened`, and `/api/tpsl`. Position and open-order totals
+must match the available-balance response before the snapshot is trusted. A margin
+call, malformed response, mismatch, or failed request produces an explicit
+`reconciled=false` snapshot that revokes the previous account view. The service uses
+the negative unrealized PnL reported by EVEDEX conservatively when calculating equity.
+
+CCXT refreshes unified balance, positions, and open orders concurrently and records
+protective stop IDs. In `dry_run`, a clearly labelled synthetic account is published;
+it cannot cause a live order because the adapter does not make exchange calls.
+
+Intraday PnL and peak equity are tracked for the lifetime of the process. Restarting
+Execution resets the intraday baseline, so production supervision should avoid
+unnecessary restarts and should treat durable accounting history as a follow-up before
+unattended capital is enabled.
+
 ## Prerequisites
 
 - [uv 0.12.3](https://docs.astral.sh/uv/)
@@ -80,9 +103,11 @@ dependencies.
 ## Message lifecycle
 
 The service consumes `kairos.risk.validated_order` and `kairos.system.control`, and emits
-`kairos.execution.report`. A validated order is acknowledged only after handling succeeds
-and any execution report is published. Transient validation, exchange, or publish failures
-remain pending for at-least-once redelivery.
+`kairos.execution.report` plus `kairos.account.snapshot`. A validated order is
+acknowledged only after handling succeeds and any execution report is published.
+Transient validation, exchange, or publish failures remain pending for at-least-once
+redelivery. CLOSE requests carry the exact risk-validated quantity into the exchange
+signature; emergency closes first retrieve the live position size.
 
 When `LOCAL_QUANT_MODE` is active, new positions are refused and only protective actions
 are allowed.
