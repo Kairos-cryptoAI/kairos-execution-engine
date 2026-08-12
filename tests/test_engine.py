@@ -30,8 +30,15 @@ class FakeAdapter(ExchangeAdapter):
         )
 
     async def cancel_order(self, symbol, order_id): ...
-    async def close_position(self, symbol, *, client_order_id=None):
-        self.closed.append((symbol, client_order_id))
+    async def close_position(
+        self,
+        symbol,
+        *,
+        quantity=None,
+        side=None,
+        client_order_id=None,
+    ):
+        self.closed.append((symbol, client_order_id, quantity, side))
         return ExecutionReport(
             source="x", client_order_id="2", symbol=symbol, side=OrderSide.SELL, status=OrderStatus.NEW
         )
@@ -93,6 +100,17 @@ def test_same_validated_order_gets_same_exchange_client_id():
     asyncio.run(engine.handle(order))
     assert adapter.placed[1].client_order_id == first_id
     assert first_id.startswith("krs-")
+
+
+def test_close_passes_exact_risk_validated_quantity_and_side():
+    adapter = FakeAdapter()
+    order = _order(reason=ReasonCode.CLOSE_POSITION)
+
+    asyncio.run(_engine(adapter).handle(order))
+
+    assert adapter.closed[0][0] == "BTCUSDT"
+    assert adapter.closed[0][2] == 0.1
+    assert adapter.closed[0][3] is OrderSide.BUY
 
 
 def test_stop_failure_requests_emergency_close():

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from kairos_core.config import CoreSettings
+from pydantic import Field
 
 
 class ExecSettings(CoreSettings):
@@ -10,6 +11,9 @@ class ExecSettings(CoreSettings):
 
     exchange: str = "evedex"  # evedex | ccxt
     dry_run: bool = True  # never sends real orders unless explicitly disabled
+    account_id: str = "primary"
+    account_snapshot_interval_s: float = Field(default=15.0, gt=0)
+    dry_run_equity_usd: float = Field(default=10_000.0, gt=0)
 
     # EVEDEX
     evedex_exchange_url: str = "https://exchange-api.evedex.com"

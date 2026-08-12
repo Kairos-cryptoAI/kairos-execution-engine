@@ -23,6 +23,7 @@ def build_adapter(settings: ExecSettings) -> ExchangeAdapter:
             chain_id=settings.evedex_chain_id,
             jwt=settings.evedex_jwt,
             dry_run=settings.dry_run,
+            dry_run_equity_usd=settings.dry_run_equity_usd,
         )
     if settings.exchange == "ccxt":
         from .adapters.ccxt_adapter import CCXTAdapter
@@ -35,6 +36,7 @@ def build_adapter(settings: ExecSettings) -> ExchangeAdapter:
             secret=settings.ccxt_secret,
             sandbox=settings.ccxt_sandbox,
             dry_run=settings.dry_run,
+            dry_run_equity_usd=settings.dry_run_equity_usd,
         )
     raise ValueError(f"Unknown exchange: {settings.exchange!r}")
 

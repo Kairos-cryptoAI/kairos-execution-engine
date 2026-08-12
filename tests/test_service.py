@@ -1,9 +1,10 @@
 import asyncio
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
 from kairos_core.bus.base import BusEnvelope
-from kairos_core.contracts import ExecutionReport, OrderIntent, ValidatedOrder
+from kairos_core.contracts import AccountSnapshot, ExecutionReport, OrderIntent, ValidatedOrder
 from kairos_core.enums import OrderSide, OrderStatus, OrderType, ReasonCode, SystemMode
 from kairos_core.topics import Topics
 
@@ -11,14 +12,37 @@ from kairos_execution.service import ExecutionService
 
 
 class FakeAdapter:
-    def __init__(self, *, close_error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        close_error: Exception | None = None,
+        snapshot: AccountSnapshot | None = None,
+        snapshot_error: Exception | None = None,
+    ) -> None:
         self.closed = False
         self.close_error = close_error
+        self.snapshot = snapshot
+        self.snapshot_error = snapshot_error
 
     async def close(self) -> None:
         self.closed = True
         if self.close_error is not None:
             raise self.close_error
+
+    async def fetch_account_snapshot(self, *, account_id, peak_equity_usd):
+        if self.snapshot_error is not None:
+            raise self.snapshot_error
+        if self.snapshot is not None:
+            return self.snapshot
+        return AccountSnapshot(
+            source="test-execution",
+            exchange="fake",
+            account_id=account_id,
+            equity_usd=10_000,
+            available_balance_usd=10_000,
+            peak_equity_usd=max(10_000, peak_equity_usd),
+            reconciled=True,
+        )
 
 
 class FakeEngine:
@@ -53,6 +77,7 @@ class FakeBus:
         self.envelopes = envelopes or {}
         self.publish_error = publish_error
         self.events: list[str] = []
+        self.published: list[tuple[str, object]] = []
         self.closed = False
 
     async def subscribe(self, topic, *, group=None, consumer=None):
@@ -63,6 +88,7 @@ class FakeBus:
         self.events.append("publish")
         if self.publish_error is not None:
             raise self.publish_error
+        self.published.append((topic, message))
         return "report-1"
 
     async def ack(self, topic, envelope, *, group=None) -> None:
@@ -94,9 +120,16 @@ def _service(bus: FakeBus, engine: FakeEngine) -> ExecutionService:
         service_name="test-execution",
         exchange="fake",
         dry_run=True,
+        account_id="primary",
+        account_snapshot_interval_s=3600,
+        dry_run_equity_usd=10_000,
     )
     service.bus = bus
     service.engine = engine
+    service._account_refresh = asyncio.Queue(maxsize=1)
+    service._peak_equity_usd = 10_000
+    service._session_day = None
+    service._day_start_equity_usd = None
     return service
 
 
@@ -126,6 +159,7 @@ async def test_order_is_acked_only_after_handle_and_publish_succeed():
     await service._consume_orders()
 
     assert events == ["handle", "publish", "ack"]
+    assert service._account_refresh.qsize() == 1
 
 
 @pytest.mark.asyncio
@@ -226,3 +260,72 @@ async def test_bus_is_closed_even_if_adapter_close_fails():
 
     assert engine.adapter.closed is True
     assert bus.closed is True
+
+
+@pytest.mark.asyncio
+async def test_reconciled_account_snapshot_is_published():
+    bus = FakeBus()
+    snapshot = AccountSnapshot(
+        source="test-execution",
+        exchange="fake",
+        account_id="primary",
+        equity_usd=10_250,
+        available_balance_usd=8_000,
+        peak_equity_usd=10_250,
+        reconciled=True,
+        captured_at=datetime(2026, 8, 12, 12, tzinfo=UTC),
+    )
+    engine = FakeEngine([])
+    engine.adapter = FakeAdapter(snapshot=snapshot)
+    service = _service(bus, engine)
+
+    await service._publish_account_snapshot()
+
+    topic, published = bus.published[0]
+    assert topic == Topics.ACCOUNT_SNAPSHOT
+    assert published.reconciled is True
+    assert published.equity_usd == 10_250
+    assert published.daily_pnl_pct == 0
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_error_publishes_explicit_failure_snapshot():
+    bus = FakeBus()
+    engine = FakeEngine([])
+    engine.adapter = FakeAdapter(snapshot_error=RuntimeError("positions unavailable"))
+    service = _service(bus, engine)
+
+    await service._publish_account_snapshot()
+
+    topic, published = bus.published[0]
+    assert topic == Topics.ACCOUNT_SNAPSHOT
+    assert published.reconciled is False
+    assert published.available_balance_usd == 0
+    assert published.reconciliation_detail == "RuntimeError: positions unavailable"
+
+
+def test_session_accounting_tracks_peak_and_intraday_drawdown():
+    service = _service(FakeBus(), FakeEngine([]))
+    start = AccountSnapshot(
+        source="test-execution",
+        exchange="fake",
+        account_id="primary",
+        equity_usd=10_000,
+        available_balance_usd=10_000,
+        peak_equity_usd=10_000,
+        captured_at=datetime(2026, 8, 12, 9, tzinfo=UTC),
+        reconciled=True,
+    )
+    lower = start.model_copy(
+        update={
+            "equity_usd": 9_500,
+            "available_balance_usd": 9_500,
+            "captured_at": datetime(2026, 8, 12, 10, tzinfo=UTC),
+        }
+    )
+
+    service._apply_session_accounting(start)
+    result = service._apply_session_accounting(lower)
+
+    assert result.peak_equity_usd == 10_000
+    assert result.daily_pnl_pct == -5

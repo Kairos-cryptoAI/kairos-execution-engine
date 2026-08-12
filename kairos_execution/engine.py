@@ -54,6 +54,8 @@ class ExecutionEngine:
             )
             return await self.adapter.close_position(
                 order.intent.symbol,
+                quantity=order.intent.quantity,
+                side=order.intent.side,
                 client_order_id=close_id,
             )
         if action is Action.REDUCE:
