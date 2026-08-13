@@ -1,29 +1,48 @@
 import asyncio
-from kairos_core.contracts import OrderIntent, ValidatedOrder
-from kairos_core.enums import OrderSide, OrderType, ReasonCode, SystemMode
-from kairos_execution.engine import ExecutionEngine
+
+from kairos_core.contracts import ExecutionReport, OrderIntent, ValidatedOrder
+from kairos_core.enums import OrderSide, OrderStatus, OrderType, ReasonCode, SystemMode
+
 from kairos_execution.adapters.base import ExchangeAdapter
-from kairos_core.contracts import ExecutionReport
-from kairos_core.enums import OrderStatus
+from kairos_execution.engine import ExecutionEngine
 
 
 class FakeAdapter(ExchangeAdapter):
     name = "fake"
-    def __init__(self, fill_price=0.0, fail_stop=False):
+
+    def __init__(self, fill_price=0.0, fail_stop=False, rejected=False):
         self.placed = []
         self.trailing = []
         self.closed = []
         self.fill_price = fill_price
         self.fail_stop = fail_stop
+        self.rejected = rejected
+
     async def place_order(self, intent):
         self.placed.append(intent)
-        return ExecutionReport(source="x", client_order_id="1", symbol=intent.symbol,
-                               side=intent.side, status=OrderStatus.NEW, avg_price=self.fill_price)
+        return ExecutionReport(
+            source="x",
+            client_order_id="1",
+            symbol=intent.symbol,
+            side=intent.side,
+            status=OrderStatus.REJECTED if self.rejected else OrderStatus.NEW,
+            avg_price=self.fill_price,
+        )
+
     async def cancel_order(self, symbol, order_id): ...
-    async def close_position(self, symbol):
-        self.closed.append(symbol)
-        return ExecutionReport(source="x", client_order_id="2", symbol=symbol,
-                               side=OrderSide.SELL, status=OrderStatus.NEW)
+    async def close_position(
+        self,
+        symbol,
+        *,
+        quantity=None,
+        side=None,
+        client_order_id=None,
+    ):
+        self.closed.append((symbol, client_order_id, quantity, side))
+        return ExecutionReport(
+            source="x", client_order_id="2", symbol=symbol, side=OrderSide.SELL, status=OrderStatus.NEW
+        )
+
     async def set_leverage(self, symbol, leverage): ...
     async def set_trailing_stop(self, symbol, stop_price, side):
         if self.fail_stop:
@@ -32,8 +51,15 @@ class FakeAdapter(ExchangeAdapter):
 
 
 def _order(reason=ReasonCode.ENTER_LONG_TREND, approved=True, price=65000, order_type=OrderType.LIMIT):
-    intent = OrderIntent(source="risk", symbol="BTCUSDT", side=OrderSide.BUY, order_type=order_type,
-                         quantity=0.1, price=price, reason_code=reason)
+    intent = OrderIntent(
+        source="risk",
+        symbol="BTCUSDT",
+        side=OrderSide.BUY,
+        order_type=order_type,
+        quantity=0.1,
+        price=price,
+        reason_code=reason,
+    )
     return ValidatedOrder(source="risk", intent=intent, approved=approved, reason_code=reason)
 
 
@@ -76,19 +102,30 @@ def test_same_validated_order_gets_same_exchange_client_id():
     assert first_id.startswith("krs-")
 
 
+def test_close_passes_exact_risk_validated_quantity_and_side():
+    adapter = FakeAdapter()
+    order = _order(reason=ReasonCode.CLOSE_POSITION)
+
+    asyncio.run(_engine(adapter).handle(order))
+
+    assert adapter.closed[0][0] == "BTCUSDT"
+    assert adapter.closed[0][2] == 0.1
+    assert adapter.closed[0][3] is OrderSide.BUY
+
+
 def test_stop_failure_requests_emergency_close():
     adapter = FakeAdapter(fail_stop=True)
     with __import__("pytest").raises(RuntimeError, match="stop rejected"):
         asyncio.run(_engine(adapter).handle(_order()))
-    assert adapter.closed == ["BTCUSDT"]
+    assert adapter.closed[0][0] == "BTCUSDT"
+    assert adapter.closed[0][1].startswith("krs-")
 
 
 def test_missing_entry_price_requests_emergency_close():
     adapter = FakeAdapter(fill_price=0)
-    report = asyncio.run(_engine(adapter).handle(
-        _order(price=None, order_type=OrderType.MARKET)
-    ))
-    assert adapter.closed == ["BTCUSDT"]
+    report = asyncio.run(_engine(adapter).handle(_order(price=None, order_type=OrderType.MARKET)))
+    assert adapter.closed[0][0] == "BTCUSDT"
+    assert adapter.closed[0][1].startswith("krs-")
     assert "emergency close" in report.message
 
 
@@ -97,6 +134,15 @@ def test_unapproved_order_is_ignored():
     eng = _engine(a)
     asyncio.run(eng.handle(_order(approved=False)))
     assert not a.placed
+
+
+def test_exchange_rejection_does_not_request_emergency_close():
+    adapter = FakeAdapter(rejected=True)
+
+    report = asyncio.run(_engine(adapter).handle(_order()))
+
+    assert report.status is OrderStatus.REJECTED
+    assert adapter.closed == []
 
 
 def test_unknown_symbol_is_rejected_before_adapter_call():

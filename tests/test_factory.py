@@ -1,4 +1,5 @@
 """Fail-closed tests for exchange adapter construction."""
+
 import pytest
 
 from kairos_execution.config import ExecSettings
@@ -12,9 +13,7 @@ def test_live_evedex_requires_private_key():
 
 
 def test_live_evedex_requires_jwt():
-    settings = ExecSettings(
-        exchange="evedex", dry_run=False, evedex_private_key="0x" + "11" * 32
-    )
+    settings = ExecSettings(exchange="evedex", dry_run=False, evedex_private_key="0x" + "11" * 32)
     with pytest.raises(ValueError, match="EVEDEX_JWT"):
         build_adapter(settings)
 

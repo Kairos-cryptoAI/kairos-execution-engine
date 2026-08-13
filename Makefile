@@ -1,11 +1,36 @@
-.PHONY: install lint test format run
+UV ?= uv
+
+.PHONY: install install-all lock format lint typecheck security test check build run
+
 install:
-	pip install -e ".[dev]"
+	$(UV) sync --locked
+
+install-all:
+	$(UV) sync --locked --all-extras
+
+lock:
+	$(UV) lock
+
 format:
-	ruff format kairos_execution tests
+	$(UV) run --locked ruff format kairos_execution tests
+
 lint:
-	ruff check kairos_execution tests
+	$(UV) run --locked ruff check .
+	$(UV) run --locked ruff format --check .
+
+typecheck:
+	$(UV) run --locked mypy kairos_execution
+
+security:
+	$(UV) run --locked bandit -q -r kairos_execution -x tests
+
 test:
-	pytest -q
+	$(UV) run --locked pytest -q --tb=short
+
+check: lint typecheck security test build
+
+build:
+	$(UV) build --no-sources
+
 run:
-	python -m kairos_execution
+	$(UV) run --locked python -m kairos_execution

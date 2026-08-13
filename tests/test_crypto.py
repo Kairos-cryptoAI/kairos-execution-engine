@@ -1,4 +1,4 @@
-from kairos_execution.crypto import to_eth_number, EIP712_SCHEMAS, build_domain
+from kairos_execution.crypto import EIP712_SCHEMAS, build_domain, to_eth_number
 
 
 def test_normalization_half_up_8dp():

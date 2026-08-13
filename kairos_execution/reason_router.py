@@ -1,12 +1,13 @@
 """Translate a validated reason_code into a concrete execution action."""
+
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 
 from kairos_core.enums import OrderSide, ReasonCode
 
 
-class Action(str, Enum):
+class Action(StrEnum):
     OPEN = "OPEN"
     CLOSE = "CLOSE"
     REDUCE = "REDUCE"
