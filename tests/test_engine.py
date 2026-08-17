@@ -193,6 +193,24 @@ def test_open_places_order_and_arms_trailing_stop():
     assert parent == a.placed[0].client_order_id
 
 
+def test_unresolved_execution_journal_blocks_new_entries_but_preserves_close_path():
+    adapter = FakeAdapter(position_flat=(True,))
+    engine = _engine(adapter)
+    engine.set_recovery_blockers(["effect-1: unresolved"])
+
+    with pytest.raises(ExecutionSafetyError, match="journal recovery is incomplete"):
+        asyncio.run(engine.handle(_order()))
+    assert adapter.placed == []
+    assert engine.recovery_blocked is True
+
+    close_report = asyncio.run(engine.handle(_order(reason=ReasonCode.CLOSE_POSITION)))
+    assert close_report is not None
+    assert "position already flat" in close_report.message
+
+    engine.set_recovery_blockers([])
+    assert engine.recovery_blocked is False
+
+
 def test_explicit_protective_stop_takes_priority_over_default_distance():
     adapter = FakeAdapter(fill_price=65_000.0)
 

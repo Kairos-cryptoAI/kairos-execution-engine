@@ -15,6 +15,7 @@ class ExecSettings(CoreSettings):
     account_snapshot_interval_s: float = Field(default=15.0, gt=0)
     dry_run_equity_usd: float = Field(default=10_000.0, gt=0)
     idempotency_cache_size: int = Field(default=10_000, ge=1)
+    journal_recovery_interval_s: float = Field(default=15.0, gt=0)
 
     # EVEDEX
     evedex_exchange_url: str = "https://exchange-api.evedex.com"

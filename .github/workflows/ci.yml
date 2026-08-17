@@ -52,7 +52,7 @@ jobs:
       - name: Security scan
         run: uv run --locked bandit -q -r kairos_execution -x tests
       - name: Test
-        run: uv run --locked pytest -q --tb=short
+        run: uv run --locked pytest -q -m "not integration" --tb=short
       - name: Build source and wheel distributions
         run: uv build --no-sources
 
@@ -74,4 +74,32 @@ jobs:
       - name: Import optional adapter dependencies
         run: uv run --locked --all-extras python -c "import ccxt.async_support; import eth_account"
       - name: Test with all extras
-        run: uv run --locked --all-extras pytest -q --tb=short
+        run: uv run --locked --all-extras pytest -q -m "not integration" --tb=short
+
+  execution-journal-integration:
+    name: Execution journal / TimescaleDB
+    runs-on: ubuntu-latest
+    services:
+      timescaledb:
+        image: timescale/timescaledb:2.28.3-pg16
+        env:
+          POSTGRES_USER: kairos
+          POSTGRES_PASSWORD: kairos_test
+          POSTGRES_DB: kairos
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U kairos -d kairos"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      KAIROS_PERSISTENCE_DATABASE_URL: postgresql://kairos:kairos_test@localhost:5432/kairos
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          python-version: "3.11"
+      - run: uv sync --python 3.11 --locked --dev --extra evedex
+      - run: uv run --python 3.11 --locked --dev --extra evedex pytest -q -m integration

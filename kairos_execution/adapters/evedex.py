@@ -40,6 +40,7 @@ MIN_NOTIONAL_USD = 5.0
 class EvedexAdapter(ExchangeAdapter):
     name = "evedex"
     exchange_order_id_matches_client_order_id = True
+    protective_stop_lookup_authoritative = True
 
     def __init__(
         self,
@@ -275,6 +276,56 @@ class EvedexAdapter(ExchangeAdapter):
                 parent_order_id=parent_order_id,
                 stop_price=stop_price,
             )
+        return ProtectiveStopAck(exchange_order_id=str(server_id))
+
+    async def find_protective_stop(
+        self,
+        symbol: str,
+        stop_price: float,
+        position_side: OrderSide,
+        parent_order_id: str,
+    ) -> ProtectiveStopAck | None:
+        if not is_evedex_client_order_id(parent_order_id):
+            raise ValueError("EVEDEX protective-stop lookup requires an authoritative parent order ID")
+        if self.dry_run:
+            return None
+        records = self._as_list(await self._get("/api/tpsl"))
+        matches: list[dict[str, Any]] = []
+        for record in records:
+            if str(record.get("status", "")).casefold() not in {"waitorder", "active"}:
+                continue
+            echoed_parent = record.get("order")
+            if str(echoed_parent or "") == parent_order_id:
+                self._validate_protective_stop_record(
+                    record,
+                    symbol=symbol,
+                    position_side=position_side,
+                    parent_order_id=parent_order_id,
+                    stop_price=stop_price,
+                )
+                matches.append(record)
+                continue
+            if echoed_parent is None:
+                try:
+                    self._validate_protective_stop_record(
+                        record,
+                        symbol=symbol,
+                        position_side=position_side,
+                        parent_order_id=parent_order_id,
+                        stop_price=stop_price,
+                    )
+                except ValueError:
+                    continue
+                raise ValueError(
+                    "EVEDEX live protective stop matches geometry but lacks its parent-order link"
+                )
+        if len(matches) > 1:
+            raise ValueError("EVEDEX returned duplicate live protective stops for one parent order")
+        if not matches:
+            return None
+        server_id = matches[0].get("id")
+        if server_id is None or not str(server_id).strip():
+            raise ValueError("EVEDEX reconciled protective stop has no ID")
         return ProtectiveStopAck(exchange_order_id=str(server_id))
 
     async def cancel_order_by_client_id(

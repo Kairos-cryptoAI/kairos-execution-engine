@@ -45,7 +45,7 @@ required-version = "==0.12.3"
 
 [tool.uv.sources]
 kairos-core = { git = "https://github.com/Kairos-cryptoAI/kairos-core.git", rev = "c2b9ba192521f9843b245e1eae8a501d408a6bfa" }
-kairos-persistence = { git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git", rev = "5709e7b8a1f9a11bc1727c2c23e39cdcd683f909" }
+kairos-persistence = { git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git", rev = "0722ddbf4e0d894394176fb652e4540fc914c8a4" }
 
 [tool.ruff]
 line-length = 110
@@ -65,3 +65,4 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = ["integration: requires a real TimescaleDB instance"]

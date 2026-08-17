@@ -10,11 +10,12 @@ from kairos_core.contracts import AccountSnapshot, ValidatedOrder
 from kairos_core.enums import SystemMode
 from kairos_core.logging import configure_logging, get_logger
 from kairos_core.topics import Topics
-from kairos_persistence import DurableMessageBus
+from kairos_persistence import DurableMessageBus, ExecutionJournalRepository
 
 from .config import ExecSettings
 from .engine import ExecutionEngine, ExecutionSafetyError
 from .factory import build_adapter
+from .journaled_adapter import JournaledExchangeAdapter
 
 log = get_logger("execution")
 
@@ -38,6 +39,7 @@ class ExecutionService:
         self._peak_equity_usd = self.settings.dry_run_equity_usd if self.settings.dry_run else 0.0
         self._session_day: date | None = None
         self._day_start_equity_usd: float | None = None
+        self._journaled_adapter: JournaledExchangeAdapter | None = None
 
     async def _consume_control(self) -> None:
         async for env in self.bus.subscribe(Topics.SYSTEM_CONTROL, group="execution", consumer="ctrl"):
@@ -103,6 +105,15 @@ class ExecutionService:
                 peak_equity_usd=self._peak_equity_usd,
             )
             snapshot = self._apply_session_accounting(snapshot)
+            if getattr(self.engine, "recovery_blocked", False):
+                snapshot = snapshot.model_copy(
+                    update={
+                        "reconciled": False,
+                        "reconciliation_detail": (
+                            "account snapshot read succeeded, but execution journal recovery is incomplete"
+                        ),
+                    }
+                )
         except Exception as exc:
             log.exception("execution.account_reconciliation_failed")
             snapshot = AccountSnapshot(
@@ -135,6 +146,32 @@ class ExecutionService:
             except TimeoutError:
                 pass
 
+    async def _initialize_execution_journal(self) -> None:
+        if not isinstance(self.bus, DurableMessageBus):
+            return
+        await self.bus.start()
+        journal = ExecutionJournalRepository(self.bus.database.pool)
+        wrapped = JournaledExchangeAdapter(self.engine.adapter, journal)
+        self.engine.adapter = wrapped
+        self._journaled_adapter = wrapped
+        blockers = await wrapped.recover_pending()
+        self.engine.set_recovery_blockers(blockers)
+
+    async def _recover_execution_journal(self) -> None:
+        journaled_adapter = getattr(self, "_journaled_adapter", None)
+        if journaled_adapter is None:
+            return
+        while True:
+            await asyncio.sleep(getattr(self.settings, "journal_recovery_interval_s", 15.0))
+            try:
+                blockers = await journaled_adapter.recover_pending()
+            except Exception as exc:
+                blockers = [f"journal recovery scan failed: {type(exc).__name__}: {exc}"]
+                log.exception("execution.journal_recovery_failed")
+            self.engine.set_recovery_blockers(blockers)
+            if blockers:
+                self._request_account_refresh()
+
     async def close(self) -> None:
         """Release both resources even if the first close operation fails."""
         try:
@@ -148,10 +185,12 @@ class ExecutionService:
                 self.settings.log_level, json_logs=self.settings.log_json, service=self.settings.service_name
             )
             log.info("execution.start", exchange=self.settings.exchange, dry_run=self.settings.dry_run)
+            await self._initialize_execution_journal()
             async with asyncio.TaskGroup() as tasks:
                 tasks.create_task(self._consume_orders(), name="validated-orders")
                 tasks.create_task(self._consume_control(), name="system-control")
                 tasks.create_task(self._produce_account_snapshots(), name="account-snapshots")
+                tasks.create_task(self._recover_execution_journal(), name="execution-journal-recovery")
         finally:
             await self.close()
 

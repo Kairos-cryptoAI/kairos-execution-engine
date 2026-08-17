@@ -77,20 +77,25 @@ Execution resets the intraday baseline, so production supervision should avoid
 unnecessary restarts and should treat durable accounting history as a follow-up before
 unattended capital is enabled.
 
-Duplicate source deliveries are suppressed by a bounded in-memory fingerprint cache,
-and entry/close requests use deterministic venue client IDs. This protects ordinary
-at-least-once redelivery and publish-after-execute retries within one process. The cache
-is not durable: after a restart, correctness still depends on venue client-ID semantics
-and the timeliness of open-order/position views. CCXT has no portable cross-venue query
-for historical orders by client ID, so a create timeout followed by eventually
-consistent empty views stays pending rather than being declared successful.
+Every exchange mutation is recorded in the TimescaleDB execution journal before the
+venue call. Confirmed responses are replayed from the journal, while unresolved effects
+are recovered under a database advisory lock after a two-minute in-flight grace period.
+Until recovery is complete, account snapshots are forced to `reconciled=false`, new risk
+is blocked, and reduce-only close processing remains available. The bounded in-memory
+fingerprint cache remains only a fast path for duplicate deliveries; it is no longer the
+durability boundary.
 
-EVEDEX links each create request to the parent through signed `order` and Kairos verifies
-the returned server ID through `GET /api/tpsl`, but the public contract does not promise
-that repeating the same parent link deduplicates TP/SL creation. A crash after creation
-but before the response/reconciliation is recorded can therefore still create a second
-stop after restart. Durable execution journaling and a venue-supported historical
-identity query/deduplication guarantee remain prerequisites for unattended capital.
+For an unresolved EVEDEX TP/SL request, recovery first reads `GET /api/tpsl` and accepts
+only one live, parent-linked stop with exact symbol, side, type, full-position semantics,
+and trigger price. Exact absence permits one retry while the position is still open;
+ambiguous or duplicate records fail closed. Adapters without an authoritative
+parent-linked lookup never retry an unresolved protective stop for an open position.
+
+The remaining venue boundary is deliberately conservative. CCXT has no portable
+historical client-ID or parent-linked TP/SL lookup, and an inactive entry with a non-flat
+position cannot be classified automatically. Such effects stay blocked for operator
+reconciliation instead of being guessed successful. Intraday PnL baseline restoration
+also still depends on durable accounting history outside this journal.
 
 ## Prerequisites
 

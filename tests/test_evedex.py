@@ -454,6 +454,65 @@ async def test_live_protective_stop_requires_returned_id_in_get_snapshot():
 
 
 @pytest.mark.asyncio
+async def test_find_protective_stop_requires_one_exact_live_parent_linked_record():
+    adapter = EvedexAdapter(
+        exchange_base_url="https://example.invalid",
+        signer=RecordingSigner(),
+        chain_id=1,
+        dry_run=False,
+        clock=lambda: NOW,
+    )
+    record = {
+        "id": "server-stop-42",
+        "instrument": "BTCUSDT",
+        "type": "stop-loss",
+        "side": "BUY",
+        "quantity": "0",
+        "price": "64000",
+        "status": "active",
+        "order": PARENT_ORDER_ID,
+    }
+    adapter._get = AsyncMock(return_value={"list": [record]})
+
+    ack = await adapter.find_protective_stop("BTCUSDT", 64_000.0, OrderSide.BUY, PARENT_ORDER_ID)
+    assert ack is not None
+    assert ack.exchange_order_id == "server-stop-42"
+
+    adapter._get = AsyncMock(return_value={"list": [record, {**record, "id": "duplicate"}]})
+    with pytest.raises(ValueError, match="duplicate live protective stops"):
+        await adapter.find_protective_stop("BTCUSDT", 64_000.0, OrderSide.BUY, PARENT_ORDER_ID)
+
+
+@pytest.mark.asyncio
+async def test_find_protective_stop_rejects_ambiguous_unlinked_live_geometry():
+    adapter = EvedexAdapter(
+        exchange_base_url="https://example.invalid",
+        signer=RecordingSigner(),
+        chain_id=1,
+        dry_run=False,
+        clock=lambda: NOW,
+    )
+    adapter._get = AsyncMock(
+        return_value={
+            "list": [
+                {
+                    "id": "unlinked-stop",
+                    "instrument": "BTCUSDT",
+                    "type": "stop-loss",
+                    "side": "BUY",
+                    "quantity": "0",
+                    "price": "64000",
+                    "status": "active",
+                }
+            ]
+        }
+    )
+
+    with pytest.raises(ValueError, match="lacks its parent-order link"):
+        await adapter.find_protective_stop("BTCUSDT", 64_000.0, OrderSide.BUY, PARENT_ORDER_ID)
+
+
+@pytest.mark.asyncio
 async def test_full_account_snapshot_is_cross_checked_and_normalized():
     adapter = EvedexAdapter(
         exchange_base_url="https://example.invalid",

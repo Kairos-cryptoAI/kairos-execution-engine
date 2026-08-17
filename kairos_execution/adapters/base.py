@@ -27,6 +27,7 @@ class ProtectiveStopAck:
 class ExchangeAdapter(abc.ABC):
     name: str = "base"
     exchange_order_id_matches_client_order_id: bool = False
+    protective_stop_lookup_authoritative: bool = False
 
     @abc.abstractmethod
     async def place_order(self, intent: OrderIntent) -> ExecutionReport: ...
@@ -77,6 +78,20 @@ class ExchangeAdapter(abc.ABC):
         trusted submitted entry identity; venues without linked TP/SL orders may
         ignore it.
         """
+
+    async def find_protective_stop(
+        self,
+        symbol: str,
+        stop_price: float,
+        position_side: OrderSide,
+        parent_order_id: str,
+    ) -> ProtectiveStopAck | None:
+        """Return one exact live stop, or ``None`` when the venue proves absence.
+
+        Adapters that cannot query a parent-linked stop must retain the default
+        fail-closed result; callers must not infer deduplication from geometry.
+        """
+        return None
 
     async def fetch_account_snapshot(
         self,

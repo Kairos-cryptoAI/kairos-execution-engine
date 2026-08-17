@@ -40,6 +40,7 @@ class ExecutionEngine:
         self.system_mode = SystemMode.NORMAL
         self._idempotency_cache_size = idempotency_cache_size
         self._completed: OrderedDict[str, tuple[str, ExecutionReport | None]] = OrderedDict()
+        self._recovery_blockers: tuple[str, ...] = ()
 
     async def handle(self, order: ValidatedOrder) -> ExecutionReport | None:
         fingerprint = sha256(order.model_dump_json().encode()).hexdigest()
@@ -70,6 +71,12 @@ class ExecutionEngine:
             return None
 
         action, side = action_for(order.reason_code)
+
+        if self._recovery_blockers and action is not Action.CLOSE:
+            raise ExecutionSafetyError(
+                "execution journal recovery is incomplete; only protective closes are allowed: "
+                + "; ".join(self._recovery_blockers[:3])
+            )
 
         # In LOCAL_QUANT_MODE the LLM is detached; only protective actions are allowed.
         if self.system_mode is SystemMode.LOCAL_QUANT_MODE and action is Action.OPEN:
@@ -682,3 +689,17 @@ class ExecutionEngine:
         if mode != self.system_mode:
             log.warning("execution.mode_change", mode=mode.value)
         self.system_mode = mode
+
+    def set_recovery_blockers(self, blockers: list[str]) -> None:
+        normalized = tuple(dict.fromkeys(item.strip() for item in blockers if item.strip()))
+        if normalized != self._recovery_blockers:
+            log.warning(
+                "execution.recovery_gate_change",
+                blocked=bool(normalized),
+                blockers=list(normalized),
+            )
+        self._recovery_blockers = normalized
+
+    @property
+    def recovery_blocked(self) -> bool:
+        return bool(self._recovery_blockers)
