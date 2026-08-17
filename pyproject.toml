@@ -36,6 +36,7 @@ dev = [
 
 [project.scripts]
 kairos-execution-engine = "kairos_execution.service:main"
+kairos-evedex-qualify = "kairos_execution.qualification:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["kairos_execution"]

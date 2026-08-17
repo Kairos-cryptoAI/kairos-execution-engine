@@ -97,6 +97,26 @@ position cannot be classified automatically. Such effects stay blocked for opera
 reconciliation instead of being guessed successful. Intraday PnL baseline restoration
 also still depends on durable accounting history outside this journal.
 
+Internal Kairos symbols use Binance-style `*USDT` identities. The EVEDEX adapter maps
+the configured production universe one-to-one to the venue's `*USD` instruments and
+maps reconciled positions back to their logical identities. An unmapped live position
+invalidates the account snapshot instead of silently creating a second symbol domain.
+
+Run the GET-only venue qualification without credentials:
+
+```powershell
+uv run --locked kairos-evedex-qualify `
+  --output $env:TEMP\kairos-evedex-public.json `
+  --overwrite
+```
+
+For authenticated reconciliation, place the JWT in a local secret file and add
+`--jwt-file <path>`. The JWT is never accepted on the command line and is never written
+to the report. Qualification performs no POST, PUT, PATCH, DELETE, signing, or order
+operation. Its report always contains `live_orders_allowed=false`; missing credentials,
+missing quota headers, stale market evidence, or a schema mismatch remain explicitly
+`BLOCKED`/`FAIL` until reviewed.
+
 ## Prerequisites
 
 - [uv 0.12.3](https://docs.astral.sh/uv/)
