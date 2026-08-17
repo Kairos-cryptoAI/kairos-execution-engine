@@ -10,6 +10,7 @@ from kairos_core.contracts import AccountSnapshot, ValidatedOrder
 from kairos_core.enums import SystemMode
 from kairos_core.logging import configure_logging, get_logger
 from kairos_core.topics import Topics
+from kairos_persistence import DurableMessageBus
 
 from .config import ExecSettings
 from .engine import ExecutionEngine, ExecutionSafetyError
@@ -21,7 +22,12 @@ log = get_logger("execution")
 class ExecutionService:
     def __init__(self, settings: ExecSettings | None = None) -> None:
         self.settings = settings or ExecSettings()
-        self.bus = build_bus(self.settings)
+        transport = build_bus(self.settings)
+        self.bus = (
+            transport
+            if self.settings.bus_backend == "memory"
+            else DurableMessageBus(transport, service_name=self.settings.service_name)
+        )
         self.engine = ExecutionEngine(
             build_adapter(self.settings),
             default_trail_pct=self.settings.default_trail_pct,

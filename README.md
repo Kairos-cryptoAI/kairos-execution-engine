@@ -165,6 +165,13 @@ signature; emergency closes first retrieve the live position size.
 When `LOCAL_QUANT_MODE` is active, new positions are refused and only protective actions
 are allowed.
 
+## Runtime delivery durability
+
+With Redis, consumed IDs, execution reports and completion are committed through
+`kairos-persistence`; Redis is ACKed only after PostgreSQL commits. Configure
+`KAIROS_PERSISTENCE_DATABASE_URL` through the deployment secret provider. This
+transport guarantee complements, but does not replace, the venue-effect journal.
+
 ---
 
 Part of the [Kairos](https://github.com/Kairos-cryptoAI/kairos) system. MIT licensed.
