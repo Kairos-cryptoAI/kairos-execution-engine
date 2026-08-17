@@ -4,7 +4,7 @@ Implements the order endpoints documented at https://docs.evedex.com:
   * POST /api/v2/order/limit, /market, /stop-limit
   * POST /api/v2/position/{instrument}/close
   * PUT  /api/position/{instrument}              (leverage)
-  * POST /api/tpsl/{instrument}                  (trailing / protective stop)
+  * POST /api/tpsl/{instrument}                  (protective stop)
   * DELETE /api/order/{orderId}
 Every mutating call is EIP-712 signed and rate-limited to 30 heavy requests / 60s.
 """
@@ -12,6 +12,7 @@ Every mutating call is EIP-712 signed and rate-limited to 30 heavy requests / 60
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
@@ -26,7 +27,7 @@ from ..state_machine import (
     is_evedex_client_order_id,
     is_fresh_evedex_client_order_id,
 )
-from .base import ExchangeAdapter
+from .base import ExchangeAdapter, ProtectiveStopAck
 
 try:
     import aiohttp
@@ -38,6 +39,7 @@ MIN_NOTIONAL_USD = 5.0
 
 class EvedexAdapter(ExchangeAdapter):
     name = "evedex"
+    exchange_order_id_matches_client_order_id = True
 
     def __init__(
         self,
@@ -88,6 +90,12 @@ class EvedexAdapter(ExchangeAdapter):
     async def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
         await self._bucket.acquire()
         if self.dry_run:
+            if path.startswith("/api/tpsl/"):
+                return {
+                    "id": f"dry-tpsl-{body.get('order', 'unlinked')}",
+                    "status": "waitOrder",
+                    "dry_run": True,
+                }
             return {"id": body.get("id", "dry"), "status": "NEW", "dry_run": True}
         session = await self._session_get()  # pragma: no cover - network
         async with session.post(f"{self.base}{path}", json=body) as resp:  # pragma: no cover
@@ -153,14 +161,16 @@ class EvedexAdapter(ExchangeAdapter):
             signature = self._sign("New limit order", message)
             resp = await self._post("/api/v2/order/limit", {**message, "signature": signature})
 
-        raw_status = str(resp.get("status", "NEW")).upper().replace("CANCELLED", "CANCELED")
-        status = OrderStatus(raw_status) if raw_status in OrderStatus.__members__ else OrderStatus.NEW
+        response_id = resp.get("id")
+        if response_id is None or str(response_id) != order_id:
+            raise ValueError("EVEDEX order response ID does not match the submitted order ID")
+        status = self._order_status(resp.get("status"))
         remaining_qty = self._float(resp.get("unFilledQuantity"), default=intent.quantity)
         filled_qty = max(0.0, intent.quantity - remaining_qty)
         return self._report(
             intent,
             status,
-            exch_id=resp.get("id"),
+            exch_id=order_id,
             client_id=order_id,
             filled_qty=filled_qty,
             remaining_qty=remaining_qty,
@@ -192,38 +202,152 @@ class EvedexAdapter(ExchangeAdapter):
             "chainId": int(self.chain_id),
         }
         signature = self._sign("Position close order", message)
-        await self._post(f"/api/v2/position/{symbol}/close", {**message, "signature": signature})
+        resp = await self._post(
+            f"/api/v2/position/{symbol}/close",
+            {**message, "signature": signature},
+        )
+        response_id = resp.get("id")
+        if response_id is None or str(response_id) != close_id:
+            raise ValueError("EVEDEX close response ID does not match the submitted close ID")
+        requested_qty = quantity or 0.0
+        remaining_qty = self._float(resp.get("unFilledQuantity"), default=requested_qty)
         return ExecutionReport(
             source="execution-engine",
             client_order_id=close_id,
+            exchange_order_id=close_id,
+            exchange=self.name,
             symbol=symbol,
             side=side or OrderSide.BUY,
-            status=OrderStatus.NEW,
-            requested_qty=quantity or 0,
-            message="close requested",
+            status=self._order_status(resp.get("status")),
+            requested_qty=requested_qty,
+            filled_qty=max(0.0, requested_qty - remaining_qty),
+            remaining_qty=remaining_qty,
+            avg_price=self._float(resp.get("filledAvgPrice")),
+            message="close response received",
         )
 
     async def set_leverage(self, symbol: str, leverage: float) -> None:  # pragma: no cover - thin
         await self._put(f"/api/position/{symbol}", {"leverage": int(leverage)})
 
-    async def set_trailing_stop(self, symbol: str, stop_price: float, side: str) -> None:
+    async def set_protective_stop(
+        self,
+        symbol: str,
+        stop_price: float,
+        position_side: OrderSide,
+        parent_order_id: str,
+    ) -> ProtectiveStopAck:
+        if not is_evedex_client_order_id(parent_order_id):
+            raise ValueError("EVEDEX protective stop requires the authoritative parent order ID")
         message = {
             "instrument": symbol,
-            "type": "STOP_LOSS",
-            "side": side,
+            "type": "stop-loss",
+            # EVEDEX TpSl.side is the protected position side, not the side of
+            # the market order that will eventually close that position.
+            "side": position_side.value,
             "quantity": 0,
             "price": to_eth_number(stop_price),
+            "order": parent_order_id,
         }
         signature = self._sign("New take-profit/stop-loss", message)
-        await self._post(f"/api/tpsl/{symbol}", {**message, "signature": signature})
+        resp = await self._post(
+            f"/api/tpsl/{symbol}",
+            {
+                **message,
+                "signature": signature,
+            },
+        )
+        if str(resp.get("status", "")).casefold() not in {"waitorder", "active"}:
+            raise ValueError("EVEDEX protective-stop create status is neither waitOrder nor active")
+        # EVEDEX creates the TP/SL record ID.  It is deliberately not included
+        # in ``message``; `order` above is the signed parent entry ID.
+        server_id = resp.get("id")
+        if server_id is None or not str(server_id).strip():
+            raise ValueError("EVEDEX protective-stop response has no server-assigned ID")
+        if not self.dry_run:
+            records = self._as_list(await self._get("/api/tpsl"))
+            matches = [item for item in records if str(item.get("id")) == str(server_id)]
+            if len(matches) != 1:
+                raise ValueError("EVEDEX protective-stop ID was not uniquely reconciled via GET /api/tpsl")
+            self._validate_protective_stop_record(
+                matches[0],
+                symbol=symbol,
+                position_side=position_side,
+                parent_order_id=parent_order_id,
+                stop_price=stop_price,
+            )
+        return ProtectiveStopAck(exchange_order_id=str(server_id))
 
-    async def cancel_order(self, symbol: str, order_id: str) -> None:  # pragma: no cover - thin
-        await self._bucket.acquire()
+    async def cancel_order_by_client_id(
+        self,
+        symbol: str,
+        client_order_id: str,
+    ) -> None:  # pragma: no cover - thin
+        if not is_evedex_client_order_id(client_order_id):
+            raise ValueError("EVEDEX cancellation requires a deterministic client order ID")
         if self.dry_run:
             return
+        if not await self.is_order_active_by_client_id(symbol, client_order_id):
+            return
+        await self._bucket.acquire()
         session = await self._session_get()
-        async with session.delete(f"{self.base}/api/order/{order_id}") as resp:
+        async with session.delete(f"{self.base}/api/order/{client_order_id}") as resp:
             resp.raise_for_status()
+
+    async def is_order_active_by_client_id(self, symbol: str, client_order_id: str) -> bool:
+        if not is_evedex_client_order_id(client_order_id):
+            raise ValueError("EVEDEX reconciliation requires a deterministic client order ID")
+        if self.dry_run:
+            return False
+        orders = self._as_list(await self._get("/api/order/opened"))
+        return any(
+            str(item.get("id")) == client_order_id
+            and str(item.get("instrument", "")).upper() == symbol.upper()
+            for item in orders
+        )
+
+    async def is_position_flat(self, symbol: str) -> bool:
+        if self.dry_run:
+            return True
+        positions = self._as_list(await self._get("/api/position"))
+        for item in positions:
+            if str(item.get("instrument", "")).upper() != symbol.upper():
+                continue
+            if self._required_float(item.get("quantity"), f"{symbol}.quantity") > 0:
+                return False
+        return True
+
+    @staticmethod
+    def _validate_protective_stop_record(
+        record: dict[str, Any],
+        *,
+        symbol: str,
+        position_side: OrderSide,
+        parent_order_id: str,
+        stop_price: float,
+    ) -> None:
+        if str(record.get("instrument", "")).upper() != symbol.upper():
+            raise ValueError("EVEDEX reconciled protective stop has the wrong instrument")
+        stop_type = str(record.get("type", "")).casefold().replace("_", "-")
+        if stop_type != "stop-loss":
+            raise ValueError("EVEDEX reconciled protective stop has the wrong type")
+        if str(record.get("side", "")).upper() != position_side.value:
+            raise ValueError("EVEDEX reconciled protective stop has the wrong position side")
+        status = str(record.get("status", "")).casefold()
+        if status not in {"waitorder", "active"}:
+            raise ValueError("EVEDEX reconciled protective stop is not in a protective lifecycle state")
+        quantity = EvedexAdapter._required_float(record.get("quantity"), f"{symbol}.tpsl.quantity")
+        if quantity != 0:
+            raise ValueError("EVEDEX reconciled protective stop is not for the full position")
+        reconciled_price = EvedexAdapter._required_float(
+            record.get("price"),
+            f"{symbol}.tpsl.price",
+        )
+        price_tolerance = max(1e-8, abs(stop_price) * 1e-9)
+        if reconciled_price <= 0 or abs(reconciled_price - stop_price) > price_tolerance:
+            raise ValueError("EVEDEX reconciled protective stop has the wrong price")
+        echoed_parent = record.get("order")
+        if echoed_parent is not None and str(echoed_parent) != parent_order_id:
+            raise ValueError("EVEDEX reconciled protective stop has the wrong parent order")
 
     async def fetch_account_snapshot(
         self,
@@ -256,7 +380,7 @@ class EvedexAdapter(ExchangeAdapter):
         )
         if not isinstance(account, dict) or not isinstance(balance, dict):
             raise ValueError("EVEDEX account endpoints returned malformed objects")
-        if account.get("marginCall") is True:
+        if self._required_bool(account.get("marginCall"), "marginCall"):
             raise ValueError("EVEDEX account is in margin call")
 
         positions = self._as_list(raw_positions)
@@ -276,24 +400,41 @@ class EvedexAdapter(ExchangeAdapter):
         if equity <= 0:
             raise ValueError("EVEDEX reconciled equity is not positive")
 
-        stop_by_symbol = {
-            str(item.get("instrument")): str(item.get("id"))
-            for item in tpsl
-            if str(item.get("type", "")).casefold() == "stop-loss"
-            and str(item.get("status", "")).casefold() in {"waitorder", "active", "process"}
-            and item.get("instrument")
-            and item.get("id")
-        }
-        position_snapshots = [
-            self._position_snapshot(
-                position,
-                account_id=account_id,
-                captured_at=captured_at,
-                protective_stop_id=stop_by_symbol.get(str(position.get("instrument"))),
+        stop_by_position: dict[tuple[str, str], str] = {}
+        for item in tpsl:
+            if str(item.get("type", "")).casefold() != "stop-loss" or str(
+                item.get("status", "")
+            ).casefold() not in {"waitorder", "active"}:
+                continue
+            instrument = str(item.get("instrument", "")).upper()
+            side = str(item.get("side", "")).upper()
+            stop_id = str(item.get("id", ""))
+            if not instrument or side not in {"BUY", "SELL"} or not stop_id:
+                raise ValueError("EVEDEX live protective stop has incomplete identity")
+            quantity = self._required_float(
+                item.get("quantity"),
+                f"{instrument}.tpsl.quantity",
             )
-            for position in positions
-            if self._float(position.get("quantity")) > 0
-        ]
+            # The official contract defines zero as a full-position TP/SL.
+            # A partial stop must not make the whole position look protected.
+            if quantity == 0:
+                stop_by_position.setdefault((instrument, side), stop_id)
+        position_snapshots: list[PositionSnapshot] = []
+        for position in positions:
+            symbol = str(position.get("instrument", ""))
+            quantity = self._required_float(position.get("quantity"), f"{symbol}.quantity")
+            if quantity <= 0:
+                continue
+            position_snapshots.append(
+                self._position_snapshot(
+                    position,
+                    account_id=account_id,
+                    captured_at=captured_at,
+                    protective_stop_id=stop_by_position.get(
+                        (symbol.upper(), str(position.get("side", "")).upper())
+                    ),
+                )
+            )
         margin_used = sum(
             self._float(item.get("initialMargin"))
             for item in balance.get("position", [])
@@ -322,7 +463,7 @@ class EvedexAdapter(ExchangeAdapter):
     async def _open_position_quantity(self, symbol: str) -> float:
         positions = self._as_list(await self._get("/api/position"))
         quantity = sum(
-            self._float(item.get("quantity"))
+            self._required_float(item.get("quantity"), f"{symbol}.quantity")
             for item in positions
             if str(item.get("instrument", "")).upper() == symbol.upper()
         )
@@ -422,14 +563,29 @@ class EvedexAdapter(ExchangeAdapter):
             result = float(value)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"EVEDEX {field} is not numeric") from exc
-        if result < 0:
-            raise ValueError(f"EVEDEX {field} must not be negative")
+        if not math.isfinite(result) or result < 0:
+            raise ValueError(f"EVEDEX {field} must be finite and non-negative")
         return result
 
     @staticmethod
     def _optional_positive_float(value: Any) -> float | None:
         parsed = EvedexAdapter._float(value)
         return parsed if parsed > 0 else None
+
+    @staticmethod
+    def _required_bool(value: Any, field: str) -> bool:
+        """Parse a required API boolean and reject undocumented representations."""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int) and value in {0, 1}:
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().casefold()
+            if normalized in {"0", "false"}:
+                return False
+            if normalized in {"1", "true"}:
+                return True
+        raise ValueError(f"EVEDEX {field} is not a valid boolean")
 
     def _report(
         self,
@@ -464,6 +620,13 @@ class EvedexAdapter(ExchangeAdapter):
             return float(value) if value is not None else default
         except (TypeError, ValueError):
             return default
+
+    @staticmethod
+    def _order_status(value: Any) -> OrderStatus:
+        raw_status = str(value or "").upper().replace("CANCELLED", "CANCELED")
+        if raw_status not in OrderStatus.__members__:
+            raise ValueError(f"EVEDEX returned unknown order status {value!r}")
+        return OrderStatus(raw_status)
 
     async def close(self) -> None:  # pragma: no cover
         if self._session is not None:

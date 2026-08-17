@@ -8,6 +8,7 @@ from kairos_core.contracts import AccountSnapshot, ExecutionReport, OrderIntent,
 from kairos_core.enums import OrderSide, OrderStatus, OrderType, ReasonCode, SystemMode
 from kairos_core.topics import Topics
 
+from kairos_execution.engine import ExecutionSafetyError
 from kairos_execution.service import ExecutionService
 
 
@@ -172,6 +173,23 @@ async def test_transient_handle_failure_leaves_order_pending():
     await service._consume_orders()
 
     assert events == ["handle"]
+    assert service._account_refresh.qsize() == 1
+
+
+@pytest.mark.asyncio
+async def test_safety_failure_schedules_reconciliation_and_leaves_order_pending():
+    events: list[str] = []
+    bus = FakeBus({Topics.VALIDATED_ORDER: [_order_envelope()]})
+    bus.events = events
+    service = _service(
+        bus,
+        FakeEngine(events, error=ExecutionSafetyError("position is not flat")),
+    )
+
+    await service._consume_orders()
+
+    assert events == ["handle"]
+    assert service._account_refresh.qsize() == 1
 
 
 @pytest.mark.asyncio
@@ -187,6 +205,7 @@ async def test_publish_failure_leaves_order_pending():
     await service._consume_orders()
 
     assert events == ["handle", "publish"]
+    assert service._account_refresh.qsize() == 1
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,4 @@
-from .base import ExchangeAdapter
+from .base import ExchangeAdapter, ProtectiveStopAck
 from .evedex import EvedexAdapter
 
-__all__ = ["ExchangeAdapter", "EvedexAdapter"]
+__all__ = ["ExchangeAdapter", "EvedexAdapter", "ProtectiveStopAck"]

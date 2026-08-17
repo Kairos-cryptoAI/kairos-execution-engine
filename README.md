@@ -2,7 +2,7 @@
 
 **Layer 6 — Execution Engine.** The hands of the Kairos system (no LLM). It consumes
 risk-validated orders, switches only on their machine-readable `reason_code`, and
-deterministically submits orders with protective trailing stops.
+deterministically submits orders with exchange-side protective stops.
 
 ## Exchanges
 
@@ -15,6 +15,44 @@ deterministically submits orders with protective trailing stops.
 
 Both adapters are optional installation extras. The service is in `dry_run` mode by
 default and makes no real exchange calls unless that setting is explicitly disabled.
+Risk-provided `stop_price` takes priority over the configured fallback distance and is
+accepted only on the protective side of the entry. The current service arms an initial
+exchange-side stop; it does not claim that stop is dynamically trailed until a reviewed
+price-update and replace/cancel loop is wired for the selected venue.
+
+The stop-create adapter contract requires a venue-assigned TP/SL ID. EVEDEX's signed
+TP/SL payload includes the documented `order` link to the already verified parent entry
+ID; it does not invent a client ID for the TP/SL record itself. The create response must
+contain a server ID and a documented live state (`waitOrder` or `active`), then a live
+`GET /api/tpsl` must uniquely return that ID in `waitOrder` or `active` before protection
+is accepted. `process`, `triggered`, `done`, and `cancelled` are not proof of a still-live
+stop; the engine compensates and reconciles the position instead.
+
+For an unprotected `NEW` or `PARTIALLY_FILLED` entry, compensation cancels by the
+deterministic ID generated before submission, verifies that it disappeared from open
+orders, reconciles the live position, closes it if necessary, and reconciles again. It
+never uses an exchange ID copied from a malformed acknowledgement. CCXT first resolves
+an exact, unique client ID in open orders and only then sends the venue's server ID to
+`cancel_order`; an absent or duplicate identity fails closed. Any ambiguous cancellation
+or non-flat position leaves the source message pending and requests an immediate account
+refresh so Risk does not continue using the last pre-failure snapshot.
+
+Explicit `CLOSE_POSITION` actions target the reconciled desired state rather than an
+acknowledgement label. Redelivery first checks whether the symbol is already flat and,
+if so, returns an explicit `CANCELED`, zero-observed-fill desired-state result without
+submitting a second close. After submission, a finite identity/accounting-valid
+acknowledgement is still required, but `NEW`, `PARTIALLY_FILLED`, `REJECTED`, or
+`CANCELED` can converge only when the venue independently proves flat; the result does
+not claim an unobserved fill.
+A malformed acknowledgement or non-flat position remains pending. An active close with
+the same deterministic client ID blocks duplicate submission while reconciliation is
+accelerated.
+
+On the normal path, a `NEW` limit entry may remain active after the venue returns the
+server ID for its close-position protective stop. Kairos does not reinterpret `NEW` as
+a fill: it retains the entry only because stop creation was acknowledged, then relies
+on periodic position/open-order reconciliation for actual fill state. This is initial
+protection for a future or partial fill, not evidence of execution and not trailing.
 
 ## Account reconciliation
 
@@ -38,6 +76,21 @@ Intraday PnL and peak equity are tracked for the lifetime of the process. Restar
 Execution resets the intraday baseline, so production supervision should avoid
 unnecessary restarts and should treat durable accounting history as a follow-up before
 unattended capital is enabled.
+
+Duplicate source deliveries are suppressed by a bounded in-memory fingerprint cache,
+and entry/close requests use deterministic venue client IDs. This protects ordinary
+at-least-once redelivery and publish-after-execute retries within one process. The cache
+is not durable: after a restart, correctness still depends on venue client-ID semantics
+and the timeliness of open-order/position views. CCXT has no portable cross-venue query
+for historical orders by client ID, so a create timeout followed by eventually
+consistent empty views stays pending rather than being declared successful.
+
+EVEDEX links each create request to the parent through signed `order` and Kairos verifies
+the returned server ID through `GET /api/tpsl`, but the public contract does not promise
+that repeating the same parent link deduplicates TP/SL creation. A crash after creation
+but before the response/reconciliation is recorded can therefore still create a second
+stop after restart. Durable execution journaling and a venue-supported historical
+identity query/deduplication guarantee remain prerequisites for unattended capital.
 
 ## Prerequisites
 

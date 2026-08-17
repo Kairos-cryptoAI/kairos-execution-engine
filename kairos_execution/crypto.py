@@ -76,6 +76,7 @@ EIP712_SCHEMAS: dict[str, dict[str, list]] = {
             {"name": "side", "type": "string"},
             {"name": "quantity", "type": "uint96"},
             {"name": "price", "type": "uint80"},
+            {"name": "order", "type": "string"},
         ]
     },
 }

@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from datetime import UTC, datetime
 from typing import Any
 
 from kairos_core.contracts import AccountSnapshot, ExecutionReport, OrderIntent, PositionSnapshot
 from kairos_core.enums import OrderSide, OrderStatus, OrderType
 
-from .base import ExchangeAdapter
+from .base import ExchangeAdapter, ProtectiveStopAck
 
 try:
     import ccxt.async_support as ccxt
@@ -42,12 +43,17 @@ class CCXTAdapter(ExchangeAdapter):
 
     async def place_order(self, intent: OrderIntent) -> ExecutionReport:
         if self.dry_run or self._client is None:
+            client_id = intent.client_order_id or "dry"
             return ExecutionReport(
                 source="execution-engine",
-                client_order_id=intent.client_order_id or "dry",
+                client_order_id=client_id,
+                exchange_order_id=f"dry-{client_id}",
+                exchange=self.name,
                 symbol=intent.symbol,
                 side=intent.side,
                 status=OrderStatus.NEW,
+                requested_qty=intent.quantity,
+                remaining_qty=intent.quantity,
                 message="dry_run",
             )
         otype = "market" if intent.order_type is OrderType.MARKET else "limit"  # pragma: no cover
@@ -67,10 +73,35 @@ class CCXTAdapter(ExchangeAdapter):
             requested=intent.quantity,
         )
 
-    async def cancel_order(self, symbol, order_id):  # pragma: no cover
+    async def cancel_order_by_client_id(
+        self,
+        symbol: str,
+        client_order_id: str,
+    ) -> None:  # pragma: no cover
         if self.dry_run or self._client is None:
             return
-        await self._client.cancel_order(order_id, symbol)
+        order = await self._open_order_by_client_id(symbol, client_order_id)
+        if order is None:
+            return
+        exchange_order_id = order.get("id")
+        if exchange_order_id is None or not str(exchange_order_id).strip():
+            raise ValueError("CCXT open order matched client ID but has no exchange order ID")
+        await self._client.cancel_order(str(exchange_order_id), symbol)
+
+    async def is_order_active_by_client_id(self, symbol: str, client_order_id: str) -> bool:
+        if self.dry_run or self._client is None:
+            return False
+        return await self._open_order_by_client_id(symbol, client_order_id) is not None
+
+    async def is_position_flat(self, symbol: str) -> bool:
+        if self.dry_run or self._client is None:
+            return True
+        positions = await self._client.fetch_positions([symbol])
+        for position in positions:
+            contracts = self._required_contracts(position)
+            if abs(contracts) > 0:
+                return False
+        return True
 
     async def close_position(
         self,
@@ -83,11 +114,11 @@ class CCXTAdapter(ExchangeAdapter):
         if not self.dry_run and self._client is not None:
             if quantity is None:
                 positions = await self._client.fetch_positions([symbol])
-                open_positions = [item for item in positions if abs(self._float(item.get("contracts"))) > 0]
+                open_positions = [item for item in positions if self._required_contracts(item) > 0]
                 position_sides = {str(item.get("side", "")).casefold() for item in open_positions}
                 if len(position_sides) != 1 or not position_sides <= {"long", "short"}:
                     raise ValueError(f"cannot infer one-sided CCXT position for {symbol}")
-                quantity = sum(abs(self._float(item.get("contracts"))) for item in open_positions)
+                quantity = sum(self._required_contracts(item) for item in open_positions)
                 side = OrderSide.SELL if position_sides == {"long"} else OrderSide.BUY
             if not quantity or quantity <= 0:
                 raise ValueError(f"no open CCXT position for {symbol}")
@@ -115,12 +146,20 @@ class CCXTAdapter(ExchangeAdapter):
         if not self.dry_run and self._client is not None:
             await self._client.set_leverage(int(leverage), symbol)
 
-    async def set_trailing_stop(self, symbol, stop_price, side):  # pragma: no cover
+    async def set_protective_stop(
+        self,
+        symbol: str,
+        stop_price: float,
+        position_side: OrderSide,
+        parent_order_id: str,
+    ) -> ProtectiveStopAck:  # pragma: no cover
+        del parent_order_id  # CCXT venues do not expose a portable linked-stop field.
+        close_side = OrderSide.SELL if position_side is OrderSide.BUY else OrderSide.BUY
         if not self.dry_run and self._client is not None:
-            await self._client.create_order(
+            order = await self._client.create_order(
                 symbol,
                 "STOP_MARKET",
-                side.lower(),
+                close_side.value.lower(),
                 None,
                 None,
                 {
@@ -129,6 +168,15 @@ class CCXTAdapter(ExchangeAdapter):
                     "reduceOnly": True,
                 },
             )
+            if not isinstance(order, dict):
+                raise ValueError("CCXT protective-stop response is not an order object")
+            order_id = order.get("id")
+            if order_id is None or not str(order_id).strip():
+                raise ValueError("CCXT protective-stop response has no exchange order ID")
+            if str(order.get("status") or "").casefold() not in {"new", "open"}:
+                raise ValueError("CCXT protective-stop response is not in a live order state")
+            return ProtectiveStopAck(exchange_order_id=str(order_id))
+        return ProtectiveStopAck(exchange_order_id=f"dry-protective-{symbol}")
 
     async def fetch_account_snapshot(
         self,
@@ -166,18 +214,32 @@ class CCXTAdapter(ExchangeAdapter):
         if equity <= 0:
             raise ValueError("CCXT account equity is not positive")
 
-        protective_stops: dict[str, str] = {}
+        protective_stops: dict[tuple[str, str], str] = {}
         for order in orders:
             order_info = order.get("info", {}) if isinstance(order.get("info"), dict) else {}
-            is_protective = bool(
-                order.get("reduceOnly") or order_info.get("reduceOnly") or order_info.get("closePosition")
-            ) and bool(order.get("stopPrice") or order_info.get("stopPrice"))
-            if is_protective and order.get("id"):
-                protective_stops[self._symbol(order.get("symbol"))] = str(order["id"])
+            is_close_position = self._is_true(order.get("closePosition")) or self._is_true(
+                order_info.get("closePosition")
+            )
+            stop_price = self._float(order.get("stopPrice") or order_info.get("stopPrice"))
+            close_side = str(order.get("side") or order_info.get("side") or "").casefold()
+            order_id = order.get("id")
+            if (
+                is_close_position
+                and math.isfinite(stop_price)
+                and stop_price > 0
+                and close_side in {"buy", "sell"}
+                and order_id is not None
+                and str(order_id).strip()
+            ):
+                position_side = "SELL" if close_side == "buy" else "BUY"
+                protective_stops.setdefault(
+                    (self._symbol(order.get("symbol")), position_side),
+                    str(order_id),
+                )
 
         positions: list[PositionSnapshot] = []
         for item in raw_positions:
-            contracts = abs(self._float(item.get("contracts")))
+            contracts = self._required_contracts(item)
             if contracts <= 0:
                 continue
             side_text = str(item.get("side", "")).casefold()
@@ -200,7 +262,9 @@ class CCXTAdapter(ExchangeAdapter):
                     leverage=max(1.0, self._float(item.get("leverage"), default=1.0)),
                     liquidation_price=self._positive_or_none(item.get("liquidationPrice")),
                     unrealized_pnl_usd=self._float(item.get("unrealizedPnl")),
-                    protective_stop_order_id=protective_stops.get(symbol),
+                    protective_stop_order_id=protective_stops.get(
+                        (symbol, "BUY" if side_text == "long" else "SELL")
+                    ),
                     captured_at=captured_at,
                 )
             )
@@ -233,28 +297,92 @@ class CCXTAdapter(ExchangeAdapter):
 
     @staticmethod
     def _execution_report(order: dict[str, Any], *, symbol: str, side: OrderSide, requested: float):
-        status_text = str(order.get("status", "open")).upper()
+        status_text = str(order.get("status") or "").upper()
         status_map = {
             "OPEN": OrderStatus.NEW,
             "CLOSED": OrderStatus.FILLED,
             "CANCELED": OrderStatus.CANCELED,
+            "CANCELLED": OrderStatus.CANCELED,
             "REJECTED": OrderStatus.REJECTED,
             "EXPIRED": OrderStatus.REJECTED,
+            "PARTIALLY_FILLED": OrderStatus.PARTIALLY_FILLED,
         }
         filled = CCXTAdapter._float(order.get("filled"))
+        try:
+            status = status_map[status_text]
+        except KeyError as exc:
+            raise ValueError(f"CCXT returned unknown order status {order.get('status')!r}") from exc
+        if status is OrderStatus.NEW and filled > 0:
+            status = OrderStatus.PARTIALLY_FILLED
         return ExecutionReport(
             source="execution-engine",
-            client_order_id=str(order.get("clientOrderId") or order.get("id") or "unknown"),
+            client_order_id=CCXTAdapter._client_order_identity(order) or "unknown",
             exchange_order_id=str(order["id"]) if order.get("id") is not None else None,
             exchange="ccxt",
             symbol=symbol,
             side=side,
-            status=status_map.get(status_text, OrderStatus.NEW),
+            status=status,
             requested_qty=requested,
             filled_qty=filled,
             remaining_qty=max(0.0, CCXTAdapter._float(order.get("remaining"), default=requested - filled)),
             avg_price=CCXTAdapter._float(order.get("average")),
         )
+
+    async def _open_order_by_client_id(
+        self,
+        symbol: str,
+        client_order_id: str,
+    ) -> dict[str, Any] | None:
+        """Resolve one active CCXT order without treating a server ID as a client ID."""
+        if not client_order_id.strip():
+            raise ValueError("CCXT client order ID must not be empty")
+        if self._client is None:
+            raise RuntimeError("CCXT client is not initialized")
+        orders = await self._client.fetch_open_orders(symbol)
+        matches = [order for order in orders if self._client_order_identity(order) == client_order_id]
+        if len(matches) > 1:
+            raise ValueError(f"multiple CCXT open orders have client ID {client_order_id!r}")
+        return matches[0] if matches else None
+
+    @staticmethod
+    def _client_order_identity(order: Any) -> str | None:
+        if not isinstance(order, dict):
+            return None
+        info = order.get("info")
+        sources = (order, info if isinstance(info, dict) else {})
+        for source in sources:
+            for key in (
+                "clientOrderId",
+                "clientOrderID",
+                "clientOid",
+                "clOrdId",
+                "origClientOrderId",
+            ):
+                value = source.get(key)
+                if value is not None and str(value).strip():
+                    return str(value)
+        return None
+
+    @staticmethod
+    def _is_true(value: Any) -> bool:
+        """Parse exchange boolean flags without treating ``"false"`` as true."""
+        if value is True:
+            return True
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value == 1
+        return isinstance(value, str) and value.strip().casefold() in {"1", "true"}
+
+    @staticmethod
+    def _required_contracts(position: Any) -> float:
+        if not isinstance(position, dict) or position.get("contracts") is None:
+            raise ValueError("CCXT position is missing contracts")
+        try:
+            contracts = float(position["contracts"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("CCXT position contracts is not numeric") from exc
+        if not math.isfinite(contracts) or contracts < 0:
+            raise ValueError("CCXT position contracts must be finite and non-negative")
+        return contracts
 
     @staticmethod
     def _balance_currency(balance: Any, field: str, currency: str) -> float:

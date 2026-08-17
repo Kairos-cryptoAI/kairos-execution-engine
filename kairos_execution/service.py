@@ -12,7 +12,7 @@ from kairos_core.logging import configure_logging, get_logger
 from kairos_core.topics import Topics
 
 from .config import ExecSettings
-from .engine import ExecutionEngine
+from .engine import ExecutionEngine, ExecutionSafetyError
 from .factory import build_adapter
 
 log = get_logger("execution")
@@ -26,6 +26,7 @@ class ExecutionService:
             build_adapter(self.settings),
             default_trail_pct=self.settings.default_trail_pct,
             allowed_symbols=set(self.settings.trading_symbols),
+            idempotency_cache_size=self.settings.idempotency_cache_size,
         )
         self._account_refresh: asyncio.Queue[None] = asyncio.Queue(maxsize=1)
         self._peak_equity_usd = self.settings.dry_run_equity_usd if self.settings.dry_run else 0.0
@@ -53,11 +54,23 @@ class ExecutionService:
                 report = await self.engine.handle(order)
                 if report is not None:
                     await self.bus.publish(Topics.EXECUTION_REPORT, report)
-                    if self._account_refresh.empty():
-                        self._account_refresh.put_nowait(None)
+                    self._request_account_refresh()
                 await self.bus.ack(Topics.VALIDATED_ORDER, env, group="execution")
+            except ExecutionSafetyError:
+                # The source entry remains pending, while reconciliation is
+                # accelerated so Risk does not rely on a stale pre-failure view.
+                self._request_account_refresh()
+                log.exception("execution.order_safety_failure", envelope_id=env.id)
             except Exception:
+                # Adapter and transport exceptions may have happened after a
+                # venue mutation.  Even when the engine could not classify the
+                # failure, immediately revoke the age of the last account view.
+                self._request_account_refresh()
                 log.exception("execution.order_processing_failed", envelope_id=env.id)
+
+    def _request_account_refresh(self) -> None:
+        if self._account_refresh.empty():
+            self._account_refresh.put_nowait(None)
 
     def _apply_session_accounting(self, snapshot: AccountSnapshot) -> AccountSnapshot:
         if not snapshot.reconciled:

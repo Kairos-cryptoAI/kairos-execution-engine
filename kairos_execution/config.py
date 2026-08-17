@@ -14,6 +14,7 @@ class ExecSettings(CoreSettings):
     account_id: str = "primary"
     account_snapshot_interval_s: float = Field(default=15.0, gt=0)
     dry_run_equity_usd: float = Field(default=10_000.0, gt=0)
+    idempotency_cache_size: int = Field(default=10_000, ge=1)
 
     # EVEDEX
     evedex_exchange_url: str = "https://exchange-api.evedex.com"
@@ -27,4 +28,4 @@ class ExecSettings(CoreSettings):
     ccxt_secret: str = ""
     ccxt_sandbox: bool = True
 
-    default_trail_pct: float = 0.01  # 1% trailing stop
+    default_trail_pct: float = Field(default=0.01, gt=0, lt=1)  # initial 1% protective distance
