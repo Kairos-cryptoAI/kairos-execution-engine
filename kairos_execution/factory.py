@@ -24,6 +24,7 @@ def build_adapter(settings: ExecSettings) -> ExchangeAdapter:
             jwt=settings.evedex_jwt,
             dry_run=settings.dry_run,
             dry_run_equity_usd=settings.dry_run_equity_usd,
+            symbol_map=settings.evedex_symbol_map,
         )
     if settings.exchange == "ccxt":
         from .adapters.ccxt_adapter import CCXTAdapter

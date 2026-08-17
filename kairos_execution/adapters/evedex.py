@@ -51,6 +51,7 @@ class EvedexAdapter(ExchangeAdapter):
         jwt: str | None = None,
         dry_run: bool = True,
         dry_run_equity_usd: float = 10_000.0,
+        symbol_map: dict[str, str] | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.base = exchange_base_url.rstrip("/")
@@ -62,16 +63,26 @@ class EvedexAdapter(ExchangeAdapter):
         self._clock = clock or (lambda: datetime.now(UTC))
         self._bucket = TokenBucket(30, 60.0)
         self._session = None
+        normalized = {
+            self._normalized_symbol(source, "logical symbol"): self._normalized_symbol(
+                target, "EVEDEX instrument"
+            )
+            for source, target in (symbol_map or {}).items()
+        }
+        if len(set(normalized.values())) != len(normalized):
+            raise ValueError("EVEDEX symbol map must be one-to-one")
+        self._symbol_map = normalized
+        self._reverse_symbol_map = {target: source for source, target in normalized.items()}
 
     # ---- signing helpers -------------------------------------------------
     def _sign(self, schema_key: str, message: dict[str, Any]) -> str:
         types = EIP712_SCHEMAS[schema_key]
         return self.signer.sign_typed_data(build_domain(self.chain_id), types, message)
 
-    def _limit_message(self, intent: OrderIntent, order_id: str) -> dict[str, Any]:
+    def _limit_message(self, intent: OrderIntent, order_id: str, instrument: str) -> dict[str, Any]:
         return {
             "id": order_id,
-            "instrument": intent.symbol,
+            "instrument": instrument,
             "side": intent.side.value,
             "leverage": int(intent.leverage),
             "quantity": to_eth_number(intent.quantity),
@@ -121,6 +132,7 @@ class EvedexAdapter(ExchangeAdapter):
 
     # ---- ExchangeAdapter -------------------------------------------------
     async def place_order(self, intent: OrderIntent) -> ExecutionReport:
+        instrument = self._venue_symbol(intent.symbol)
         notional = (intent.price or 0) * intent.quantity
         if intent.order_type is OrderType.LIMIT and notional < MIN_NOTIONAL_USD:
             return self._report(intent, OrderStatus.REJECTED, msg="below $5 min notional")
@@ -148,7 +160,7 @@ class EvedexAdapter(ExchangeAdapter):
         if intent.order_type is OrderType.MARKET:
             message = {
                 "id": order_id,
-                "instrument": intent.symbol,
+                "instrument": instrument,
                 "side": intent.side.value,
                 "timeInForce": (intent.time_in_force or TimeInForce.IOC).value,
                 "leverage": int(intent.leverage),
@@ -158,7 +170,7 @@ class EvedexAdapter(ExchangeAdapter):
             signature = self._sign("New market order", message)
             resp = await self._post("/api/v2/order/market", {**message, "signature": signature})
         else:
-            message = self._limit_message(intent, order_id)
+            message = self._limit_message(intent, order_id, instrument)
             signature = self._sign("New limit order", message)
             resp = await self._post("/api/v2/order/limit", {**message, "signature": signature})
 
@@ -186,6 +198,7 @@ class EvedexAdapter(ExchangeAdapter):
         side: OrderSide | None = None,
         client_order_id: str | None = None,
     ) -> ExecutionReport:  # pragma: no cover - thin
+        instrument = self._venue_symbol(symbol)
         close_id = client_order_id
         if close_id is None or not is_evedex_client_order_id(close_id):
             raise ValueError("close_position requires a valid deterministic EVEDEX client order ID")
@@ -197,14 +210,14 @@ class EvedexAdapter(ExchangeAdapter):
             raise ValueError("close_position quantity must be positive")
         message = {
             "id": close_id,
-            "instrument": symbol,
+            "instrument": instrument,
             "leverage": 1,
             "quantity": to_eth_number(quantity or 0),
             "chainId": int(self.chain_id),
         }
         signature = self._sign("Position close order", message)
         resp = await self._post(
-            f"/api/v2/position/{symbol}/close",
+            f"/api/v2/position/{instrument}/close",
             {**message, "signature": signature},
         )
         response_id = resp.get("id")
@@ -228,7 +241,7 @@ class EvedexAdapter(ExchangeAdapter):
         )
 
     async def set_leverage(self, symbol: str, leverage: float) -> None:  # pragma: no cover - thin
-        await self._put(f"/api/position/{symbol}", {"leverage": int(leverage)})
+        await self._put(f"/api/position/{self._venue_symbol(symbol)}", {"leverage": int(leverage)})
 
     async def set_protective_stop(
         self,
@@ -237,10 +250,11 @@ class EvedexAdapter(ExchangeAdapter):
         position_side: OrderSide,
         parent_order_id: str,
     ) -> ProtectiveStopAck:
+        instrument = self._venue_symbol(symbol)
         if not is_evedex_client_order_id(parent_order_id):
             raise ValueError("EVEDEX protective stop requires the authoritative parent order ID")
         message = {
-            "instrument": symbol,
+            "instrument": instrument,
             "type": "stop-loss",
             # EVEDEX TpSl.side is the protected position side, not the side of
             # the market order that will eventually close that position.
@@ -251,7 +265,7 @@ class EvedexAdapter(ExchangeAdapter):
         }
         signature = self._sign("New take-profit/stop-loss", message)
         resp = await self._post(
-            f"/api/tpsl/{symbol}",
+            f"/api/tpsl/{instrument}",
             {
                 **message,
                 "signature": signature,
@@ -271,7 +285,7 @@ class EvedexAdapter(ExchangeAdapter):
                 raise ValueError("EVEDEX protective-stop ID was not uniquely reconciled via GET /api/tpsl")
             self._validate_protective_stop_record(
                 matches[0],
-                symbol=symbol,
+                symbol=instrument,
                 position_side=position_side,
                 parent_order_id=parent_order_id,
                 stop_price=stop_price,
@@ -285,6 +299,7 @@ class EvedexAdapter(ExchangeAdapter):
         position_side: OrderSide,
         parent_order_id: str,
     ) -> ProtectiveStopAck | None:
+        instrument = self._venue_symbol(symbol)
         if not is_evedex_client_order_id(parent_order_id):
             raise ValueError("EVEDEX protective-stop lookup requires an authoritative parent order ID")
         if self.dry_run:
@@ -298,7 +313,7 @@ class EvedexAdapter(ExchangeAdapter):
             if str(echoed_parent or "") == parent_order_id:
                 self._validate_protective_stop_record(
                     record,
-                    symbol=symbol,
+                    symbol=instrument,
                     position_side=position_side,
                     parent_order_id=parent_order_id,
                     stop_price=stop_price,
@@ -309,7 +324,7 @@ class EvedexAdapter(ExchangeAdapter):
                 try:
                     self._validate_protective_stop_record(
                         record,
-                        symbol=symbol,
+                        symbol=instrument,
                         position_side=position_side,
                         parent_order_id=parent_order_id,
                         stop_price=stop_price,
@@ -349,21 +364,22 @@ class EvedexAdapter(ExchangeAdapter):
             raise ValueError("EVEDEX reconciliation requires a deterministic client order ID")
         if self.dry_run:
             return False
+        instrument = self._venue_symbol(symbol)
         orders = self._as_list(await self._get("/api/order/opened"))
         return any(
-            str(item.get("id")) == client_order_id
-            and str(item.get("instrument", "")).upper() == symbol.upper()
+            str(item.get("id")) == client_order_id and str(item.get("instrument", "")).upper() == instrument
             for item in orders
         )
 
     async def is_position_flat(self, symbol: str) -> bool:
         if self.dry_run:
             return True
+        instrument = self._venue_symbol(symbol)
         positions = self._as_list(await self._get("/api/position"))
         for item in positions:
-            if str(item.get("instrument", "")).upper() != symbol.upper():
+            if str(item.get("instrument", "")).upper() != instrument:
                 continue
-            if self._required_float(item.get("quantity"), f"{symbol}.quantity") > 0:
+            if self._required_float(item.get("quantity"), f"{instrument}.quantity") > 0:
                 return False
         return True
 
@@ -512,14 +528,15 @@ class EvedexAdapter(ExchangeAdapter):
         )
 
     async def _open_position_quantity(self, symbol: str) -> float:
+        instrument = self._venue_symbol(symbol)
         positions = self._as_list(await self._get("/api/position"))
         quantity = sum(
-            self._required_float(item.get("quantity"), f"{symbol}.quantity")
+            self._required_float(item.get("quantity"), f"{instrument}.quantity")
             for item in positions
-            if str(item.get("instrument", "")).upper() == symbol.upper()
+            if str(item.get("instrument", "")).upper() == instrument
         )
         if quantity <= 0:
-            raise ValueError(f"no open EVEDEX position for {symbol}")
+            raise ValueError(f"no open EVEDEX position for {instrument}")
         return quantity
 
     def _position_snapshot(
@@ -530,9 +547,10 @@ class EvedexAdapter(ExchangeAdapter):
         captured_at: datetime,
         protective_stop_id: str | None,
     ) -> PositionSnapshot:
-        symbol = str(item.get("instrument", ""))
-        if not symbol:
+        venue_symbol = str(item.get("instrument", ""))
+        if not venue_symbol:
             raise ValueError("EVEDEX position has no instrument")
+        symbol = self._logical_symbol(venue_symbol)
         quantity = self._required_float(item.get("quantity"), f"{symbol}.quantity")
         side = str(item.get("side", "")).upper()
         if side not in {"BUY", "SELL"}:
@@ -595,6 +613,25 @@ class EvedexAdapter(ExchangeAdapter):
             abs(expected[key] - actual[key]) > 1e-8 for key in expected
         ):
             raise ValueError(f"EVEDEX {kind} detail does not match available-balance snapshot")
+
+    @staticmethod
+    def _normalized_symbol(value: Any, field: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{field} must be a non-empty string")
+        normalized = value.strip().upper()
+        if not normalized.isalnum():
+            raise ValueError(f"{field} must be alphanumeric")
+        return normalized
+
+    def _venue_symbol(self, symbol: str) -> str:
+        logical = self._normalized_symbol(symbol, "logical symbol")
+        return self._symbol_map.get(logical, logical)
+
+    def _logical_symbol(self, instrument: str) -> str:
+        venue = self._normalized_symbol(instrument, "EVEDEX instrument")
+        if self._reverse_symbol_map and venue not in self._reverse_symbol_map:
+            raise ValueError(f"EVEDEX instrument {venue!r} is not present in the configured symbol map")
+        return self._reverse_symbol_map.get(venue, venue)
 
     @staticmethod
     def _as_list(payload: Any) -> list[dict[str, Any]]:

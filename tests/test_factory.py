@@ -27,3 +27,4 @@ def test_live_ccxt_requires_api_credentials():
 def test_dry_run_remains_keyless():
     adapter = build_adapter(ExecSettings(exchange="evedex", dry_run=True))
     assert adapter.dry_run is True
+    assert adapter._venue_symbol("BTCUSDT") == "BTCUSD"

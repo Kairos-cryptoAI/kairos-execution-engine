@@ -6,6 +6,16 @@ from kairos_core.config import CoreSettings
 from pydantic import Field
 
 
+def _default_evedex_symbol_map() -> dict[str, str]:
+    return {
+        "BTCUSDT": "BTCUSD",
+        "ETHUSDT": "ETHUSD",
+        "SOLUSDT": "SOLUSD",
+        "BNBUSDT": "BNBUSD",
+        "XRPUSDT": "XRPUSD",
+    }
+
+
 class ExecSettings(CoreSettings):
     service_name: str = "kairos-execution-engine"
 
@@ -22,6 +32,7 @@ class ExecSettings(CoreSettings):
     evedex_chain_id: int = 1
     evedex_jwt: str | None = None
     evedex_private_key: str | None = None  # wallet key for EIP-712 signing
+    evedex_symbol_map: dict[str, str] = Field(default_factory=_default_evedex_symbol_map)
 
     # CCXT (testing on other venues)
     ccxt_exchange_id: str = "binanceusdm"

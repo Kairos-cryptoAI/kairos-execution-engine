@@ -75,6 +75,35 @@ async def test_valid_evedex_order_id_is_preserved():
 
 
 @pytest.mark.asyncio
+async def test_symbol_map_translates_orders_and_preserves_logical_report_symbol():
+    signer = RecordingSigner()
+    adapter = EvedexAdapter(
+        exchange_base_url="https://example.invalid",
+        signer=signer,
+        chain_id=1,
+        dry_run=True,
+        symbol_map={"BTCUSDT": "BTCUSD"},
+        clock=lambda: NOW,
+    )
+
+    report = await adapter.place_order(_intent())
+
+    assert signer.messages[-1]["instrument"] == "BTCUSD"
+    assert report.symbol == "BTCUSDT"
+
+
+def test_symbol_map_must_be_one_to_one():
+    with pytest.raises(ValueError, match="one-to-one"):
+        EvedexAdapter(
+            exchange_base_url="https://example.invalid",
+            signer=RecordingSigner(),
+            chain_id=1,
+            dry_run=True,
+            symbol_map={"BTCUSDT": "BTCUSD", "WBTCUSDT": "BTCUSD"},
+        )
+
+
+@pytest.mark.asyncio
 async def test_legacy_order_id_is_mapped_deterministically():
     adapter = EvedexAdapter(
         exchange_base_url="https://example.invalid",
@@ -726,4 +755,79 @@ async def test_account_snapshot_rejects_non_numeric_position_quantity():
     adapter._get = AsyncMock(side_effect=lambda path: responses[path])
 
     with pytest.raises(ValueError, match="quantity is not numeric"):
+        await adapter.fetch_account_snapshot(account_id="primary", peak_equity_usd=10_000)
+
+
+@pytest.mark.asyncio
+async def test_account_snapshot_maps_venue_instrument_back_to_logical_symbol():
+    adapter = EvedexAdapter(
+        exchange_base_url="https://example.invalid",
+        signer=RecordingSigner(),
+        chain_id=1,
+        jwt="jwt",
+        dry_run=False,
+        symbol_map={"BTCUSDT": "BTCUSD"},
+        clock=lambda: NOW,
+    )
+    responses = {
+        "/api/user/me": {"exchangeId": "exchange-42", "marginCall": False},
+        "/api/market/available-balance": {
+            "funding": {"balance": "10000"},
+            "availableBalance": "9000",
+            "negativeUnPnL": 0,
+            "position": [{"instrument": "BTCUSD", "side": "BUY", "volume": "0.2"}],
+            "openOrder": [],
+        },
+        "/api/position": [
+            {
+                "instrument": "BTCUSD",
+                "side": "BUY",
+                "quantity": "0.2",
+                "avgPrice": "65000",
+            }
+        ],
+        "/api/order/opened": [],
+        "/api/tpsl": {"list": []},
+    }
+    adapter._get = AsyncMock(side_effect=lambda path: responses[path])
+
+    snapshot = await adapter.fetch_account_snapshot(account_id="primary", peak_equity_usd=10_000)
+
+    assert snapshot.positions[0].symbol == "BTCUSDT"
+
+
+@pytest.mark.asyncio
+async def test_account_snapshot_rejects_unmapped_venue_position():
+    adapter = EvedexAdapter(
+        exchange_base_url="https://example.invalid",
+        signer=RecordingSigner(),
+        chain_id=1,
+        jwt="jwt",
+        dry_run=False,
+        symbol_map={"BTCUSDT": "BTCUSD"},
+        clock=lambda: NOW,
+    )
+    responses = {
+        "/api/user/me": {"exchangeId": "exchange-42", "marginCall": False},
+        "/api/market/available-balance": {
+            "funding": {"balance": "10000"},
+            "availableBalance": "9000",
+            "negativeUnPnL": 0,
+            "position": [{"instrument": "DOGEUSD", "side": "BUY", "volume": "1"}],
+            "openOrder": [],
+        },
+        "/api/position": [
+            {
+                "instrument": "DOGEUSD",
+                "side": "BUY",
+                "quantity": "1",
+                "avgPrice": "0.2",
+            }
+        ],
+        "/api/order/opened": [],
+        "/api/tpsl": {"list": []},
+    }
+    adapter._get = AsyncMock(side_effect=lambda path: responses[path])
+
+    with pytest.raises(ValueError, match="not present in the configured symbol map"):
         await adapter.fetch_account_snapshot(account_id="primary", peak_equity_usd=10_000)
