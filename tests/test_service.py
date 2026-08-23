@@ -5,11 +5,20 @@ from types import SimpleNamespace
 import pytest
 from kairos_core.bus.base import BusEnvelope
 from kairos_core.contracts import AccountSnapshot, ExecutionReport, OrderIntent, ValidatedOrder
-from kairos_core.enums import OrderSide, OrderStatus, OrderType, ReasonCode, SystemMode
+from kairos_core.enums import (
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    ReasonCode,
+    SystemMode,
+    TradingMode,
+)
 from kairos_core.topics import Topics
 
 from kairos_execution.engine import ExecutionSafetyError
+from kairos_execution.paper_engine import PaperExecutionResult
 from kairos_execution.service import ExecutionService
+from tests.paper_fixtures import approved_decision
 
 
 class FakeAdapter:
@@ -206,6 +215,39 @@ async def test_publish_failure_leaves_order_pending():
 
     assert events == ["handle", "publish"]
     assert service._account_refresh.qsize() == 1
+
+
+@pytest.mark.asyncio
+async def test_paper_consumes_only_strict_risk_decisions_and_acks_after_handle():
+    decision = approved_decision()
+    envelope = BusEnvelope(
+        id="paper-decision-1",
+        topic=Topics.RISK_TRADE_DECISION,
+        payload=decision.to_payload(),
+    )
+    events: list[str] = []
+    bus = FakeBus({Topics.RISK_TRADE_DECISION: [envelope], Topics.VALIDATED_ORDER: [_order_envelope()]})
+    bus.events = events
+
+    class FakePaperEngine:
+        async def handle(self, value):
+            assert value.trade_id == decision.trade_id
+            events.append("paper-handle")
+            return PaperExecutionResult(events=())
+
+    service = object.__new__(ExecutionService)
+    service.settings = SimpleNamespace(trading_mode=TradingMode.PAPER)
+    service.bus = bus
+    service.engine = None
+    service.paper_engine = FakePaperEngine()
+    service._account_refresh = asyncio.Queue(maxsize=1)
+
+    await service._consume_paper_decisions()
+
+    assert events == ["paper-handle", "ack"]
+    assert service._account_refresh.qsize() == 1
+    with pytest.raises(RuntimeError, match="must never subscribe"):
+        await service._consume_orders()
 
 
 @pytest.mark.asyncio
