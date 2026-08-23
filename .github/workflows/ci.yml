@@ -34,6 +34,10 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install Node.js 22 for sidecar client tests
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+        with:
+          node-version: "22"
       - name: Install uv and Python
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
@@ -56,12 +60,38 @@ jobs:
       - name: Build source and wheel distributions
         run: uv build --no-sources
 
+  evedex-sidecar:
+    name: EVEDEX sidecar / Node 22
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: kairos_execution/evedex_sidecar
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install Node.js
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: kairos_execution/evedex_sidecar/package-lock.json
+      - name: Install pinned production dependencies
+        run: npm ci --omit=dev --ignore-scripts
+      - name: Test protocol and pinned SDK assumptions
+        run: npm test
+      - name: Audit production dependency tree
+        run: npm audit --omit=dev
+
   optional-adapters:
     name: All exchange adapters
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install Node.js 22 for sidecar client tests
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+        with:
+          node-version: "22"
       - name: Install uv and Python
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:

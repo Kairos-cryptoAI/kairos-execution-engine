@@ -6,6 +6,8 @@ build/
 dist/
 .venv/
 venv/
+# Obsolete local npm install from the pre-packaged sidecar layout.
+sidecar/
 # Tooling
 .mypy_cache/
 .ruff_cache/
