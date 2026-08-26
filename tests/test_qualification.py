@@ -3,6 +3,8 @@ from datetime import UTC, datetime
 
 import pytest
 
+import kairos_execution.qualification as qualification
+from kairos_execution.config import _default_evedex_dev_symbol_map
 from kairos_execution.qualification import (
     CheckStatus,
     EvedexQualificationReport,
@@ -173,3 +175,32 @@ def test_secret_file_must_not_be_empty(tmp_path):
     secret.write_text("\n", encoding="utf-8")
     with pytest.raises(ValueError, match="empty"):
         _read_secret_file(secret)
+
+
+def test_cli_defaults_to_the_exact_dev_profile(monkeypatch, tmp_path):
+    captured = {}
+
+    async def fake_qualify(**kwargs):
+        captured.update(kwargs)
+        return EvedexQualificationReport(
+            schema_version=1,
+            generated_at=NOW.isoformat(),
+            exchange_base_url=kwargs["exchange_base_url"],
+            symbol_map=kwargs["symbol_map"],
+            authenticated=False,
+            checks=(QualificationCheck("credentials", CheckStatus.BLOCKED, "not supplied"),),
+        )
+
+    monkeypatch.setattr(qualification, "qualify_evedex", fake_qualify)
+    output = tmp_path / "qualification.json"
+
+    assert qualification.main(["--output", str(output)]) == 2
+    assert captured["exchange_base_url"] == "https://trading-api.evedex.tech"
+    assert captured["symbol_map"] == _default_evedex_dev_symbol_map()
+    assert set(captured["symbol_map"].values()) == {
+        "BTCUSD:DEV",
+        "ETHUSD:DEV",
+        "SOLUSD:DEV",
+        "BNBUSD:DEV",
+        "XRPUSD:DEV",
+    }

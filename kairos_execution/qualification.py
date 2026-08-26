@@ -1,4 +1,4 @@
-"""Read-only EVEDEX qualification with machine-readable fail-closed evidence."""
+"""Read-only EVEDEX DEV qualification with machine-readable fail-closed evidence."""
 
 from __future__ import annotations
 
@@ -471,8 +471,8 @@ def _read_secret_file(path: Path | None) -> str | None:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run read-only EVEDEX venue qualification")
-    parser.add_argument("--exchange-base-url", default="https://exchange-api.evedex.com")
+    parser = argparse.ArgumentParser(description="Run read-only EVEDEX DEV venue qualification")
+    parser.add_argument("--exchange-base-url", default="https://trading-api.evedex.tech")
     parser.add_argument("--jwt-file", type=Path, help="read JWT from a file; never pass it on argv")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--overwrite", action="store_true")
@@ -481,12 +481,12 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    from .config import _default_evedex_symbol_map
+    from .config import _default_evedex_dev_symbol_map
 
     report = asyncio.run(
         qualify_evedex(
             exchange_base_url=args.exchange_base_url,
-            symbol_map=_default_evedex_symbol_map(),
+            symbol_map=_default_evedex_dev_symbol_map(),
             jwt=_read_secret_file(args.jwt_file),
         )
     )
