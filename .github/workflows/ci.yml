@@ -115,20 +115,22 @@ jobs:
         env:
           POSTGRES_USER: kairos
           POSTGRES_PASSWORD: kairos_test
-          POSTGRES_DB: kairos
+          POSTGRES_DB: kairos_execution_test_000000000001
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U kairos -d kairos"
+          --health-cmd "pg_isready -U kairos -d kairos_execution_test_000000000001"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
     env:
-      KAIROS_PERSISTENCE_DATABASE_URL: postgresql://kairos:kairos_test@localhost:5432/kairos
+      KAIROS_PERSISTENCE_DATABASE_URL: postgresql://kairos:kairos_test@localhost:5432/kairos_execution_test_000000000001
+      KAIROS_EXECUTION_TEST_DATABASE: kairos_execution_test_000000000001
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
+          version: "0.12.3"
           enable-cache: true
           python-version: "3.11"
       - run: uv sync --python 3.11 --locked --dev --extra evedex

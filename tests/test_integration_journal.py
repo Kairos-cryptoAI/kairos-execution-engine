@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from datetime import timedelta
 from unittest.mock import AsyncMock
 
@@ -11,11 +10,11 @@ from kairos_persistence import (
     EffectStatus,
     EffectType,
     ExecutionJournalRepository,
-    PersistenceSettings,
 )
 
 from kairos_execution.adapters.evedex import EvedexAdapter
 from kairos_execution.journaled_adapter import JournaledExchangeAdapter
+from tests.disposable_database import connect_disposable_database, disposable_settings
 
 pytestmark = pytest.mark.integration
 
@@ -29,18 +28,10 @@ class _Signer:
         return "0x" + "00" * 65
 
 
-def _settings() -> PersistenceSettings:
-    database_url = os.getenv("KAIROS_PERSISTENCE_DATABASE_URL")
-    if not database_url:
-        pytest.skip("KAIROS_PERSISTENCE_DATABASE_URL is required")
-    return PersistenceSettings(database_url=database_url)
-
-
 @pytest.mark.asyncio
 async def test_crashed_tpsl_create_is_found_by_parent_and_reconciled_without_second_post() -> None:
-    database = Database(_settings())
-    await database.connect()
-    await database.migrate()
+    database = Database(disposable_settings())
+    await connect_disposable_database(database)
     journal = ExecutionJournalRepository(database.pool)
     raw = EvedexAdapter(
         exchange_base_url="https://example.invalid",

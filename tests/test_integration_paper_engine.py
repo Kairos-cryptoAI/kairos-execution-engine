@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -17,13 +16,13 @@ from kairos_persistence import (
     EffectType,
     ExecutionJournalRepository,
     NewTrade,
-    PersistenceSettings,
     TradeLifecycleRepository,
     TradeState,
 )
 
 from kairos_execution.config import ExecSettings
 from kairos_execution.paper_engine import PaperExecutionEngine, PaperExecutionSafetyError
+from tests.disposable_database import connect_disposable_database, disposable_settings
 from tests.paper_fixtures import T0, approved_decision
 
 pytestmark = pytest.mark.integration
@@ -272,13 +271,6 @@ class FakePaperAdapter:
         return {"id": tpsl_id, "status": "CANCELED"}
 
 
-def _database_settings() -> PersistenceSettings:
-    database_url = os.getenv("KAIROS_PERSISTENCE_DATABASE_URL")
-    if not database_url:
-        pytest.skip("KAIROS_PERSISTENCE_DATABASE_URL is required")
-    return PersistenceSettings(database_url=database_url)
-
-
 def _exec_settings(tmp_path: Path) -> ExecSettings:
     return ExecSettings(
         trading_mode="PAPER",
@@ -292,9 +284,8 @@ def _exec_settings(tmp_path: Path) -> ExecSettings:
 
 @pytest.fixture
 async def paper_runtime(tmp_path: Path):
-    database = Database(_database_settings())
-    await database.connect()
-    await database.migrate()
+    database = Database(disposable_settings())
+    await connect_disposable_database(database)
     settings = _exec_settings(tmp_path)
     environment = f"{settings.environment}:EVEDEX:DEV:PAPER"
     pool = database.pool
