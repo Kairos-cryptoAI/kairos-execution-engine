@@ -1,0 +1,12 @@
+**
+!pyproject.toml
+!uv.lock
+!README.md
+!.python-version
+!kairos_execution/
+!kairos_execution/**
+!tests/
+!tests/**
+**/__pycache__/
+**/*.pyc
+kairos_execution/evedex_sidecar/node_modules/

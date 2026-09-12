@@ -50,6 +50,9 @@ class ExecSettings(CoreSettings):
     evedex_dev_api_key_file: Path | None = None
     evedex_dev_private_key_file: Path | None = None
     evedex_dev_expected_account_id: str | None = None
+    # Non-secret independent receipt/config scope. Missing/invalid means no new
+    # canary entries; it must never prevent existing exposure recovery or exits.
+    canary_scope_file: Path | None = None
     evedex_sidecar_node: str = "node"
     evedex_sidecar_script: Path = Path(__file__).parent / "evedex_sidecar" / "src" / "main.js"
     evedex_sidecar_timeout_s: float = Field(default=20.0, gt=0, le=120)

@@ -22,6 +22,7 @@ from kairos_persistence import (
 
 from kairos_execution.config import ExecSettings
 from kairos_execution.paper_engine import PaperExecutionEngine, PaperExecutionSafetyError
+from tests.canary_admission_fixtures import LayeredCanaryAdmission, expected_scope
 from tests.disposable_database import connect_disposable_database, disposable_settings
 from tests.paper_fixtures import T0, approved_decision
 
@@ -331,6 +332,8 @@ def _engine(database: Database, settings: ExecSettings, clock: MutableClock, ada
         ExecutionJournalRepository(database.pool),
         settings,
         clock=clock,
+        canary_sessions=LayeredCanaryAdmission(),
+        canary_scope=expected_scope(settings),
     )
 
 
@@ -660,6 +663,8 @@ async def test_small_local_clock_skew_waits_to_next_bar_without_redis_reclaim(
         settings,
         clock=clock,
         sleeper=advance_clock,
+        canary_sessions=LayeredCanaryAdmission(),
+        canary_scope=expected_scope(settings),
     )
     assert await engine.initialize_recovery() == ()
 
@@ -1055,6 +1060,8 @@ async def test_crash_after_venue_call_recovers_without_second_entry(paper_runtim
         effects,
         settings,
         clock=clock,
+        canary_sessions=LayeredCanaryAdmission(),
+        canary_scope=expected_scope(settings),
     )
     decision = approved_decision()
     trade = await _atomic_entry_pending(engine, decision)

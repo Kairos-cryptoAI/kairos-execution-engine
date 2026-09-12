@@ -142,6 +142,14 @@ the configured production universe one-to-one to the venue's `*USD` instruments 
 maps reconciled positions back to their logical identities. An unmapped live position
 invalidates the account snapshot instead of silently creating a second symbol domain.
 
+New technical canary entries additionally require a persisted bounded session and an
+independently configured, read-only `KAIROS_CANARY_SCOPE_FILE`. The session admits at
+most ten attempts within two hours after a verified 24-hour observation receipt.
+Entry dispatch claims commit before the venue call and survive crashes; stopping a
+session never disables protection or recovery of an existing position. See
+[bounded entry admission](docs/BOUNDED_ENTRY_ADMISSION.md). This is an engineering
+gate, not evidence of completed real DEV qualification.
+
 Run the GET-only venue qualification without credentials:
 
 ```powershell

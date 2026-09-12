@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
-from typing import Any
+from typing import Any, cast
 
 from kairos_core.contracts import (
     AccountSnapshotV2,
@@ -51,8 +51,10 @@ from kairos_persistence import (
     TradeRecord,
     TradeState,
 )
+from kairos_persistence.canary_session import CanaryScope, CanarySessionRepository
 
 from .adapters.evedex_sidecar import EvedexSidecarAdapter
+from .canary_admission import CanaryAdmissionRepository, load_expected_scope
 from .config import ExecSettings
 from .state_machine import client_order_id
 
@@ -129,6 +131,8 @@ class PaperExecutionEngine:
         sleeper: Callable[[float], Awaitable[None]] | None = None,
         mutation_budget: ExecutionMutationBudgetRepository | None = None,
         runtime_health: ExecutionRuntimeHealthRepository | None = None,
+        canary_sessions: CanaryAdmissionRepository | None = None,
+        canary_scope: CanaryScope | None = None,
     ) -> None:
         if settings.trading_mode is not TradingMode.PAPER:
             raise ValueError("PaperExecutionEngine requires TradingMode.PAPER")
@@ -145,6 +149,16 @@ class PaperExecutionEngine:
         self._operational_telemetry: dict[str, str] = {}
         self._last_sidecar_health: dict[str, Any] = {}
         self._lifecycle_lock = asyncio.Lock()
+        self._canary_sessions = canary_sessions
+        self._canary_scope: CanaryScope | None = None
+        self._canary_scope_error = "MISSING"
+        try:
+            self._canary_scope = load_expected_scope(settings, canary_scope)
+            self._canary_scope_error = ""
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            # Validation/file errors may include paths or file contents. Keep
+            # their type only, and do not disable recovery of existing trades.
+            self._canary_scope_error = type(exc).__name__
 
     @property
     def recovery_blocked(self) -> bool:
@@ -352,6 +366,9 @@ class PaperExecutionEngine:
 
         trade_id = self._required_text(decision.trade_id, "trade_id")
         entry_client_id = self._client_id(trade_id, OrderRole.ENTRY, decision.decided_at_ms)
+        existing = await self.trades.get(trade_id)
+        if existing is None and now_ms <= decision.intent.entry_expires_ts_ms:
+            await self._bind_canary_entry(decision, self._effect_id(trade_id, OrderRole.ENTRY, "place"))
         new_trade = NewTrade(
             trade_id=trade_id,
             strategy_intent_id=self._required_text(decision.intent.intent_id, "intent_id"),
@@ -1492,6 +1509,7 @@ class PaperExecutionEngine:
         effect_id: str,
         client_order_id: str,
     ) -> EffectPreparation:
+        await self._bind_canary_entry(decision, effect_id)
         self._assert_fresh_entry_market(decision, int(self.clock().astimezone(UTC).timestamp() * 1000))
         request = {
             "trade_id": trade.trade_id,
@@ -1561,27 +1579,42 @@ class PaperExecutionEngine:
             compensation=False,
             require_entry_headroom=True,
         )
-        response = await self.adapter.place_limit(
-            effect_id=effect_id,
-            client_order_id=client_order_id,
-            symbol=trade.symbol,
-            side=self._order_side(decision),
-            quantity=decision.quantity,
-            limit_price=decision.worst_entry_price,
-            leverage=decision.leverage,
-            post_only=False,
-        )
-        exchange_order_id, _, _, _ = self._validate_entry_response(
-            response,
-            decision=decision,
-            client_order_id=client_order_id,
-        )
-        await self.effects.confirm(
-            effect_id,
-            exchange_effect_id=exchange_order_id,
-            response_payload=response,
-        )
+        admission, scope = self._canary_entry_admission()
+        async with admission.final_dispatch(decision=decision, expected_scope=scope, effect_id=effect_id):
+            response = await self.adapter.place_limit(
+                effect_id=effect_id,
+                client_order_id=client_order_id,
+                symbol=trade.symbol,
+                side=self._order_side(decision),
+                quantity=decision.quantity,
+                limit_price=decision.worst_entry_price,
+                leverage=decision.leverage,
+                post_only=False,
+            )
+            exchange_order_id, _, _, _ = self._validate_entry_response(
+                response,
+                decision=decision,
+                client_order_id=client_order_id,
+            )
+            await self.effects.confirm(
+                effect_id,
+                exchange_effect_id=exchange_order_id,
+                response_payload=response,
+            )
         return response
+
+    def _canary_entry_admission(self) -> tuple[CanaryAdmissionRepository, CanaryScope]:
+        if self._canary_scope is None:
+            raise PaperExecutionSafetyError(
+                f"new canary entries require an independent valid scope ({self._canary_scope_error})"
+            )
+        if self._canary_sessions is None:
+            self._canary_sessions = cast(CanaryAdmissionRepository, CanarySessionRepository(self.trades.pool))
+        return self._canary_sessions, self._canary_scope
+
+    async def _bind_canary_entry(self, decision: RiskTradeDecisionV1, effect_id: str) -> None:
+        admission, scope = self._canary_entry_admission()
+        await admission.bind_entry(decision=decision, expected_scope=scope, effect_id=effect_id)
 
     async def _assert_entry_admission(self, trade: TradeRecord) -> None:
         if not await self.trades.entries_allowed(
