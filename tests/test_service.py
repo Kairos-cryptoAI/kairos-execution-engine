@@ -1,6 +1,7 @@
 import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from kairos_core.bus.base import BusEnvelope
@@ -18,7 +19,8 @@ from kairos_core.topics import Topics
 from kairos_execution.engine import ExecutionSafetyError
 from kairos_execution.paper_engine import PaperExecutionResult
 from kairos_execution.service import ExecutionService
-from tests.paper_fixtures import approved_decision
+from tests.paper_fixtures import approved_decision, rejected_decision
+from tests.test_paper_rejections import rejection_engine
 
 
 class FakeAdapter:
@@ -248,6 +250,62 @@ async def test_paper_consumes_only_strict_risk_decisions_and_acks_after_handle()
     assert service._account_refresh.qsize() == 1
     with pytest.raises(RuntimeError, match="must never subscribe"):
         await service._consume_orders()
+
+
+@pytest.mark.asyncio
+async def test_paper_risk_refusal_and_redelivery_ack_without_execution_or_recovery():
+    decision = rejected_decision()
+    envelopes = [
+        BusEnvelope(
+            id=f"risk-refusal-{index}", topic=Topics.RISK_TRADE_DECISION, payload=decision.to_payload()
+        )
+        for index in range(2)
+    ]
+    bus = FakeBus({Topics.RISK_TRADE_DECISION: envelopes})
+    engine = rejection_engine()
+    engine.block_entries = AsyncMock()
+    initial_blockers = engine.recovery_blockers
+    service = object.__new__(ExecutionService)
+    service.settings = SimpleNamespace(trading_mode=TradingMode.PAPER)
+    service.bus = bus
+    service.engine = None
+    service.paper_engine = engine
+    service._account_refresh = asyncio.Queue(maxsize=1)
+
+    await service._consume_paper_decisions()
+
+    assert bus.events == ["ack", "ack"]
+    assert bus.published == []
+    engine.block_entries.assert_not_awaited()
+    assert engine.recovery_blockers == initial_blockers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_kind", ["foreign-account", "bad-hash"])
+async def test_paper_invalid_refusal_remains_pending_and_requests_recovery(invalid_kind):
+    decision = rejected_decision(
+        account_id="foreign-account" if invalid_kind == "foreign-account" else "kairos-paper-dev-01"
+    )
+    payload = decision.to_payload()
+    if invalid_kind == "bad-hash":
+        payload["decision_id"] = "f" * 64
+    envelope = BusEnvelope(id="invalid-refusal", topic=Topics.RISK_TRADE_DECISION, payload=payload)
+    bus = FakeBus({Topics.RISK_TRADE_DECISION: [envelope]})
+    engine = rejection_engine()
+    engine.block_entries = AsyncMock()
+    service = object.__new__(ExecutionService)
+    service.settings = SimpleNamespace(trading_mode=TradingMode.PAPER)
+    service.bus = bus
+    service.engine = None
+    service.paper_engine = engine
+    service._account_refresh = asyncio.Queue(maxsize=1)
+
+    await service._consume_paper_decisions()
+
+    assert bus.events == []
+    assert bus.published == []
+    engine.block_entries.assert_awaited_once()
+    assert service._account_refresh.qsize() == 1
 
 
 @pytest.mark.asyncio

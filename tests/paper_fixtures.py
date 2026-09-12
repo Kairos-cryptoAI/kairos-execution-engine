@@ -178,3 +178,17 @@ def approved_decision(**overrides: object) -> RiskTradeDecisionV1:
     }
     values.update(overrides)
     return RiskTradeDecisionV1(**values)
+
+
+def rejected_decision(**overrides: object) -> RiskTradeDecisionV1:
+    values: dict[str, object] = {
+        "approved": False,
+        "rejection_reasons": ("venue_entry_blocked",),
+        "quantity": 0,
+        "notional_usd": 0,
+        "worst_case_loss_usd": 0,
+        "estimated_fees_usd": 0,
+        "estimated_slippage_usd": 0,
+    }
+    values.update(overrides)
+    return approved_decision(**values)

@@ -304,6 +304,12 @@ class PaperExecutionEngine:
 
     async def handle(self, decision: RiskTradeDecisionV1) -> PaperExecutionResult:
         """Serialize entry and reconciliation work within this service process."""
+        if not decision.approved:
+            # A Risk refusal is a terminal audit fact, not an attempted venue
+            # mutation. Validate its scope/identity without touching account
+            # recovery or creating/locking a trade, even on delayed redelivery.
+            self._validate_decision(decision)
+            return PaperExecutionResult(events=())
         trade_id = self._required_text(decision.trade_id, "trade_id")
         async with self._lifecycle_lock:
             async with self.trades.account_lock(**self._remote_account_scope):
@@ -3487,6 +3493,29 @@ class PaperExecutionEngine:
         expected_symbol = self.settings.evedex_dev_symbol_map.get(decision.intent.symbol)
         if expected_symbol != decision.venue_symbol:
             raise PaperExecutionSafetyError("risk decision venue symbol is outside the DEV allowlist")
+        if not decision.approved:
+            # Reparse rather than trusting a model_copy/model_construct caller:
+            # the strict contracts verify hashes and nested immutable lineage.
+            # Stale/blocked market data is valid evidence for a refusal and must
+            # not be subjected to the mutation-only admission checks below.
+            try:
+                RiskTradeDecisionV1.model_validate(decision.to_payload())
+            except ValueError as exc:
+                raise PaperExecutionSafetyError(
+                    "rejected risk decision has invalid canonical lineage"
+                ) from exc
+            if any(
+                value != 0
+                for value in (
+                    decision.quantity,
+                    decision.notional_usd,
+                    decision.worst_case_loss_usd,
+                    decision.estimated_fees_usd,
+                    decision.estimated_slippage_usd,
+                )
+            ):
+                raise PaperExecutionSafetyError("rejected risk decision must have zero execution economics")
+            return
         if decision.intent.entry_eligible_ts_ms > decision.venue_quality.expires_at_ms:
             raise PaperExecutionSafetyError(
                 "venue quality expires before NEXT_BAR_MARKET entry becomes eligible"
