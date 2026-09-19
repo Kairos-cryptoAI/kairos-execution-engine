@@ -16,6 +16,22 @@
 mutation route, production/custom endpoints, static JWTs, legacy signing keys, CCXT
 credentials and the EVEDEX PROD/DEMO profiles.
 
+## Isolated market-data simulator
+
+`kairos_execution.simulation` is a separate, SIM-only development contour. It now
+has a durable `SimulationExecutionController` and a disposable PostgreSQL gate for
+replaying sealed Binance UM closed bars and top-N book frames. Its results are always
+`SIMULATED`; they cannot alter `PAPER_QUALIFIED`, `ALPHA_READY` or `LIVE_READY`.
+It has no EVEDEX adapter, provider/API client, listener or secret configuration, and
+is outside `TradingMode` and `PaperExecutionEngine`.
+
+The controller currently accepts already sealed simulation admissions and models
+next-bar IOC entry plus stop, target and timeout exits. The full
+`closed bar -> strategy -> router -> review -> risk -> simulator` pipeline remains
+unwired; the isolated gate supplies deterministic fixtures rather than starting a
+trading service. See [the simulator boundary](docs/SIMULATION_MODEL.md) for its
+implemented lifecycle, assumptions and explicit limitations.
+
 ## Exchanges
 
 - **EVEDEX legacy DRY_RUN** retains the existing deterministic adapter without network
