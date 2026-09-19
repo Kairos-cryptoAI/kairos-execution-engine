@@ -225,12 +225,18 @@ def _frame(
     )
 
 
-def _bar(*, low: float, high: float, close: float) -> ClosedBarEventV1:
+def _bar(
+    *,
+    low: float,
+    high: float,
+    close: float,
+    open_time_ms: int = T0 + 60_000,
+) -> ClosedBarEventV1:
     return ClosedBarEventV1(
         source="controller-test",
         symbol="BTCUSDT",
-        open_time_ms=T0 + 60_000,
-        close_time_ms=T0 + 119_999,
+        open_time_ms=open_time_ms,
+        close_time_ms=open_time_ms + 59_999,
         open=100.0,
         high=high,
         low=low,
@@ -382,6 +388,63 @@ async def test_partial_entry_and_partial_stop_exit_stay_honestly_unresolved() ->
     assert result.final_state == "UNRESOLVED"
     assert result.entry_filled_quantity == pytest.approx(0.005)
     assert result.exit_filled_quantity == pytest.approx(0.003)
+
+
+@pytest.mark.asyncio
+async def test_target_exit_uses_the_sealed_book_and_flattens_once() -> None:
+    entry_frame = _frame(sequence=1, persisted_at_ms=T0 + 60_010)
+    exit_frame = _frame(
+        sequence=2,
+        persisted_at_ms=T0 + 120_010,
+        bids=((105.0, 1.0),),
+        asks=((105.1, 1.0),),
+        previous_frame_sha256=entry_frame.frame_sha256,
+    )
+    repository = _MemoryRepository((entry_frame, exit_frame))
+    controller = SimulationExecutionController(repository)  # type: ignore[arg-type]
+    trade = await controller.start_trade(_admission(entry_frame), created_at_ms=T0 + 60_010)
+
+    entry = await controller.submit_entry(trade, as_of_ms=T0 + 60_035)
+    assert entry.receipt is not None and entry.receipt.status == "FILLED"
+    exit_outcome = await controller.process_closed_bar(
+        trade,
+        _bar(low=96.0, high=106.0, close=105.0),
+        as_of_ms=T0 + 120_025,
+    )
+    assert exit_outcome is not None and exit_outcome.receipt is not None
+    assert exit_outcome.command.command_kind == "TARGET_EXIT_IOC"
+    assert exit_outcome.receipt.status == "FILLED"
+    assert exit_outcome.lifecycle_state == "FLAT"
+    assert trade.trade_id is not None
+    assert repository.results[trade.trade_id].final_state == "FLAT"
+
+
+@pytest.mark.asyncio
+async def test_timeout_exit_requires_a_sealed_book_and_flattens_once() -> None:
+    entry_frame = _frame(sequence=1, persisted_at_ms=T0 + 60_010)
+    exit_frame = _frame(
+        sequence=2,
+        persisted_at_ms=T0 + 180_010,
+        bids=((100.0, 1.0),),
+        previous_frame_sha256=entry_frame.frame_sha256,
+    )
+    repository = _MemoryRepository((entry_frame, exit_frame))
+    controller = SimulationExecutionController(repository)  # type: ignore[arg-type]
+    trade = await controller.start_trade(_admission(entry_frame), created_at_ms=T0 + 60_010)
+
+    entry = await controller.submit_entry(trade, as_of_ms=T0 + 60_035)
+    assert entry.receipt is not None and entry.receipt.status == "FILLED"
+    exit_outcome = await controller.process_closed_bar(
+        trade,
+        _bar(low=96.0, high=104.0, close=100.0, open_time_ms=T0 + 120_000),
+        as_of_ms=T0 + 180_025,
+    )
+    assert exit_outcome is not None and exit_outcome.receipt is not None
+    assert exit_outcome.command.command_kind == "TIMEOUT_EXIT_IOC"
+    assert exit_outcome.receipt.status == "FILLED"
+    assert exit_outcome.lifecycle_state == "FLAT"
+    assert trade.trade_id is not None
+    assert repository.results[trade.trade_id].final_state == "FLAT"
 
 
 @pytest.mark.asyncio
