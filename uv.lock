@@ -1192,7 +1192,7 @@ requires-dist = [
     { name = "ccxt", marker = "extra == 'ccxt'", specifier = ">=4.3,<5" },
     { name = "eth-account", marker = "extra == 'evedex'", specifier = ">=0.11,<1" },
     { name = "kairos-core", git = "https://github.com/Kairos-cryptoAI/kairos-core.git?rev=52aba6b158a52754784162987e7af4ad24c06669" },
-    { name = "kairos-persistence", git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git?rev=f5b1192751f4a8400abe3b17028b2b856d9502ae" },
+    { name = "kairos-persistence", git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git?rev=61c1483032ba4520f54f04618bbc2d0e830e27ae" },
     { name = "pydantic", specifier = ">=2.6,<3" },
     { name = "pydantic-settings", specifier = ">=2.2,<3" },
     { name = "redis", specifier = ">=6.4,<9" },
@@ -1213,7 +1213,7 @@ dev = [
 [[package]]
 name = "kairos-persistence"
 version = "0.1.0"
-source = { git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git?rev=f5b1192751f4a8400abe3b17028b2b856d9502ae#f5b1192751f4a8400abe3b17028b2b856d9502ae" }
+source = { git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git?rev=61c1483032ba4520f54f04618bbc2d0e830e27ae#61c1483032ba4520f54f04618bbc2d0e830e27ae" }
 dependencies = [
     { name = "asyncpg" },
     { name = "kairos-core" },
