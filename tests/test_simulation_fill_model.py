@@ -16,7 +16,7 @@ from kairos_execution.simulation import (
     SimulationIdentityConflict,
     simulate_ioc,
 )
-from kairos_execution.simulation.models import MAX_COMMANDS, CommandReceipt, ConsumedDepth
+from kairos_execution.simulation.models import MAX_COMMANDS, CommandReceipt, ConsumedDepth, LevelFill
 
 D = Decimal
 
@@ -194,6 +194,63 @@ def test_wait_is_non_terminal_and_does_not_consume_book_or_remember_identity() -
     assert waiting.state == original and not waiting.state.receipts
     completed = run(prior=waiting.state)
     assert completed.outcome.status == "FILLED" and len(completed.state.receipts) == 1
+
+
+def test_terminal_no_book_outcome_preserves_causality_without_inventing_a_frame() -> None:
+    request = command()
+    assumptions = policy()
+    outcome = FillOutcome(
+        command_id=request.command_id,
+        command_sha256=request.fingerprint(),
+        assumptions_sha256=assumptions.fingerprint(),
+        frame_sha256=None,
+        status="BLOCKED",
+        reason="NO_ADMITTED_BOOK",
+        arrival_at_ms=1_200,
+        requested_quantity=request.quantity,
+        filled_quantity=D("0"),
+        cancelled_quantity=request.quantity,
+        notional_quote=D("0"),
+        fee_quote=D("0"),
+        implementation_shortfall_quote=D("0"),
+        level_fills=(),
+    )
+    durable = state(
+        assumptions_sha256=assumptions.fingerprint(),
+        last_as_of_ms=1_200,
+        last_arrival_at_ms=1_200,
+        receipts=(
+            CommandReceipt(
+                command_id=request.command_id,
+                command_sha256=request.fingerprint(),
+                assumptions_sha256=assumptions.fingerprint(),
+                outcome=outcome,
+            ),
+        ),
+    )
+    assert durable.receipts[0].outcome.frame_sha256 is None
+    with pytest.raises(ValidationError, match="exact accepted book frame"):
+        FillOutcome.model_validate(
+            outcome.model_dump(mode="python")
+            | {
+                "status": "FILLED",
+                "filled_quantity": request.quantity,
+                "cancelled_quantity": D("0"),
+                "average_price": D("101"),
+                "arrival_mid_price": D("100"),
+                "notional_quote": D("101"),
+                "fee_quote": D("0.101"),
+                "implementation_shortfall_quote": D("1"),
+                "level_fills": (
+                    LevelFill(
+                        book_price=D("101"),
+                        execution_price=D("101"),
+                        quantity=request.quantity,
+                        fee_quote=D("0.101"),
+                    ),
+                ),
+            }
+        )
 
 
 @pytest.mark.parametrize(

@@ -169,7 +169,11 @@ class FillOutcome(ImmutableModel):
     command_id: Identifier
     command_sha256: Sha256
     assumptions_sha256: Sha256
-    frame_sha256: Sha256
+    # A blocked no-book command has no honest frame provenance.  Normal kernel
+    # paths still carry the exact accepted-frame fingerprint, while the
+    # controller can retain causal ordering for a terminal NO_ADMITTED_BOOK
+    # result without inventing a market-data input.
+    frame_sha256: Sha256 | None = None
     status: Literal["WAIT", "FILLED", "PARTIAL", "NO_FILL", "BLOCKED"]
     reason: str = Field(min_length=1, max_length=100)
     arrival_at_ms: Timestamp
@@ -202,6 +206,8 @@ class FillOutcome(ImmutableModel):
                 raise ValueError("PARTIAL requires strictly partial quantity")
             if self.status in {"WAIT", "NO_FILL", "BLOCKED"} and quantity:
                 raise ValueError("non-fill statuses cannot contain fills")
+            if quantity and self.frame_sha256 is None:
+                raise ValueError("a model fill requires its exact accepted book frame")
             if self.average_price != (notional / quantity if quantity else None):
                 raise ValueError("average price must match filled notional and quantity")
             if quantity and self.arrival_mid_price is None:
