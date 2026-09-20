@@ -53,7 +53,10 @@ class ExecSettings(CoreSettings):
     # Non-secret independent receipt/config scope. Missing/invalid means no new
     # canary entries; it must never prevent existing exposure recovery or exits.
     canary_scope_file: Path | None = None
-    evedex_sidecar_node: str = "node"
+    # PAPER must receive a deployment-controlled absolute Node runtime.  A
+    # bare command would be resolved through PATH before the child receives
+    # credential file paths, which is not an acceptable trust boundary.
+    evedex_sidecar_node: Path | None = None
     evedex_sidecar_script: Path = Path(__file__).parent / "evedex_sidecar" / "src" / "main.js"
     evedex_sidecar_timeout_s: float = Field(default=20.0, gt=0, le=120)
     evedex_symbol_map: dict[str, str] = Field(default_factory=_default_evedex_symbol_map)
@@ -139,5 +142,8 @@ class ExecSettings(CoreSettings):
         bundled_script = Path(__file__).parent / "evedex_sidecar" / "src" / "main.js"
         if self.evedex_sidecar_script.resolve() != bundled_script.resolve():
             raise ValueError("PAPER must use the bundled EVEDEX sidecar")
-        if self.evedex_sidecar_node.casefold() not in {"node", "node.exe"}:
-            raise ValueError("PAPER sidecar executable must be Node.js")
+        node_runtime = self.evedex_sidecar_node
+        if node_runtime is None or not node_runtime.is_absolute():
+            raise ValueError("PAPER requires a deployment-controlled absolute Node.js runtime")
+        if node_runtime.name.casefold() not in {"node", "node.exe"}:
+            raise ValueError("PAPER sidecar runtime must name the Node.js executable")

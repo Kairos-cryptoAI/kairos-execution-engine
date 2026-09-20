@@ -6,7 +6,6 @@ import asyncio
 import json
 import os
 import re
-import shutil
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -30,7 +29,7 @@ class EvedexSidecarClient:
     def __init__(
         self,
         *,
-        node_executable: str,
+        node_executable: Path,
         script: Path,
         api_key_file: Path,
         private_key_file: Path,
@@ -43,7 +42,11 @@ class EvedexSidecarClient:
             raise ValueError("API and signing key files must be distinct")
         if not expected_account_id.strip():
             raise ValueError("expected EVEDEX account ID must not be empty")
-        self.node_executable = node_executable
+        self.node_executable = Path(node_executable)
+        if not self.node_executable.is_absolute():
+            raise ValueError("sidecar Node.js runtime must be an absolute deployment-controlled path")
+        if self.node_executable.name.casefold() not in {"node", "node.exe"}:
+            raise ValueError("sidecar runtime must name the Node.js executable")
         self.script = script
         self.api_key_file = api_key_file
         self.private_key_file = private_key_file
@@ -55,9 +58,7 @@ class EvedexSidecarClient:
     async def start(self) -> None:
         if self._process is not None and self._process.returncode is None:
             return
-        executable = shutil.which(self.node_executable)
-        if executable is None:
-            raise SidecarError(f"Node executable {self.node_executable!r} was not found")
+        executable = self._trusted_node_executable()
         if not self.script.is_file():
             raise SidecarError(f"EVEDEX sidecar script does not exist: {self.script}")
         await self._assert_supported_node(executable)
@@ -72,7 +73,7 @@ class EvedexSidecarClient:
         if os.name == "nt" and "SYSTEMROOT" in os.environ:
             child_env["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
         self._process = await asyncio.create_subprocess_exec(
-            executable,
+            str(executable),
             str(self.script),
             cwd=str(self.script.parents[1]),
             stdin=asyncio.subprocess.PIPE,
@@ -84,14 +85,30 @@ class EvedexSidecarClient:
             limit=1024 * 1024,
         )
 
-    async def _assert_supported_node(self, executable: str) -> None:
+    def _trusted_node_executable(self) -> Path:
+        """Resolve an explicitly configured runtime without consulting PATH."""
+        try:
+            if self.node_executable.is_symlink():
+                raise SidecarError("sidecar Node.js runtime must not be a symbolic link")
+            executable = self.node_executable.resolve(strict=True)
+        except OSError as exc:
+            raise SidecarError("configured sidecar Node.js runtime could not be resolved") from exc
+        if not executable.is_file():
+            raise SidecarError("configured sidecar Node.js runtime is not a regular file")
+        if executable.name.casefold() not in {"node", "node.exe"}:
+            raise SidecarError("configured sidecar runtime does not name Node.js")
+        if not os.access(executable, os.X_OK):
+            raise SidecarError("configured sidecar Node.js runtime is not executable")
+        return executable
+
+    async def _assert_supported_node(self, executable: Path) -> None:
         """Fail closed before giving an unsupported runtime authenticated context."""
         probe_env: dict[str, str] = {}
         if os.name == "nt" and "SYSTEMROOT" in os.environ:
             probe_env["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
         try:
             process = await asyncio.create_subprocess_exec(
-                executable,
+                str(executable),
                 "--version",
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,

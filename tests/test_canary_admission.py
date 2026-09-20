@@ -15,7 +15,7 @@ from kairos_execution.config import ExecSettings
 from kairos_execution.paper_engine import PaperExecutionEngine, PaperExecutionSafetyError
 from tests.canary_admission_fixtures import LayeredCanaryAdmission, expected_scope
 from tests.canary_session_fixtures import fresh_decision, fresh_review, session_plan
-from tests.paper_fixtures import T0, approved_decision
+from tests.paper_fixtures import T0, approved_decision, configured_paper_node_runtime
 
 
 def settings(tmp_path, **overrides):
@@ -26,6 +26,7 @@ def settings(tmp_path, **overrides):
         evedex_dev_api_key_file=tmp_path / "api.secret",
         evedex_dev_private_key_file=tmp_path / "signing.secret",
         evedex_dev_expected_account_id="remote-paper-account-01",
+        evedex_sidecar_node=configured_paper_node_runtime(),
         **overrides,
     )
 

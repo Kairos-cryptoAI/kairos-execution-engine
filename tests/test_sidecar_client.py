@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +47,13 @@ input.on("line", (line) => {
 """
 
 
+def _node_runtime() -> Path:
+    executable = shutil.which("node")
+    if executable is None:
+        pytest.skip("Node.js is required for the sidecar client contract tests")
+    return Path(executable).resolve(strict=True)
+
+
 class _FakeVersionProcess:
     def __init__(self, stdout: bytes, *, returncode: int = 0) -> None:
         self._stdout = stdout
@@ -64,7 +72,7 @@ def _client(
     script = tmp_path / "fake-sidecar.mjs"
     script.write_text(_FAKE_SIDECAR, encoding="utf-8")
     client = EvedexSidecarClient(
-        node_executable="node",
+        node_executable=_node_runtime(),
         script=script,
         api_key_file=tmp_path / "api.secret",
         private_key_file=tmp_path / "signing.secret",
@@ -163,3 +171,17 @@ async def test_unsupported_node_is_rejected_before_authenticated_sidecar_spawn(
     assert command[1:] == ("--version",)
     assert not any(key.startswith("EVEDEX_") for key in kwargs["env"])
     assert client._process is None
+
+
+def test_relative_node_runtime_is_rejected_before_path_resolution(tmp_path: Path) -> None:
+    script = tmp_path / "fake-sidecar.mjs"
+    script.write_text(_FAKE_SIDECAR, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="absolute deployment-controlled path"):
+        EvedexSidecarClient(
+            node_executable=Path("node"),
+            script=script,
+            api_key_file=tmp_path / "api.secret",
+            private_key_file=tmp_path / "signing.secret",
+            expected_account_id="paper-account",
+        )

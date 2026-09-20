@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 from kairos_core.contracts import (
     CandidateReviewV1,
     CandidateRouteV1,
@@ -28,6 +31,13 @@ SHA_A = "a" * 64
 SHA_B = "b" * 64
 SHA_C = "c" * 64
 SHA_D = "d" * 64
+
+
+def configured_paper_node_runtime() -> Path:
+    """An absolute, non-started runtime path for cross-platform settings fixtures."""
+    if os.name == "nt":
+        return Path(r"C:\\kairos-test-runtime\\node.exe")
+    return Path("/usr/local/bin/node")
 
 
 def _instrument_rule() -> tuple[dict[str, object], str]:

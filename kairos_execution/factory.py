@@ -17,10 +17,16 @@ def build_adapter(settings: ExecSettings) -> ExchangeAdapter:
         api_key_file = settings.evedex_dev_api_key_file
         signing_key_file = settings.evedex_dev_private_key_file
         expected_account_id = settings.evedex_dev_expected_account_id
-        if api_key_file is None or signing_key_file is None or expected_account_id is None:
+        node_runtime = settings.evedex_sidecar_node
+        if (
+            api_key_file is None
+            or signing_key_file is None
+            or expected_account_id is None
+            or node_runtime is None
+        ):
             raise ValueError("PAPER DEV credentials did not pass startup validation")
         client = EvedexSidecarClient(
-            node_executable=settings.evedex_sidecar_node,
+            node_executable=node_runtime,
             script=settings.evedex_sidecar_script,
             api_key_file=api_key_file,
             private_key_file=signing_key_file,

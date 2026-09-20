@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,13 @@ from kairos_execution.factory import build_adapter
 from kairos_execution.profiles import profile_params
 
 
+def _configured_node_runtime() -> Path:
+    """A non-started absolute runtime path for cross-platform settings tests."""
+    if os.name == "nt":
+        return Path(r"C:\\kairos-runtime\\node.exe")
+    return Path("/usr/local/bin/node")
+
+
 def _paper_values(tmp_path: Path) -> dict[str, object]:
     return {
         "trading_mode": TradingMode.PAPER,
@@ -23,6 +31,7 @@ def _paper_values(tmp_path: Path) -> dict[str, object]:
         "evedex_dev_api_key_file": tmp_path / "evedex-api.secret",
         "evedex_dev_private_key_file": tmp_path / "evedex-signing.secret",
         "evedex_dev_expected_account_id": "remote-paper-account-01",
+        "evedex_sidecar_node": _configured_node_runtime(),
     }
 
 
@@ -105,8 +114,12 @@ def test_all_profile_constants_match_the_reviewed_official_sdk_master() -> None:
             },
             "five-symbol",
         ),
-        ({"evedex_sidecar_node": "C:/tools/node-wrapper.exe"}, "must be Node.js"),
-        ({"evedex_sidecar_node": "C:/tools/node.exe"}, "must be Node.js"),
+        ({"evedex_sidecar_node": None}, "absolute Node.js runtime"),
+        ({"evedex_sidecar_node": "node"}, "absolute Node.js runtime"),
+        (
+            {"evedex_sidecar_node": _configured_node_runtime().with_name("node-wrapper")},
+            "must name the Node.js executable",
+        ),
     ],
 )
 def test_paper_rejects_every_profile_or_authority_escape(

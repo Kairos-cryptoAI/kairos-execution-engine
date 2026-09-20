@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from .adapters.evedex import EvedexAdapter
 
@@ -89,6 +90,32 @@ _AUTH_PATHS = (
     "/api/order/opened",
     "/api/tpsl",
 )
+
+# Qualification is an authenticated, read-only operation, not a generic HTTP
+# probe.  Keep its only network destination pinned to the same DEV origin that
+# the PAPER execution boundary uses.  The value is deliberately duplicated
+# here instead of accepting a caller-provided profile: qualification must not
+# grow into a credential-bearing cross-environment client.
+_EVEDEX_DEV_QUALIFICATION_ORIGIN = "https://trading-api.evedex.tech"
+
+
+def _require_evedex_dev_qualification_origin(value: str) -> str:
+    """Return the canonical DEV origin or reject every redirect/SSRF escape."""
+    if not isinstance(value, str) or value != value.strip():
+        raise ValueError("EVEDEX qualification requires the exact EVEDEX DEV HTTPS origin")
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "trading-api.evedex.tech"
+        or parsed.port is not None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("EVEDEX qualification requires the exact EVEDEX DEV HTTPS origin")
+    return _EVEDEX_DEV_QUALIFICATION_ORIGIN
 
 
 class _ReadOnlySigner:
@@ -406,11 +433,12 @@ async def qualify_evedex(
     timeout_s: float = 15.0,
 ) -> EvedexQualificationReport:
     """Run GET-only qualification; this function contains no mutating HTTP method."""
+    base_url = _require_evedex_dev_qualification_origin(exchange_base_url)
     captured_at = (now or datetime.now(UTC)).astimezone(UTC)
     if getter is not None:
         return await _qualify(
             getter,
-            exchange_base_url=exchange_base_url.rstrip("/"),
+            exchange_base_url=base_url,
             symbol_map=symbol_map,
             jwt=jwt,
             now=captured_at,
@@ -422,7 +450,14 @@ async def qualify_evedex(
 
         async def http_get(path: str, headers: Mapping[str, str]) -> HttpObservation:
             started = time.perf_counter()
-            async with session.get(f"{exchange_base_url.rstrip('/')}{path}", headers=headers) as response:
+            # Authentication must never follow a venue redirect.  A 3xx result
+            # is recorded as a failed read-only check rather than forwarding a
+            # bearer token to a new origin.
+            async with session.get(
+                f"{base_url}{path}",
+                headers=headers,
+                allow_redirects=False,
+            ) as response:
                 payload = await response.json(content_type=None)
                 return HttpObservation(
                     status=response.status,
@@ -433,7 +468,7 @@ async def qualify_evedex(
 
         return await _qualify(
             http_get,
-            exchange_base_url=exchange_base_url.rstrip("/"),
+            exchange_base_url=base_url,
             symbol_map=symbol_map,
             jwt=jwt,
             now=captured_at,
@@ -472,7 +507,6 @@ def _read_secret_file(path: Path | None) -> str | None:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run read-only EVEDEX DEV venue qualification")
-    parser.add_argument("--exchange-base-url", default="https://trading-api.evedex.tech")
     parser.add_argument("--jwt-file", type=Path, help="read JWT from a file; never pass it on argv")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--overwrite", action="store_true")
@@ -485,7 +519,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     report = asyncio.run(
         qualify_evedex(
-            exchange_base_url=args.exchange_base_url,
+            exchange_base_url=_EVEDEX_DEV_QUALIFICATION_ORIGIN,
             symbol_map=_default_evedex_dev_symbol_map(),
             jwt=_read_secret_file(args.jwt_file),
         )

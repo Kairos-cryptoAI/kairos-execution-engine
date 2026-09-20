@@ -17,6 +17,7 @@ from kairos_execution.config import ExecSettings
 from kairos_execution.paper_engine import PaperExecutionEngine
 from tests.canary_session_fixtures import fresh_decision, fresh_review, seed_receipt
 from tests.disposable_database import connect_disposable_database, disposable_settings
+from tests.paper_fixtures import configured_paper_node_runtime
 from tests.test_integration_paper_engine import FakePaperAdapter, MutableClock
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
@@ -84,6 +85,7 @@ async def test_scoped_entry_claim_stop_race_redelivery_and_unscoped_restart(scop
         evedex_dev_api_key_file=tmp_path / "api.secret",
         evedex_dev_private_key_file=tmp_path / "signing.secret",
         evedex_dev_expected_account_id=scope.remote_account_id,
+        evedex_sidecar_node=configured_paper_node_runtime(),
     )
     trades, effects = TradeLifecycleRepository(database.pool), ExecutionJournalRepository(database.pool)
     engine = PaperExecutionEngine(

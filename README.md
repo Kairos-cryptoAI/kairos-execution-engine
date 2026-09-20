@@ -42,7 +42,9 @@ implemented lifecycle, assumptions and explicit limitations.
 - **EVEDEX DEV PAPER** runs through an internal Node child process using the official
   `@evedex/exchange-bot-sdk` pinned to `1.2.11`. It has no listener or host port and
   receives commands as NDJSON over stdin/stdout. Python owns the durable journal/FSM;
-  the sidecar owns SIWE/auth, signing, REST and WebSocket only.
+  the sidecar owns SIWE/auth, signing, REST and WebSocket only. PAPER receives an
+  explicit absolute Node 22 runtime from the deployment image; it never resolves an
+  executable through `PATH` after secret-file paths are in scope.
 - **CCXT** remains available only on the legacy DRY_RUN path.
 
 The service defaults to explicit `DRY_RUN`. No boolean can enable exchange mutations.
@@ -173,6 +175,9 @@ uv run --locked kairos-evedex-qualify `
   --output $env:TEMP\kairos-evedex-public.json `
   --overwrite
 ```
+
+The qualifier has one network destination: the exact EVEDEX DEV HTTPS origin. Its CLI
+does not accept a base-URL override, and authenticated GETs never follow redirects.
 
 For authenticated reconciliation, place the JWT in a local secret file and add
 `--jwt-file <path>`. The JWT is never accepted on the command line and is never written

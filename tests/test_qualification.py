@@ -1,11 +1,13 @@
 import json
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 
 import kairos_execution.qualification as qualification
 from kairos_execution.config import _default_evedex_dev_symbol_map
 from kairos_execution.qualification import (
+    _EVEDEX_DEV_QUALIFICATION_ORIGIN,
     CheckStatus,
     EvedexQualificationReport,
     HttpObservation,
@@ -82,7 +84,7 @@ async def test_public_qualification_is_blocked_without_contacting_authenticated_
     calls = []
 
     report = await qualify_evedex(
-        exchange_base_url="https://example.invalid",
+        exchange_base_url=_EVEDEX_DEV_QUALIFICATION_ORIGIN,
         symbol_map=SYMBOL_MAP,
         getter=_getter(payloads, headers, calls),
         now=NOW,
@@ -101,7 +103,7 @@ async def test_authenticated_qualification_reconciles_without_exposing_jwt():
     calls = []
 
     report = await qualify_evedex(
-        exchange_base_url="https://example.invalid",
+        exchange_base_url=_EVEDEX_DEV_QUALIFICATION_ORIGIN,
         symbol_map=SYMBOL_MAP,
         jwt="super-secret-jwt",
         getter=_getter(payloads, headers, calls),
@@ -123,7 +125,7 @@ async def test_qualification_blocks_when_authenticated_api_omits_quota_headers()
     calls = []
 
     report = await qualify_evedex(
-        exchange_base_url="https://example.invalid",
+        exchange_base_url=_EVEDEX_DEV_QUALIFICATION_ORIGIN,
         symbol_map=SYMBOL_MAP,
         jwt="jwt",
         getter=_getter(payloads, headers, calls),
@@ -141,7 +143,7 @@ async def test_qualification_fails_closed_for_non_tradable_instrument():
     calls = []
 
     report = await qualify_evedex(
-        exchange_base_url="https://example.invalid",
+        exchange_base_url=_EVEDEX_DEV_QUALIFICATION_ORIGIN,
         symbol_map=SYMBOL_MAP,
         getter=_getter(payloads, headers, calls),
         now=NOW,
@@ -177,6 +179,38 @@ def test_secret_file_must_not_be_empty(tmp_path):
         _read_secret_file(secret)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "unsafe_origin",
+    [
+        "http://trading-api.evedex.tech",
+        "https://trading-api.evedex.tech.evil.example",
+        "https://trading-api.evedex.tech:443",
+        "https://trading-api.evedex.tech/redirect",
+        "https://attacker@example.invalid",
+    ],
+)
+async def test_qualification_rejects_noncanonical_origin_before_any_authenticated_get(
+    unsafe_origin: str,
+) -> None:
+    calls: list[tuple[str, dict[str, str]]] = []
+
+    async def getter(path, headers):
+        calls.append((path, dict(headers)))
+        raise AssertionError("untrusted origin must not be contacted")
+
+    with pytest.raises(ValueError, match="exact EVEDEX DEV HTTPS origin"):
+        await qualify_evedex(
+            exchange_base_url=unsafe_origin,
+            symbol_map=SYMBOL_MAP,
+            jwt="test-jwt",
+            getter=getter,
+            now=NOW,
+        )
+
+    assert calls == []
+
+
 def test_cli_defaults_to_the_exact_dev_profile(monkeypatch, tmp_path):
     captured = {}
 
@@ -204,3 +238,65 @@ def test_cli_defaults_to_the_exact_dev_profile(monkeypatch, tmp_path):
         "BNBUSD:DEV",
         "XRPUSD:DEV",
     }
+
+
+def test_cli_rejects_any_origin_override(tmp_path) -> None:
+    with pytest.raises(SystemExit) as raised:
+        qualification.main(
+            [
+                "--exchange-base-url",
+                "https://example.invalid",
+                "--output",
+                str(tmp_path / "qualification.json"),
+            ]
+        )
+
+    assert raised.value.code == 2
+
+
+@pytest.mark.asyncio
+async def test_network_qualification_never_follows_redirects(monkeypatch) -> None:
+    calls: list[tuple[str, dict[str, str], bool]] = []
+
+    class Response:
+        status = 302
+        headers: dict[str, str] = {}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def json(self, **_kwargs):
+            return {}
+
+    class Session:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def get(self, url, *, headers, allow_redirects):
+            calls.append((url, dict(headers), allow_redirects))
+            return Response()
+
+    monkeypatch.setattr(
+        qualification,
+        "aiohttp",
+        SimpleNamespace(ClientTimeout=lambda **_kwargs: object(), ClientSession=Session),
+    )
+
+    report = await qualify_evedex(
+        exchange_base_url=_EVEDEX_DEV_QUALIFICATION_ORIGIN,
+        symbol_map=SYMBOL_MAP,
+        now=NOW,
+    )
+
+    assert report.status is CheckStatus.FAIL
+    assert calls
+    assert all(allow_redirects is False for _, _, allow_redirects in calls)
