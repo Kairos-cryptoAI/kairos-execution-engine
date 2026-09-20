@@ -80,7 +80,7 @@ class AcceptedBookFrame(ImmutableModel):
     received_at_ms: Timestamp
     persisted_at_ms: Timestamp
     raw_payload_sha256: Sha256
-    continuity: Literal["ADMITTED", "GAP", "RECONNECT", "UNKNOWN", "UNAVAILABLE"]
+    continuity: Literal["ADMITTED", "GAP", "RECONNECT", "UNKNOWN", "UNAVAILABLE", "CLOCK_SKEW"]
     bids: tuple[BookLevel, ...] = Field(max_length=100)
     asks: tuple[BookLevel, ...] = Field(max_length=100)
 

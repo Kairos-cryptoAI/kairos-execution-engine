@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 from decimal import Decimal
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from kairos_core.contracts import (
     ExitPlanV1,
     RecordedBookLevelV1,
     RecordedTopNBookFrameV1,
+    RecordedTopNBookFrameV2,
     SimulationAdmissionV1,
     SimulationAssumptionsV1,
     SimulationSessionV1,
@@ -147,6 +149,27 @@ def _frame() -> RecordedTopNBookFrameV1:
     )
 
 
+def _frame_v2() -> RecordedTopNBookFrameV2:
+    raw_payload = '{"lastUpdateId":1,"bids":[["99.9","2"]],"asks":[["100.1","2"]]}'
+    return RecordedTopNBookFrameV2(
+        source="quant-scouts",
+        tape_id="sim-tape",
+        stream_epoch="epoch-1",
+        symbol="BTCUSDT",
+        tape_sequence=1,
+        exchange_update_id=1,
+        exchange_at_ms=T0 + 60_000,
+        received_at_ms=T0 + 60_050,
+        persisted_at_ms=T0 + 60_100,
+        raw_payload=raw_payload,
+        raw_payload_sha256=hashlib.sha256(raw_payload.encode("utf-8")).hexdigest(),
+        continuity="ADMITTED",
+        source_reason="SNAPSHOT_RECEIVED",
+        bids=(RecordedBookLevelV1(price=99.9, quantity=2.0),),
+        asks=(RecordedBookLevelV1(price=100.1, quantity=2.0),),
+    )
+
+
 def test_float_contract_values_cross_decimal_boundary_through_text() -> None:
     assert decimal_from_contract(0.1, field="value") == Decimal("0.1")
     with pytest.raises(ValueError, match="finite"):
@@ -184,6 +207,36 @@ def test_bridge_preserves_public_frame_identity_in_terminal_receipt() -> None:
     assert receipt.model_frame_sha256 != step.outcome.frame_sha256
     assert receipt.average_price == pytest.approx(100.2)
     assert receipt.filled_quantity == pytest.approx(0.1)
+
+
+def test_bridge_maps_v2_raw_evidence_without_changing_model_fill_lineage() -> None:
+    session = _session()
+    command = _command(session)
+    recorded_frame = _frame_v2()
+    frame = kernel_frame(recorded_frame)
+    state = LiquidityState(
+        session_id=session.session_id or "",
+        tape_id=session.tape_id,
+        stream_epoch=frame.stream_epoch,
+        symbol="BTCUSDT",
+    )
+
+    step = simulate_ioc(
+        kernel_command(command),
+        frame,
+        kernel_assumptions(session),
+        state,
+        as_of_ms=T0 + 60_200,
+    )
+    receipt = command_receipt(
+        command=command,
+        outcome=step.outcome,
+        recorded_frame=recorded_frame,
+        source="market-simulator",
+    )
+
+    assert receipt.status == "FILLED"
+    assert receipt.model_frame_sha256 == recorded_frame.frame_sha256
 
 
 def test_bridge_has_no_external_execution_import() -> None:

@@ -7,6 +7,7 @@ from decimal import Decimal
 
 from kairos_core.contracts import (
     RecordedTopNBookFrameV1,
+    RecordedTopNBookFrameV2,
     SimulationCommandReceiptV1,
     SimulationCommandV1,
     SimulationFillLevelV1,
@@ -14,6 +15,8 @@ from kairos_core.contracts import (
 )
 
 from .models import AcceptedBookFrame, BookLevel, FillAssumptions, FillOutcome, IOCCommand
+
+_RecordedBookFrame = RecordedTopNBookFrameV1 | RecordedTopNBookFrameV2
 
 
 def decimal_from_contract(value: float, *, field: str) -> Decimal:
@@ -24,7 +27,7 @@ def decimal_from_contract(value: float, *, field: str) -> Decimal:
     return Decimal(str(value))
 
 
-def kernel_frame(frame: RecordedTopNBookFrameV1) -> AcceptedBookFrame:
+def kernel_frame(frame: _RecordedBookFrame) -> AcceptedBookFrame:
     """Map one immutable recorded public frame into the pure kernel DTO."""
 
     return AcceptedBookFrame(
@@ -102,7 +105,7 @@ def command_receipt(
     *,
     command: SimulationCommandV1,
     outcome: FillOutcome,
-    recorded_frame: RecordedTopNBookFrameV1 | None,
+    recorded_frame: _RecordedBookFrame | None,
     source: str,
 ) -> SimulationCommandReceiptV1:
     """Convert one terminal kernel outcome into its public immutable receipt."""

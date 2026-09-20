@@ -20,6 +20,7 @@ from kairos_core.contracts import (
     ExitPlanV1,
     RecordedBookLevelV1,
     RecordedTopNBookFrameV1,
+    RecordedTopNBookFrameV2,
     SimulationAdmissionV2,
     SimulationRiskDecisionV1,
     SimulationSessionV1,
@@ -80,22 +81,32 @@ def _frame(
     previous_frame_sha256: str | None,
     bids: tuple[tuple[float, float], ...] = ((99.9, 1.0),),
     asks: tuple[tuple[float, float], ...] = ((100.1, 1.0),),
-) -> RecordedTopNBookFrameV1:
+    raw_payload: str | None = None,
+) -> RecordedTopNBookFrameV1 | RecordedTopNBookFrameV2:
+    values = {
+        "source": "sim-controller-integration",
+        "tape_id": tape_id,
+        "stream_epoch": "integration-epoch-1",
+        "symbol": symbol,
+        "tape_sequence": sequence,
+        "exchange_update_id": sequence,
+        "exchange_at_ms": persisted_at_ms - 10,
+        "received_at_ms": persisted_at_ms - 5,
+        "persisted_at_ms": persisted_at_ms,
+        "raw_payload_sha256": _hash(raw_payload if raw_payload is not None else f"raw-{sequence}"),
+        "previous_frame_sha256": previous_frame_sha256,
+        "continuity": "ADMITTED",
+        "bids": tuple(RecordedBookLevelV1(price=price, quantity=quantity) for price, quantity in bids),
+        "asks": tuple(RecordedBookLevelV1(price=price, quantity=quantity) for price, quantity in asks),
+    }
+    if raw_payload is not None:
+        return RecordedTopNBookFrameV2(
+            **values,
+            raw_payload=raw_payload,
+            source_reason="SNAPSHOT_RECEIVED",
+        )
     return RecordedTopNBookFrameV1(
-        source="sim-controller-integration",
-        tape_id=tape_id,
-        stream_epoch="integration-epoch-1",
-        symbol=symbol,
-        tape_sequence=sequence,
-        exchange_update_id=sequence,
-        exchange_at_ms=persisted_at_ms - 10,
-        received_at_ms=persisted_at_ms - 5,
-        persisted_at_ms=persisted_at_ms,
-        raw_payload_sha256=_hash(f"raw-{sequence}"),
-        previous_frame_sha256=previous_frame_sha256,
-        continuity="ADMITTED",
-        bids=tuple(RecordedBookLevelV1(price=price, quantity=quantity) for price, quantity in bids),
-        asks=tuple(RecordedBookLevelV1(price=price, quantity=quantity) for price, quantity in asks),
+        **values,
     )
 
 
@@ -116,7 +127,7 @@ async def test_durable_controller_replays_only_sealed_inputs_and_stop_wins() -> 
         assert await repository.record_closed_bar(tape_id, exit_bar)
 
         prior: str | None = None
-        frames: list[RecordedTopNBookFrameV1] = []
+        frames: list[RecordedTopNBookFrameV1 | RecordedTopNBookFrameV2] = []
         for sequence, symbol in enumerate(_SYMBOLS, start=1):
             frame = _frame(
                 tape_id=tape_id,
@@ -124,10 +135,16 @@ async def test_durable_controller_replays_only_sealed_inputs_and_stop_wins() -> 
                 symbol=symbol,
                 persisted_at_ms=T0 + 60_010 + sequence - 1,
                 previous_frame_sha256=prior,
+                raw_payload=(
+                    '{"lastUpdateId":1,"bids":[["99.9","1"]],"asks":[["100.1","1"]]}'
+                    if symbol == "BTCUSDT"
+                    else None
+                ),
             )
             assert await repository.record_book_frame(frame)
             frames.append(frame)
             prior = frame.frame_sha256
+        assert isinstance(frames[0], RecordedTopNBookFrameV2)
         exit_frame = _frame(
             tape_id=tape_id,
             sequence=6,
@@ -230,6 +247,8 @@ async def test_durable_controller_replays_only_sealed_inputs_and_stop_wins() -> 
         assert exit_outcome.command.command_kind == "STOP_EXIT_IOC"
         assert exit_outcome.receipt.status == "FILLED"
         assert exit_outcome.lifecycle_state == "FLAT"
+        assert trade.trade_id is not None
+        assert session.session_id is not None
         assert await repository.verify_trade_chain(trade.trade_id)
         journal = await repository.load_trade_journal(trade.trade_id)
         assert journal is not None and journal.state == "FLAT" and len(journal.events) == 3

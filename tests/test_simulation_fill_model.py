@@ -277,7 +277,7 @@ def test_exact_expiry_and_age_boundaries_are_inclusive() -> None:
     assert result.outcome.status == "FILLED"
 
 
-@pytest.mark.parametrize("continuity", ["GAP", "RECONNECT", "UNKNOWN", "UNAVAILABLE"])
+@pytest.mark.parametrize("continuity", ["GAP", "RECONNECT", "UNKNOWN", "UNAVAILABLE", "CLOCK_SKEW"])
 def test_continuity_failure_sets_sticky_barrier_even_if_a_fresh_frame_follows(continuity: str) -> None:
     first = run(book=frame(continuity=continuity, bids=(), asks=()))
     assert first.outcome.status == "BLOCKED" and first.outcome.reason == f"SOURCE_{continuity}"
