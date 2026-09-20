@@ -28,7 +28,7 @@ from kairos_core.contracts import (
     StrategyProvenanceV1,
 )
 from kairos_core.enums import CandidateReviewTier, ReasoningEffort, ReviewDecision, Side
-from kairos_persistence import Database, PersistenceSettings, SimulationRepository
+from kairos_persistence import Database, MigrationProfile, PersistenceSettings, SimulationRepository
 from kairos_persistence.database_target import connect_verified_database, require_database_target_url
 
 from kairos_execution.simulation import SimulationExecutionController
@@ -103,7 +103,7 @@ def _frame(
 @pytest.mark.asyncio
 async def test_durable_controller_replays_only_sealed_inputs_and_stop_wins() -> None:
     settings, database_name = _settings()
-    database = Database(settings)
+    database = Database(settings, migration_profile=MigrationProfile.SIMULATOR)
     await connect_verified_database(database, database_name, local_only=True)
     try:
         await database.migrate()
