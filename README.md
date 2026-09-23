@@ -9,7 +9,10 @@
 - `DRY_RUN` keeps the existing synthetic adapter path unchanged.
 - `PAPER` is restricted to the exact EVEDEX DEV URLs, chain `16182`, five `*:DEV`
   instruments, a dedicated account and PostgreSQL inbox/outbox plus journals.
-- `LIVE` is compile-time disabled because this release is not `LIVE_READY`.
+- `LIVE` is rejected by the supported settings/factory path because this release is not `LIVE_READY`.
+  Low-level live adapter mutations also require a release authorization that the current build does
+  not issue; a future LIVE release must wire that capability only after readiness and manual-arming
+  checks.
 
 `KAIROS_DRY_RUN=false` is retired and is always a startup error. It never maps to
 `PAPER` or `LIVE`. `PAPER` also rejects the legacy `TacticalCommand -> ValidatedOrder`

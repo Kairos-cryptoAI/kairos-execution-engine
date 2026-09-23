@@ -4,6 +4,7 @@ import pytest
 from kairos_core.enums import OrderSide
 
 from kairos_execution.adapters.ccxt_adapter import CCXTAdapter
+from kairos_execution.live_authorization import _issue_live_mutation_authorization
 
 
 class FakeClient:
@@ -79,7 +80,10 @@ class FakeClient:
 
 
 def _live_adapter() -> CCXTAdapter:
-    adapter = CCXTAdapter(dry_run=True)
+    adapter = CCXTAdapter(
+        dry_run=True,
+        live_authorization=_issue_live_mutation_authorization(),
+    )
     adapter.dry_run = False
     adapter._client = FakeClient()
     return adapter

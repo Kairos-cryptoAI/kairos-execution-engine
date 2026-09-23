@@ -21,6 +21,10 @@ from kairos_core.contracts import AccountSnapshot, ExecutionReport, OrderIntent,
 from kairos_core.enums import OrderSide, OrderStatus, OrderType, TimeInForce
 
 from ..crypto import EIP712_SCHEMAS, Signer, build_domain, to_eth_number
+from ..live_authorization import (
+    LiveMutationAuthorization,
+    require_live_mutation_authorization,
+)
 from ..ratelimit import TokenBucket
 from ..state_machine import (
     client_order_id,
@@ -51,6 +55,7 @@ class EvedexAdapter(ExchangeAdapter):
         jwt: str | None = None,
         dry_run: bool = True,
         dry_run_equity_usd: float = 10_000.0,
+        live_authorization: LiveMutationAuthorization | None = None,
         symbol_map: dict[str, str] | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -60,6 +65,7 @@ class EvedexAdapter(ExchangeAdapter):
         self.jwt = jwt
         self.dry_run = dry_run
         self.dry_run_equity_usd = dry_run_equity_usd
+        self._live_authorization = live_authorization
         self._clock = clock or (lambda: datetime.now(UTC))
         self._bucket = TokenBucket(30, 60.0)
         self._session = None
@@ -109,6 +115,7 @@ class EvedexAdapter(ExchangeAdapter):
                     "dry_run": True,
                 }
             return {"id": body.get("id", "dry"), "status": "NEW", "dry_run": True}
+        self._authorize_live_mutation(path)
         session = await self._session_get()  # pragma: no cover - network
         async with session.post(f"{self.base}{path}", json=body) as resp:  # pragma: no cover
             resp.raise_for_status()
@@ -125,13 +132,22 @@ class EvedexAdapter(ExchangeAdapter):
         await self._bucket.acquire()
         if self.dry_run:
             return {"status": "dry_run"}
+        self._authorize_live_mutation(path)
         session = await self._session_get()  # pragma: no cover - network
         async with session.put(f"{self.base}{path}", json=body) as resp:  # pragma: no cover
             resp.raise_for_status()
             return await resp.json()
 
+    def _authorize_live_mutation(self, operation: str) -> None:
+        if not self.dry_run:
+            require_live_mutation_authorization(
+                self._live_authorization,
+                operation=operation,
+            )
+
     # ---- ExchangeAdapter -------------------------------------------------
     async def place_order(self, intent: OrderIntent) -> ExecutionReport:
+        self._authorize_live_mutation("place_order")
         instrument = self._venue_symbol(intent.symbol)
         notional = (intent.price or 0) * intent.quantity
         if intent.order_type is OrderType.LIMIT and notional < MIN_NOTIONAL_USD:
@@ -198,6 +214,7 @@ class EvedexAdapter(ExchangeAdapter):
         side: OrderSide | None = None,
         client_order_id: str | None = None,
     ) -> ExecutionReport:  # pragma: no cover - thin
+        self._authorize_live_mutation("close_position")
         instrument = self._venue_symbol(symbol)
         close_id = client_order_id
         if close_id is None or not is_evedex_client_order_id(close_id):
@@ -250,6 +267,7 @@ class EvedexAdapter(ExchangeAdapter):
         position_side: OrderSide,
         parent_order_id: str,
     ) -> ProtectiveStopAck:
+        self._authorize_live_mutation("set_protective_stop")
         instrument = self._venue_symbol(symbol)
         if not is_evedex_client_order_id(parent_order_id):
             raise ValueError("EVEDEX protective stop requires the authoritative parent order ID")
@@ -352,6 +370,7 @@ class EvedexAdapter(ExchangeAdapter):
             raise ValueError("EVEDEX cancellation requires a deterministic client order ID")
         if self.dry_run:
             return
+        self._authorize_live_mutation("cancel_order")
         if not await self.is_order_active_by_client_id(symbol, client_order_id):
             return
         await self._bucket.acquire()

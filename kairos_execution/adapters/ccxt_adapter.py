@@ -10,6 +10,10 @@ from typing import Any
 from kairos_core.contracts import AccountSnapshot, ExecutionReport, OrderIntent, PositionSnapshot
 from kairos_core.enums import OrderSide, OrderStatus, OrderType
 
+from ..live_authorization import (
+    LiveMutationAuthorization,
+    require_live_mutation_authorization,
+)
 from .base import ExchangeAdapter, ProtectiveStopAck
 
 try:
@@ -30,9 +34,11 @@ class CCXTAdapter(ExchangeAdapter):
         sandbox: bool = True,
         dry_run: bool = True,
         dry_run_equity_usd: float = 10_000.0,
+        live_authorization: LiveMutationAuthorization | None = None,
     ) -> None:
         self.dry_run = dry_run
         self.dry_run_equity_usd = dry_run_equity_usd
+        self._live_authorization = live_authorization
         self._client = None
         if ccxt is not None and not dry_run:  # pragma: no cover - network
             self._client = getattr(ccxt, exchange_id)(
@@ -56,6 +62,7 @@ class CCXTAdapter(ExchangeAdapter):
                 remaining_qty=intent.quantity,
                 message="dry_run",
             )
+        self._authorize_live_mutation("place_order")
         otype = "market" if intent.order_type is OrderType.MARKET else "limit"  # pragma: no cover
         params = {"clientOrderId": intent.client_order_id} if intent.client_order_id else {}
         order = await self._client.create_order(
@@ -80,6 +87,7 @@ class CCXTAdapter(ExchangeAdapter):
     ) -> None:  # pragma: no cover
         if self.dry_run or self._client is None:
             return
+        self._authorize_live_mutation("cancel_order")
         order = await self._open_order_by_client_id(symbol, client_order_id)
         if order is None:
             return
@@ -112,6 +120,7 @@ class CCXTAdapter(ExchangeAdapter):
         client_order_id=None,
     ):  # pragma: no cover
         if not self.dry_run and self._client is not None:
+            self._authorize_live_mutation("close_position")
             if quantity is None:
                 positions = await self._client.fetch_positions([symbol])
                 open_positions = [item for item in positions if self._required_contracts(item) > 0]
@@ -144,6 +153,7 @@ class CCXTAdapter(ExchangeAdapter):
 
     async def set_leverage(self, symbol, leverage):  # pragma: no cover
         if not self.dry_run and self._client is not None:
+            self._authorize_live_mutation("set_leverage")
             await self._client.set_leverage(int(leverage), symbol)
 
     async def set_protective_stop(
@@ -156,6 +166,7 @@ class CCXTAdapter(ExchangeAdapter):
         del parent_order_id  # CCXT venues do not expose a portable linked-stop field.
         close_side = OrderSide.SELL if position_side is OrderSide.BUY else OrderSide.BUY
         if not self.dry_run and self._client is not None:
+            self._authorize_live_mutation("set_protective_stop")
             order = await self._client.create_order(
                 symbol,
                 "STOP_MARKET",
@@ -177,6 +188,13 @@ class CCXTAdapter(ExchangeAdapter):
                 raise ValueError("CCXT protective-stop response is not in a live order state")
             return ProtectiveStopAck(exchange_order_id=str(order_id))
         return ProtectiveStopAck(exchange_order_id=f"dry-protective-{symbol}")
+
+    def _authorize_live_mutation(self, operation: str) -> None:
+        if not self.dry_run:
+            require_live_mutation_authorization(
+                self._live_authorization,
+                operation=operation,
+            )
 
     async def fetch_account_snapshot(
         self,

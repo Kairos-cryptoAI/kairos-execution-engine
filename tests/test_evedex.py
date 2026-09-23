@@ -38,6 +38,12 @@ def _intent(*, client_order_id: str | None = None) -> OrderIntent:
     )
 
 
+@pytest.fixture(autouse=True)
+def authorize_offline_live_adapter_tests(monkeypatch):
+    """These wire-shape tests use fake transports and explicitly bypass release policy."""
+    monkeypatch.setattr(EvedexAdapter, "_authorize_live_mutation", lambda self, operation: None)
+
+
 @pytest.mark.asyncio
 async def test_generated_order_id_matches_evedex_format_and_is_deterministic():
     signer = RecordingSigner()
