@@ -43,10 +43,7 @@ def require_live_mutation_authorization(
 ) -> None:
     """Fail closed unless the caller holds an issued capability."""
 
-    if (
-        type(authorization) is not LiveMutationAuthorization
-        or authorization._seal is not _AUTHORIZATION_SEAL
-    ):
+    if type(authorization) is not LiveMutationAuthorization or authorization._seal is not _AUTHORIZATION_SEAL:
         raise LiveMutationAuthorizationError(
             f"live mutation {operation} is disabled without LIVE release authorization"
         )
