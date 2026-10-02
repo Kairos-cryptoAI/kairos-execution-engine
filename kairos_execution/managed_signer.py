@@ -216,8 +216,13 @@ class ManagedSignerBoundary:
             separators=(",", ":"),
         ).encode()
         digest = hashlib.sha256(canonical).hexdigest()
-        if not self._claims.claim_once(
-            custody_reference=binding.custody_reference, request_id=request.request_id, request_sha256=digest
+        if (
+            self._claims.claim_once(
+                custody_reference=binding.custody_reference,
+                request_id=request.request_id,
+                request_sha256=digest,
+            )
+            is not True
         ):
             raise ManagedSigningError("signing request is already claimed or unresolved")
         domain = build_domain(binding.chain_id)
@@ -230,12 +235,15 @@ class ManagedSignerBoundary:
             )
             if not isinstance(signature, str) or re.fullmatch(r"0x[0-9a-fA-F]{130}", signature) is None:
                 raise ManagedSigningError("managed backend returned a malformed signature")
-            if not self._verifier.verify(
-                wallet_address=binding.wallet_address,
-                domain=domain,
-                types=types,
-                message=message,
-                signature=signature,
+            if (
+                self._verifier.verify(
+                    wallet_address=binding.wallet_address,
+                    domain=domain,
+                    types=types,
+                    message=message,
+                    signature=signature,
+                )
+                is not True
             ):
                 raise ManagedSigningError("managed signature failed independent verification")
         except Exception:

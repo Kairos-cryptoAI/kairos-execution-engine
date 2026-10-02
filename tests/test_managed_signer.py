@@ -211,3 +211,22 @@ def test_independent_signature_rejection_does_not_grant_retry():
     with pytest.raises(ManagedSigningError, match="claimed or unresolved"):
         signer.sign(request, now=NOW)
     assert len(backend.calls) == 1
+
+
+@pytest.mark.parametrize("truthy", [1, "accepted", {"ok": True}])
+def test_claim_and_signature_verifier_require_exact_boolean_success(truthy):
+    signer, request, backend, verifier, _ = setup_signer()
+
+    class MalformedClaims:
+        def claim_once(self, **kwargs):
+            return truthy
+
+    signer._claims = MalformedClaims()
+    with pytest.raises(ManagedSigningError, match="claimed or unresolved"):
+        signer.sign(request, now=NOW)
+    assert backend.calls == []
+    signer, request, backend, verifier, _ = setup_signer()
+    verifier.allow = truthy
+    with pytest.raises(ManagedSigningError, match="unresolved"):
+        signer.sign(request, now=NOW)
+    assert len(backend.calls) == 1
