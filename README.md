@@ -308,6 +308,30 @@ zero. `ENTRY_FILLED` and `ENTRY_PARTIAL_FILL` additionally carry
 `decision_worst_entry_price`, `execution_average_price` and
 `execution_shortfall_bps`.
 
+## Durable account-wide operator fence
+
+PAPER startup is verify-only and requires an explicitly selected, independently
+prepared `controlled-runtime` persistence profile with separated owner,
+operator and runtime roles. Default/legacy profile, missing migration or unsafe
+runtime privileges fail before outbox/venue initialization. This repository
+does not prepare primary schema, grant roles, arm a session or enable LIVE.
+
+New entries must carry the independently persisted Risk operator-version
+binding. The actual engine checks it before creating/preparing entry work and
+again immediately before `place_limit`, inside both operator and canary final
+guards. Lock order remains account -> trade -> operator -> canary. The durable
+no-resend claim commits before external I/O, and no SQL transaction spans it.
+If a canary lock wait outlives operator expiry, dispatch is refused and the
+claim remains unresolved rather than authorizing an automatic retry.
+
+KILL is remote-account-wide across local aliases. A completed KILL prevents
+subsequent new entries; an already guarded bounded call may finish before KILL
+commits. Existing cancellation, reconciliation, protection and emergency exit
+paths remain available without ARM. Existing risk/canary/session/mutation
+limits and unconditional LIVE startup rejection are unchanged. Offline layered
+fixtures and disposable PostgreSQL race tests are engineering evidence only,
+not venue/economic/PAPER qualification.
+
 ## Runtime delivery durability
 
 With Redis, consumed IDs, execution reports and completion are committed through

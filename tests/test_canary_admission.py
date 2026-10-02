@@ -15,7 +15,7 @@ from kairos_execution.config import ExecSettings
 from kairos_execution.paper_engine import PaperExecutionEngine, PaperExecutionSafetyError
 from tests.canary_admission_fixtures import LayeredCanaryAdmission, expected_scope
 from tests.canary_session_fixtures import fresh_decision, fresh_review, session_plan
-from tests.paper_fixtures import T0, approved_decision, configured_paper_node_runtime
+from tests.paper_fixtures import T0, LayeredOperatorControl, approved_decision, configured_paper_node_runtime
 
 
 def settings(tmp_path, **overrides):
@@ -43,6 +43,7 @@ def engine_fixture(tmp_path, *, scope=True, admission=None):
         runtime_health=object(),
         canary_sessions=admission or LayeredCanaryAdmission(),
         canary_scope=expected_scope(config) if scope else None,
+        operator_control=LayeredOperatorControl(),
     )
     engine._recovery_blockers = ()
     return engine

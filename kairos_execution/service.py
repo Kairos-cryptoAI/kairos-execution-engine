@@ -13,6 +13,7 @@ from kairos_core.topics import Topics
 from kairos_persistence import (
     DurableMessageBus,
     ExecutionJournalRepository,
+    MigrationProfile,
     TradeLifecycleRepository,
 )
 
@@ -35,7 +36,16 @@ class ExecutionService:
         self.bus = (
             transport
             if self.settings.bus_backend == "memory"
-            else DurableMessageBus(transport, service_name=self.settings.service_name)
+            else DurableMessageBus(
+                transport,
+                service_name=self.settings.service_name,
+                verify_schema_only=self.settings.trading_mode is TradingMode.PAPER,
+                required_migration_profile=(
+                    MigrationProfile.CONTROLLED_RUNTIME
+                    if self.settings.trading_mode is TradingMode.PAPER
+                    else None
+                ),
+            )
         )
         adapter = build_adapter(self.settings)
         self.engine: ExecutionEngine | None = None

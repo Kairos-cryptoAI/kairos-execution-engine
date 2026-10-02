@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from kairos_core.contracts import (
@@ -25,6 +26,7 @@ from kairos_core.enums import (
     Side,
     TradingMode,
 )
+from kairos_persistence.operator_control import OperatorAdmissionV1, OperatorControlRefused
 
 T0 = 1_800_000_000_000
 SHA_A = "a" * 64
@@ -202,3 +204,37 @@ def rejected_decision(**overrides: object) -> RiskTradeDecisionV1:
     }
     values.update(overrides)
     return approved_decision(**values)
+
+
+class LayeredOperatorControl:
+    """Explicit frozen-clock lifecycle fixture, NOT durable global kill proof."""
+
+    def __init__(self):
+        self.armed = True
+        self.checks = 0
+        self.claims = set()
+
+    async def check_entry(self, *, decision, expected_scope, effect_id):
+        self.checks += 1
+        if not self.armed:
+            raise OperatorControlRefused("synthetic operator is disarmed")
+        assert decision.approved and decision.account_id == expected_scope.account_id
+        return OperatorAdmissionV1(
+            scope_sha256=canonical_sha256(expected_scope.model_dump(mode="json")),
+            control_version=1,
+            session_id="1" * 64,
+            decision_id=decision.decision_id,
+            decision_sha256=canonical_sha256(decision.model_dump(mode="json")),
+            trade_id=decision.trade_id,
+            expires_at_ms=decision.intent.entry_expires_ts_ms,
+        )
+
+    @asynccontextmanager
+    async def final_dispatch_guard(self, *, decision, expected_scope, effect_id, max_hold_s=30):
+        binding = await self.check_entry(
+            decision=decision, expected_scope=expected_scope, effect_id=effect_id
+        )
+        if effect_id in self.claims:
+            raise OperatorControlRefused("synthetic dispatch already claimed")
+        self.claims.add(effect_id)
+        yield binding

@@ -52,10 +52,12 @@ from kairos_persistence import (
     TradeState,
 )
 from kairos_persistence.canary_session import CanaryScope, CanarySessionRepository
+from kairos_persistence.operator_control import OperatorControlRefused, OperatorControlRepository
 
 from .adapters.evedex_sidecar import EvedexSidecarAdapter
 from .canary_admission import CanaryAdmissionRepository, load_expected_scope
 from .config import ExecSettings
+from .operator_control import PaperOperatorControl
 from .state_machine import client_order_id
 
 _CANARY_SOURCE = "kairos-paper-canary"
@@ -133,6 +135,7 @@ class PaperExecutionEngine:
         runtime_health: ExecutionRuntimeHealthRepository | None = None,
         canary_sessions: CanaryAdmissionRepository | None = None,
         canary_scope: CanaryScope | None = None,
+        operator_control: PaperOperatorControl | None = None,
     ) -> None:
         if settings.trading_mode is not TradingMode.PAPER:
             raise ValueError("PaperExecutionEngine requires TradingMode.PAPER")
@@ -150,6 +153,7 @@ class PaperExecutionEngine:
         self._last_sidecar_health: dict[str, Any] = {}
         self._lifecycle_lock = asyncio.Lock()
         self._canary_sessions = canary_sessions
+        self._operator_control = operator_control
         self._canary_scope: CanaryScope | None = None
         self._canary_scope_error = "MISSING"
         try:
@@ -368,6 +372,7 @@ class PaperExecutionEngine:
         entry_client_id = self._client_id(trade_id, OrderRole.ENTRY, decision.decided_at_ms)
         existing = await self.trades.get(trade_id)
         if existing is None and now_ms <= decision.intent.entry_expires_ts_ms:
+            await self._check_operator_entry(decision, self._effect_id(trade_id, OrderRole.ENTRY, "place"))
             await self._bind_canary_entry(decision, self._effect_id(trade_id, OrderRole.ENTRY, "place"))
         new_trade = NewTrade(
             trade_id=trade_id,
@@ -1509,6 +1514,7 @@ class PaperExecutionEngine:
         effect_id: str,
         client_order_id: str,
     ) -> EffectPreparation:
+        await self._check_operator_entry(decision, effect_id)
         await self._bind_canary_entry(decision, effect_id)
         self._assert_fresh_entry_market(decision, int(self.clock().astimezone(UTC).timestamp() * 1000))
         request = {
@@ -1573,6 +1579,7 @@ class PaperExecutionEngine:
             await self.adapter.fetch_depth(symbol=trade.symbol, max_level=100),
         )
         self._assert_fresh_entry_market(decision, int(self.clock().astimezone(UTC).timestamp() * 1000))
+        await self._check_operator_entry(decision, effect_id)
         await self._reserve_mutation(
             effect_id,
             operation="place_limit",
@@ -1580,7 +1587,15 @@ class PaperExecutionEngine:
             require_entry_headroom=True,
         )
         admission, scope = self._canary_entry_admission()
-        async with admission.final_dispatch(decision=decision, expected_scope=scope, effect_id=effect_id):
+        operator = self._operator_entry_control()
+        async with (
+            operator.final_dispatch_guard(decision=decision, expected_scope=scope, effect_id=effect_id),
+            admission.final_dispatch(decision=decision, expected_scope=scope, effect_id=effect_id),
+        ):
+            # Canary-lock acquisition can consume the remaining operator lease.
+            # This read-only recheck takes no advisory lock and finishes its SQL
+            # transaction before send; both dispatch locks are already held.
+            await self._check_operator_entry(decision, effect_id)
             response = await self.adapter.place_limit(
                 effect_id=effect_id,
                 client_order_id=client_order_id,
@@ -1611,6 +1626,21 @@ class PaperExecutionEngine:
         if self._canary_sessions is None:
             self._canary_sessions = cast(CanaryAdmissionRepository, CanarySessionRepository(self.trades.pool))
         return self._canary_sessions, self._canary_scope
+
+    def _operator_entry_control(self) -> PaperOperatorControl:
+        if self._operator_control is None:
+            self._operator_control = OperatorControlRepository(self.trades.pool)
+        return self._operator_control
+
+    async def _check_operator_entry(self, decision: RiskTradeDecisionV1, effect_id: str) -> None:
+        if self._canary_scope is None:
+            raise PaperExecutionSafetyError("operator admission requires independent valid scope")
+        try:
+            await self._operator_entry_control().check_entry(
+                decision=decision, expected_scope=self._canary_scope, effect_id=effect_id
+            )
+        except OperatorControlRefused as exc:
+            raise PaperExecutionSafetyError("durable operator control refused this new PAPER entry") from exc
 
     async def _bind_canary_entry(self, decision: RiskTradeDecisionV1, effect_id: str) -> None:
         admission, scope = self._canary_entry_admission()

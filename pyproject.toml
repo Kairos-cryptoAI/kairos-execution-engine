@@ -64,7 +64,7 @@ required-version = "==0.12.3"
 
 [tool.uv.sources]
 kairos-core = { git = "https://github.com/Kairos-cryptoAI/kairos-core.git", rev = "56df50787eff83c898aa2aeefb426c6ee8482820" }
-kairos-persistence = { git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git", rev = "600d37694d9da650d3137cff2e24d1a77b4fa413" }
+kairos-persistence = { git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git", rev = "568007866d170fbe63fb73a0c798c068dc563e1c" }
 
 [tool.ruff]
 line-length = 110
