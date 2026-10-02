@@ -216,14 +216,15 @@ class ManagedSignerBoundary:
             separators=(",", ":"),
         ).encode()
         digest = hashlib.sha256(canonical).hexdigest()
-        if (
-            self._claims.claim_once(
+        try:
+            claimed = self._claims.claim_once(
                 custody_reference=binding.custody_reference,
                 request_id=request.request_id,
                 request_sha256=digest,
             )
-            is not True
-        ):
+        except Exception:
+            raise ManagedSigningError("signing claim outcome is unresolved; do not retry") from None
+        if claimed is not True:
             raise ManagedSigningError("signing request is already claimed or unresolved")
         domain = build_domain(binding.chain_id)
         try:

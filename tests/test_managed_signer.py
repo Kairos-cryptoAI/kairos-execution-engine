@@ -196,6 +196,22 @@ def test_backend_failure_is_sanitized_and_never_retried():
     assert len(backend.calls) == 1
 
 
+def test_claim_store_failure_is_sanitized_before_any_backend_call():
+    signer, request, backend, _, _ = setup_signer()
+
+    class UnresolvedClaims:
+        def claim_once(self, **kwargs):
+            raise RuntimeError("DO_NOT_LEAK_CLAIM_DATABASE_DSN")
+
+    signer._claims = UnresolvedClaims()
+    with pytest.raises(ManagedSigningError, match="claim outcome is unresolved") as failure:
+        signer.sign(request, now=NOW)
+    assert "DO_NOT_LEAK" not in str(failure.value)
+    assert failure.value.__cause__ is None
+    assert failure.value.__suppress_context__
+    assert backend.calls == []
+
+
 def test_verifier_receives_original_bytes_even_if_backend_mutates_its_copy():
     signer, request, backend, verifier, _ = setup_signer()
     backend.mutate = True
