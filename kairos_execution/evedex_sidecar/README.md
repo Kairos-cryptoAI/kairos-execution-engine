@@ -12,6 +12,13 @@ override containing the official DEV URL, auth URL, WebSocket URL, prefix and
 chain. It is not configurable through environment variables or protocol input;
 the embedded `421614` value is never used.
 
+The SDK's `axios` dependency is overridden to exactly `1.20.0`, within its
+published `^1.8.1` range. This replaces vulnerable `1.19.0` without changing the
+SDK, endpoints, authentication or trading protocol. The lockfile retains npm
+integrity hashes, the dependency regression test checks the SDK's resolved
+Axios version, and CI still runs `npm audit --omit=dev` without suppressions.
+See the [upstream security fixes](https://github.com/axios/axios/releases/tag/v1.20.0).
+
 Startup performs SIWE authentication, API-key authentication, dedicated account
 identity matching, an instrument preflight and an authenticated WebSocket
 balance subscription. All five allowlisted instruments
