@@ -423,7 +423,7 @@ wheels = [
 
 [[package]]
 name = "ccxt"
-version = "4.5.73"
+version = "4.5.85"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohappyeyeballs" },
@@ -450,9 +450,9 @@ dependencies = [
     { name = "yarl" },
     { name = "zlib-ng" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d2/80/497cb51c72fd68c628e30fa8cd0a4b198d5f2dad5d84f795dd3c73250b83/ccxt-4.5.73.tar.gz", hash = "sha256:0698f915201f5c18f0c0b24cc5d062e06fab4d5f68109bd9899ea8f049c5cb61", size = 6059819, upload-time = "2026-08-11T11:39:24.984Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/84/57/f68d0cb8ee804b805113f3d819a1d69179dd5ddf361ac74418fc5afb2a4d/ccxt-4.5.85.tar.gz", hash = "sha256:e2e57064675779b16d174c4bb87856d4c84e237075c6240e4c0d99db931bd02b", size = 6322871, upload-time = "2026-10-01T06:38:12.396Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fd/87/59a3c56008353e245493b14a7069fc227dce8d6c9aa660ac852ae3f1c00e/ccxt-4.5.73-py3-none-any.whl", hash = "sha256:a644b81adca7fdb49ee5a765002ea4371df3ba599877775d4dae369e00101b6f", size = 6507460, upload-time = "2026-08-11T11:39:20.871Z" },
+    { url = "https://files.pythonhosted.org/packages/43/c4/8264379c5cc6b47cb45b5a984a32f82fdf2689ee62af8255bc238f612701/ccxt-4.5.85-py3-none-any.whl", hash = "sha256:da6b2cce40530d471bc8ecf716a3e7d709f597fca8a4a84e40e7422b31f164c0", size = 6704190, upload-time = "2026-10-01T06:38:09.141Z" },
 ]
 
 [[package]]
@@ -1227,6 +1227,7 @@ dependencies = [
 [package.optional-dependencies]
 ccxt = [
     { name = "ccxt" },
+    { name = "urllib3" },
 ]
 evedex = [
     { name = "eth-account" },
@@ -1253,6 +1254,7 @@ requires-dist = [
     { name = "pydantic-settings", specifier = ">=2.2,<3" },
     { name = "redis", specifier = ">=6.4,<9" },
     { name = "structlog", specifier = ">=24.1,<27" },
+    { name = "urllib3", marker = "extra == 'ccxt'", specifier = ">=2.8.0,<3" },
 ]
 provides-extras = ["evedex", "ccxt"]
 
@@ -2346,11 +2348,11 @@ wheels = [
 
 [[package]]
 name = "urllib3"
-version = "2.7.0"
+version = "2.8.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/53/0c/06f8b233b8fd13b9e5ee11424ef85419ba0d8ba0b3138bf360be2ff56953/urllib3-2.7.0.tar.gz", hash = "sha256:231e0ec3b63ceb14667c67be60f2f2c40a518cb38b03af60abc813da26505f4c", size = 433602, upload-time = "2026-05-07T16:13:18.596Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e3/05/b17359e1cefb4f909b5e40b1b90a496d987258916dbbf88e842c729f510e/urllib3-2.8.0.tar.gz", hash = "sha256:63bf2ead4c879426ebf22ef2a781eeb4aa3b4ae798a0435506f8687fd5bb9b63", size = 458972, upload-time = "2026-09-15T19:29:36.253Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7f/3e/5db95bcf282c52709639744ca2a8b149baccf648e39c8cc87553df9eae0c/urllib3-2.7.0-py3-none-any.whl", hash = "sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897", size = 131087, upload-time = "2026-05-07T16:13:17.151Z" },
+    { url = "https://files.pythonhosted.org/packages/92/9d/c4e665119135114480843e7ab388fa94d8480650450e6f8e26b70d323a4c/urllib3-2.8.0-py3-none-any.whl", hash = "sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3", size = 135717, upload-time = "2026-09-15T19:29:34.577Z" },
 ]
 
 [[package]]

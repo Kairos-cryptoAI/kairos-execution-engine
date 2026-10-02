@@ -26,3 +26,9 @@ def test_dry_run_remains_keyless():
     adapter = build_adapter(ExecSettings(exchange="evedex", dry_run=True))
     assert adapter.dry_run is True
     assert adapter._venue_symbol("BTCUSDT") == "BTCUSD"
+
+
+def test_optional_ccxt_factory_remains_keyless_and_never_creates_a_client():
+    adapter = build_adapter(ExecSettings(exchange="ccxt", dry_run=True))
+    assert adapter.dry_run is True
+    assert adapter._client is None
