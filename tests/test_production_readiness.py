@@ -9,22 +9,17 @@ from kairos_execution.production_readiness import (
     ManualArmRequestV1,
     ProductionContextV1,
     ProductionPreconditionsVerifier,
-    ReceiptReferenceV1,
     VerifiedEvidenceV1,
     canonical_digest,
     validate_manual_arm,
 )
+from tests.production_evidence_fixtures import signed_gate_fixture
 
 NOW = datetime(2026, 10, 2, 20, tzinfo=UTC)
 
 
 def context():
-    return ProductionContextV1(
-        remote_account_id="prod-reviewed-account",
-        adaptive_system_id="adaptive-v1",
-        frozen_policy_sha256="a" * 64,
-        source_set_sha256="b" * 64,
-    )
+    return signed_gate_fixture()[3]
 
 
 class Interpreter:
@@ -47,13 +42,8 @@ class Interpreter:
 
 
 def setup_gate():
-    interpreter = Interpreter()
-    refs = tuple(
-        ReceiptReferenceV1(kind=kind, receipt_id=kind.value, content_sha256="c" * 64, issuer_id="test-only")
-        for kind in EvidenceKind
-    )
-    verifier = ProductionPreconditionsVerifier({kind: ("test-only", interpreter) for kind in EvidenceKind})
-    return verifier, refs, interpreter
+    verifier, refs, control, *_ = signed_gate_fixture()
+    return verifier, refs, control
 
 
 class Nonces:
@@ -173,7 +163,7 @@ def test_naive_and_nonutc_time_and_interpreter_failure_are_rejected():
     broken = ProductionPreconditionsVerifier(
         {kind: ("test-only", FailedInterpreter()) for kind in EvidenceKind}
     )
-    with pytest.raises(ValueError, match="independent production evidence"):
+    with pytest.raises(ValueError, match="concrete signed"):
         broken.verify(context(), refs, now=NOW)
 
 

@@ -87,6 +87,10 @@ class VerifiedEvidenceV1(StrictRecord):
     valid_until: datetime
     complete_forward_days: int | None = Field(default=None, ge=0)
     naturally_closed_simulated_trades: int | None = Field(default=None, ge=0)
+    facts_sha256: Digest | None = None
+    facts_schema_sha256: Digest | None = None
+    verified_issuer_key_id: Identity | None = None
+    binding_facts_json: str | None = None
 
     _utc = field_validator("verified_at", "valid_until")(_aware)
 
@@ -110,6 +114,9 @@ class PreconditionsV1(StrictRecord):
     valid_until: datetime
     live_ready: Literal[False] = False
     mutation_authority: Literal[False] = False
+    owner_identity: Identity
+    dollar_cap: Decimal
+    daily_stop_loss_usd: Decimal
 
     _utc = field_validator("verified_at", "valid_until")(_aware)
 
@@ -141,6 +148,10 @@ class ProductionPreconditionsVerifier:
         proofs: list[VerifiedEvidenceV1] = []
         for ref in sorted(references, key=lambda item: item.kind.value):
             issuer, interpreter = self._interpreters[ref.kind]
+            from .signed_evidence import SignedReceiptInterpreter
+
+            if type(interpreter) is not SignedReceiptInterpreter:
+                raise ValueError("a concrete signed kind-specific evidence interpreter is required")
             if ref.issuer_id != issuer:
                 raise ValueError("receipt issuer is not trusted for this gate")
             try:
@@ -150,6 +161,11 @@ class ProductionPreconditionsVerifier:
             if type(proof) is not VerifiedEvidenceV1 or proof.reference != ref or proof.context != context:
                 raise ValueError("independent evidence identity/scope/policy mismatch")
             proof = VerifiedEvidenceV1.model_validate(proof)
+            if any(
+                value is None
+                for value in (proof.facts_sha256, proof.facts_schema_sha256, proof.verified_issuer_key_id)
+            ):
+                raise ValueError("unsigned or uninterpreted gate assertions cannot qualify preconditions")
             if not proof.verified_at <= now < proof.valid_until:
                 raise ValueError("production evidence is stale or future-dated")
             if ref.kind is EvidenceKind.ADAPTIVE_SEALED_FORWARD and (
@@ -162,6 +178,21 @@ class ProductionPreconditionsVerifier:
             ):
                 raise ValueError("500 naturally closed simulated trades are required")
             proofs.append(proof)
+        bindings = {proof.reference.kind: json.loads(proof.binding_facts_json or "{}") for proof in proofs}
+        custody = bindings[EvidenceKind.MANAGED_CUSTODY]
+        pairing = bindings[EvidenceKind.PROD_ACCOUNT_PAIRING]
+        if (custody.get("wallet_address"), custody.get("chain_id")) != (
+            pairing.get("wallet_address"),
+            pairing.get("chain_id"),
+        ):
+            raise ValueError("custody and PROD account pairing wallet/chain mismatch")
+        dev_accounts = {
+            bindings[kind].get("dev_remote_account_id")
+            for kind in (EvidenceKind.DEV_READONLY_24H, EvidenceKind.DEV_CANARY, EvidenceKind.DEV_SOAK_TCA)
+        }
+        if len(dev_accounts) != 1 or None in dev_accounts or context.remote_account_id in dev_accounts:
+            raise ValueError("DEV qualification account is inconsistent or not separate from PROD")
+        limits = bindings[EvidenceKind.PRODUCTION_LIMITS]
         evidence_digest = hashlib.sha256(
             json.dumps(
                 [proof.model_dump(mode="json") for proof in proofs], sort_keys=True, separators=(",", ":")
@@ -172,6 +203,9 @@ class ProductionPreconditionsVerifier:
             evidence_sha256=evidence_digest,
             verified_at=now,
             valid_until=min(proof.valid_until for proof in proofs),
+            owner_identity=limits["owner_identity"],
+            dollar_cap=Decimal(limits["dollar_cap"]),
+            daily_stop_loss_usd=Decimal(limits["daily_stop_loss_usd"]),
         )
 
 
@@ -208,6 +242,41 @@ class DurableNonceStore(Protocol):
         ...
 
 
+class AsyncDurableNonceStore(Protocol):
+    async def consume_once_async(self, *, owner_identity: str, nonce: str, request_sha256: str) -> bool: ...
+
+
+def _validated_manual_request(
+    request: ManualArmRequestV1,
+    preconditions: PreconditionsV1,
+    *,
+    expected_owner_identity: str,
+    now: datetime,
+    maximum_lifetime: timedelta,
+) -> ManualArmRequestV1:
+    _aware(now)
+    request = ManualArmRequestV1.model_validate(request)
+    preconditions = PreconditionsV1.model_validate(preconditions)
+    if maximum_lifetime <= timedelta(0):
+        raise ValueError("reviewed manual-arm lifetime must be positive")
+    if (
+        request.context != preconditions.context
+        or request.preconditions_sha256 != canonical_digest(preconditions)
+        or request.owner_identity != expected_owner_identity
+        or request.owner_identity != preconditions.owner_identity
+        or request.dollar_cap != preconditions.dollar_cap
+        or request.daily_stop_loss_usd != preconditions.daily_stop_loss_usd
+    ):
+        raise ValueError("manual-arm scope, readiness digest or owner mismatch")
+    if not preconditions.verified_at <= now < preconditions.valid_until:
+        raise ValueError("preconditions are stale or future-dated")
+    if not request.created_at <= now < request.expires_at <= preconditions.valid_until:
+        raise ValueError("manual-arm request is stale, future-dated or beyond evidence validity")
+    if request.expires_at - request.created_at > maximum_lifetime:
+        raise ValueError("manual-arm lifetime exceeds the reviewed bound")
+    return request
+
+
 def validate_manual_arm(
     request: ManualArmRequestV1,
     preconditions: PreconditionsV1,
@@ -218,25 +287,45 @@ def validate_manual_arm(
     maximum_lifetime: timedelta,
 ) -> Literal["MANUAL_REQUEST_VALIDATED_ONLY"]:
     """Offline validation only. No LIVE flag, capability, signer or order is created."""
-    _aware(now)
-    request = ManualArmRequestV1.model_validate(request)
-    preconditions = PreconditionsV1.model_validate(preconditions)
-    if maximum_lifetime <= timedelta(0):
-        raise ValueError("reviewed manual-arm lifetime must be positive")
-    if (
-        request.context != preconditions.context
-        or request.preconditions_sha256 != canonical_digest(preconditions)
-        or request.owner_identity != expected_owner_identity
-    ):
-        raise ValueError("manual-arm scope, readiness digest or owner mismatch")
-    if not preconditions.verified_at <= now < preconditions.valid_until:
-        raise ValueError("preconditions are stale or future-dated")
-    if not request.created_at <= now < request.expires_at <= preconditions.valid_until:
-        raise ValueError("manual-arm request is stale, future-dated or beyond evidence validity")
-    if request.expires_at - request.created_at > maximum_lifetime:
-        raise ValueError("manual-arm lifetime exceeds the reviewed bound")
+    request = _validated_manual_request(
+        request,
+        preconditions,
+        expected_owner_identity=expected_owner_identity,
+        now=now,
+        maximum_lifetime=maximum_lifetime,
+    )
     try:
         admitted = nonce_store.consume_once(
+            owner_identity=expected_owner_identity,
+            nonce=request.nonce,
+            request_sha256=canonical_digest(request),
+        )
+    except Exception:
+        raise ValueError("manual-arm nonce outcome is unresolved; do not retry") from None
+    if admitted is not True:
+        raise ValueError("manual-arm nonce is already consumed or unresolved")
+    return "MANUAL_REQUEST_VALIDATED_ONLY"
+
+
+async def validate_manual_arm_async(
+    request: ManualArmRequestV1,
+    preconditions: PreconditionsV1,
+    *,
+    expected_owner_identity: str,
+    nonce_store: AsyncDurableNonceStore,
+    now: datetime,
+    maximum_lifetime: timedelta,
+) -> Literal["MANUAL_REQUEST_VALIDATED_ONLY"]:
+    """Async durable claims adapter; still no LIVE capability or authorization."""
+    request = _validated_manual_request(
+        request,
+        preconditions,
+        expected_owner_identity=expected_owner_identity,
+        now=now,
+        maximum_lifetime=maximum_lifetime,
+    )
+    try:
+        admitted = await nonce_store.consume_once_async(
             owner_identity=expected_owner_identity,
             nonce=request.nonce,
             request_sha256=canonical_digest(request),
