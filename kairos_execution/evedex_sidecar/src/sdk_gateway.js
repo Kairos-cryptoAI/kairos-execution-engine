@@ -25,6 +25,7 @@ const sdkPackage = JSON.parse(
 export const PINNED_SDK_VERSION = "1.2.11";
 const PAGE_LIMIT = 100;
 const MAX_AUTHORITATIVE_RECORDS = 10_000;
+const MAX_TENTATIVE_EVENTS = 10_000;
 const ENTRY_COMPENSATION_RESERVE = 4;
 const ENTRY_REQUIRED_HEADROOM = ENTRY_COMPENSATION_RESERVE + 2;
 
@@ -197,13 +198,19 @@ export function tokenExpiresAtMs(account) {
 }
 
 export class EvedexSdkGateway {
-  constructor({ apiKey, privateKey, expectedAccountId } = {}) {
+  constructor({ apiKey, privateKey, expectedAccountId, containerFactory } = {}) {
     assertPinnedDevProfile();
     this.apiKey = apiKey ?? readSecretFile("EVEDEX_DEV_API_KEY");
     this.privateKey = privateKey ?? readSecretFile("EVEDEX_DEV_PRIVATE_KEY");
     this.expectedAccountId =
       expectedAccountId ?? process.env.EVEDEX_DEV_EXPECTED_ACCOUNT_ID;
     if (!this.expectedAccountId) throw new Error("EVEDEX_DEV_EXPECTED_ACCOUNT_ID is required");
+    // This is a trusted-code test seam only; runtime configuration cannot
+    // replace the SDK container or alter its pinned DEV profile.
+    this.containerFactory = containerFactory ?? ((options) => new evedex.Container(options));
+    if (typeof this.containerFactory !== "function") {
+      throw new TypeError("SDK container factory must be a function");
+    }
     this.container = undefined;
     this.walletAccount = undefined;
     this.readAccount = undefined;
@@ -212,6 +219,7 @@ export class EvedexSdkGateway {
     this.events = [];
     this.eventSequence = 0;
     this.authenticatedAtMs = undefined;
+    this.authGeneration = 0;
     this.mutationBudget = new LocalMutationBudget();
   }
 
@@ -234,47 +242,119 @@ export class EvedexSdkGateway {
   }
 
   async #authenticate() {
-    if (this.balance?.listening) await this.balance.unListen();
-    this.container?.closeWsConnection();
-    const container = new evedex.Container({
-      environment: evedex.Environment.DEV,
-      centrifugeWebSocket: WebSocket,
-      wallets: { signing: { privateKey: this.privateKey } },
-      apiKeys: { readonly: { apiKey: this.apiKey } },
-      // SDK 1.2.11 still embeds the superseded 421614 DEV chain. This exact,
-      // non-configurable override mirrors official repository master. No
-      // environment variable or request can alter it.
-      gatewayOverrides: DEV_PROFILE,
-    });
-    // No gateway overrides are permitted: the SDK profile is the safety boundary.
-    const [walletAccount, readAccount] = await Promise.all([
-      container.account("signing"),
-      container.apiKeyAccount("readonly"),
-    ]);
-    const [signingAccount, readOnlyAccount, instruments] = await Promise.all([
-      walletAccount.fetchMe(),
-      readAccount.fetchMe(),
-      container.gateway().fetchInstruments(),
-    ]);
-    const signingIdentity = this.#assertExpectedAccount(signingAccount, "signing wallet");
-    const readIdentity = this.#assertExpectedAccount(readOnlyAccount, "API key");
-    if (signingIdentity !== readIdentity) {
-      throw new Error("EVEDEX signing wallet and API key resolve to different PAPER accounts");
+    const oldBalance = this.balance;
+    const oldContainer = this.container;
+    // Invalidate the old authenticated view before attempting replacement. A
+    // failed refresh must never leave stale accounts eligible for reuse.
+    this.container = undefined;
+    this.walletAccount = undefined;
+    this.readAccount = undefined;
+    this.balance = undefined;
+    this.authenticatedAtMs = undefined;
+    const generation = ++this.authGeneration;
+
+    let oldCleanupError;
+    try {
+      if (oldBalance?.listening) await oldBalance.unListen();
+    } catch (error) {
+      oldCleanupError = error;
+    } finally {
+      try {
+        await oldContainer?.closeWsConnection();
+      } catch (error) {
+        oldCleanupError ??= error;
+      }
     }
-    this.#assertVenueInstruments(instruments);
-    const balance = walletAccount.getBalance();
-    balance.onAccountUpdate((value) => this.#recordEvent("ACCOUNT", value));
-    balance.onFundingUpdate((value) => this.#recordEvent("FUNDING", value));
-    balance.onPositionUpdate((value) => this.#recordEvent("POSITION", value));
-    balance.onOrderUpdate((value) => this.#recordEvent("ORDER", value));
-    balance.onTpSlUpdate((value) => this.#recordEvent("TPSL", value));
-    balance.onOrderFillsUpdate((value) => this.#recordEvent("FILL", value));
-    await balance.listen();
-    this.container = container;
-    this.walletAccount = walletAccount;
-    this.readAccount = readAccount;
-    this.balance = balance;
-    this.authenticatedAtMs = Date.now();
+    if (oldCleanupError) throw oldCleanupError;
+
+    let container;
+    let balance;
+    let listeningStarted = false;
+    let admitted = false;
+    const pendingEvents = [];
+    let pendingOverflow = false;
+    const recordPendingEvent = (type, value) => {
+      if (generation !== this.authGeneration) return;
+      if (admitted) {
+        this.#recordEvent(type, value);
+        return;
+      }
+      if (pendingEvents.length >= MAX_TENTATIVE_EVENTS) pendingOverflow = true;
+      if (!pendingOverflow) pendingEvents.push({ type, payload: value });
+    };
+    try {
+      container = this.containerFactory({
+        environment: evedex.Environment.DEV,
+        centrifugeWebSocket: WebSocket,
+        wallets: { signing: { privateKey: this.privateKey } },
+        apiKeys: { readonly: { apiKey: this.apiKey } },
+        // SDK 1.2.11 still embeds the superseded 421614 DEV chain. This exact,
+        // non-configurable override mirrors official repository master. No
+        // environment variable or request can alter it.
+        gatewayOverrides: DEV_PROFILE,
+      });
+      // Only the fixed compile-time DEV profile is permitted.
+      const [walletAccount, readAccount] = await Promise.all([
+        container.account("signing"),
+        container.apiKeyAccount("readonly"),
+      ]);
+      const [signingAccount, readOnlyAccount, instruments] = await Promise.all([
+        walletAccount.fetchMe(),
+        readAccount.fetchMe(),
+        container.gateway().fetchInstruments(),
+      ]);
+      const signingIdentity = this.#assertExpectedAccount(signingAccount, "signing wallet");
+      const readIdentity = this.#assertExpectedAccount(readOnlyAccount, "API key");
+      if (signingIdentity !== readIdentity) {
+        throw new Error("EVEDEX signing wallet and API key resolve to different PAPER accounts");
+      }
+      this.#assertVenueInstruments(instruments);
+      balance = walletAccount.getBalance();
+      balance.onAccountUpdate((value) => recordPendingEvent("ACCOUNT", value));
+      balance.onFundingUpdate((value) => recordPendingEvent("FUNDING", value));
+      balance.onPositionUpdate((value) => recordPendingEvent("POSITION", value));
+      balance.onOrderUpdate((value) => recordPendingEvent("ORDER", value));
+      balance.onTpSlUpdate((value) => recordPendingEvent("TPSL", value));
+      balance.onOrderFillsUpdate((value) => recordPendingEvent("FILL", value));
+      listeningStarted = true;
+      await balance.listen();
+      if (generation !== this.authGeneration) {
+        throw new Error("EVEDEX session was invalidated before admission");
+      }
+      if (pendingOverflow) {
+        throw new Error("EVEDEX tentative event buffer exceeded its bound");
+      }
+
+      this.container = container;
+      this.walletAccount = walletAccount;
+      this.readAccount = readAccount;
+      this.balance = balance;
+      this.authenticatedAtMs = Date.now();
+      for (const event of pendingEvents) {
+        this.#recordEvent(event.type, event.payload);
+      }
+      pendingEvents.length = 0;
+      admitted = true;
+    } catch (error) {
+      admitted = false;
+      pendingEvents.length = 0;
+      if (generation === this.authGeneration) this.authGeneration += 1;
+      // A partially established listener/container is not safe to retain. Keep
+      // the original auth failure as the observable error if cleanup also fails.
+      if (listeningStarted && typeof balance?.unListen === "function") {
+        try {
+          await balance.unListen();
+        } catch {
+          // Preserve the authentication/preflight/listen failure.
+        }
+      }
+      try {
+        await container?.closeWsConnection();
+      } catch {
+        // Preserve the authentication/preflight/listen failure.
+      }
+      throw error;
+    }
   }
 
   #recordEvent(type, payload) {
@@ -469,7 +549,18 @@ export class EvedexSdkGateway {
   }
 
   async close() {
-    if (this.balance?.listening) await this.balance.unListen();
-    this.container?.closeWsConnection();
+    const balance = this.balance;
+    const container = this.container;
+    this.authGeneration += 1;
+    this.balance = undefined;
+    this.container = undefined;
+    this.walletAccount = undefined;
+    this.readAccount = undefined;
+    this.authenticatedAtMs = undefined;
+    try {
+      if (balance?.listening) await balance.unListen();
+    } finally {
+      await container?.closeWsConnection();
+    }
   }
 }

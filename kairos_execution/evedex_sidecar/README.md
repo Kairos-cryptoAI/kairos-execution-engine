@@ -41,6 +41,19 @@ The `drain_events` read command returns the ordered, monotonic account/order/
 fill/TP-SL event buffer for Python reconciliation; the sidecar never opens a
 host port.
 
+Session replacement first invalidates the cached accounts. Any authentication,
+identity, instrument or listener failure closes the candidate connection and
+leaves no stale account available for reuse. Listener callbacks are fenced by
+session generation; already accepted, undrained events survive reauthentication.
+Events received before listener admission are bounded at 10,000; overflow
+rejects the candidate session rather than hiding an event gap. Closing a session
+also invalidates its accounts and fences late callbacks.
+
+The offline gateway tests inject a fake container directly from trusted test
+code. Production still constructs the pinned official SDK with the fixed DEV
+profile; no environment variable or protocol request can select a factory.
+These tests do not authenticate, sign, open an exchange stream or send orders.
+
 `health` returns auth age/expiry and the remaining conservative local mutation
 budget without returning tokens, keys or wallet data. The published SDK drops
 headers on successful REST responses, so venue reserve observability is reported
