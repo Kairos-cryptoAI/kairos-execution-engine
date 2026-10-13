@@ -14,6 +14,8 @@ dependencies = [
     "kairos-core>=0.3,<0.4",
     "kairos-persistence>=0.1,<0.2",
     "aiohttp>=3.9,<4",
+    # GHSA-54p9-h82j-f925: exclude the vulnerable aiohttp transitive versions.
+    "multidict>=6.9.1,<7",
     "redis>=6.4,<9",
     "structlog>=24.1,<27",
     "pydantic>=2.6,<3",
