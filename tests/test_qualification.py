@@ -120,6 +120,82 @@ async def test_authenticated_qualification_reconciles_without_exposing_jwt():
 
 
 @pytest.mark.asyncio
+async def test_getter_exception_details_are_redacted_from_report_and_json(tmp_path):
+    payloads, headers = _responses()
+    marker = "GETTER_EXCEPTION_SECRET_SENTINEL"
+    calls = []
+
+    async def getter(path, request_headers):
+        calls.append(path)
+        if path == "/api/market":
+            raise RuntimeError(f"transport failed; bearer={marker}")
+        return HttpObservation(200, 1.5, headers, payloads[path])
+
+    report = await qualify_evedex(
+        exchange_base_url=_EVEDEX_DEV_QUALIFICATION_ORIGIN,
+        symbol_map=SYMBOL_MAP,
+        jwt=marker,
+        getter=getter,
+        now=NOW,
+    )
+    serialized = json.dumps(report.to_dict())
+    destination = tmp_path / "qualification.json"
+    _write_report(destination, report, overwrite=False)
+
+    check = next(item for item in report.checks if item.name == "http:/api/market")
+    assert check.detail == "GET request failed; exception details redacted"
+    assert marker not in serialized
+    assert marker not in destination.read_text(encoding="utf-8")
+    assert calls
+
+
+@pytest.mark.asyncio
+async def test_account_exception_details_are_redacted_from_report_and_json(tmp_path):
+    payloads, headers = _responses()
+    marker = "ACCOUNT_EXCEPTION_SECRET_SENTINEL"
+    destination = tmp_path / "qualification.json"
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+
+        async def fail_snapshot(*_args, **_kwargs):
+            raise RuntimeError(f"account metadata={marker}")
+
+        monkeypatch.setattr(qualification.EvedexAdapter, "fetch_account_snapshot", fail_snapshot)
+        report = await qualify_evedex(
+            exchange_base_url=_EVEDEX_DEV_QUALIFICATION_ORIGIN,
+            symbol_map=SYMBOL_MAP,
+            jwt="test-only-jwt",
+            getter=_getter(payloads, headers, []),
+            now=NOW,
+        )
+
+    serialized = json.dumps(report.to_dict())
+    _write_report(destination, report, overwrite=False)
+    check = next(item for item in report.checks if item.name == "authenticated_reconciliation")
+    assert check.detail == ("authenticated account reconciliation failed; exception details redacted")
+    assert marker not in serialized
+    assert marker not in destination.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_invalid_instrument_metadata_does_not_echo_server_values():
+    payloads, headers = _responses()
+    marker = "INSTRUMENT_METADATA_SECRET_SENTINEL"
+    payloads["/api/market/instrument"][0]["trading"] = marker
+
+    report = await qualify_evedex(
+        exchange_base_url=_EVEDEX_DEV_QUALIFICATION_ORIGIN,
+        symbol_map=SYMBOL_MAP,
+        getter=_getter(payloads, headers, []),
+        now=NOW,
+    )
+
+    check = next(item for item in report.checks if item.name == "instrument_contract")
+    assert check.detail == "instrument contract payload is invalid"
+    assert marker not in json.dumps(report.to_dict())
+
+
+@pytest.mark.asyncio
 async def test_qualification_blocks_when_authenticated_api_omits_quota_headers():
     payloads, headers = _responses(quota_headers=False)
     calls = []
@@ -151,7 +227,7 @@ async def test_qualification_fails_closed_for_non_tradable_instrument():
 
     assert report.status is CheckStatus.FAIL
     contract = next(check for check in report.checks if check.name == "instrument_contract")
-    assert "not fully tradable" in contract.detail
+    assert contract.detail == "instrument contract payload is invalid"
 
 
 def test_report_writer_is_atomic_and_refuses_overwrite(tmp_path):

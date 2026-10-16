@@ -169,12 +169,12 @@ async def _qualify(
         headers = {"Authorization": f"Bearer {jwt}"} if authenticated and jwt else {}
         try:
             observation = await getter(path, headers)
-        except Exception as exc:
+        except Exception:
             checks.append(
                 QualificationCheck(
                     name=f"http:{path}",
                     status=CheckStatus.FAIL,
-                    detail=f"{type(exc).__name__}: {exc}",
+                    detail="GET request failed; exception details redacted",
                 )
             )
             return None
@@ -209,8 +209,14 @@ async def _qualify(
                     observed_headers=_public_headers(market.headers),
                 )
             )
-        except ValueError as exc:
-            checks.append(QualificationCheck("matcher_state", CheckStatus.FAIL, str(exc)))
+        except ValueError:
+            checks.append(
+                QualificationCheck(
+                    "matcher_state",
+                    CheckStatus.FAIL,
+                    "matcher state payload is invalid",
+                )
+            )
 
     instruments_response = await fetch("/api/market/instrument")
     instruments_by_name: dict[str, dict[str, Any]] = {}
@@ -257,8 +263,14 @@ async def _qualify(
                         observed_headers=_public_headers(instruments_response.headers),
                     )
                 )
-            except ValueError as exc:
-                checks.append(QualificationCheck("instrument_contract", CheckStatus.FAIL, str(exc)))
+            except ValueError:
+                checks.append(
+                    QualificationCheck(
+                        "instrument_contract",
+                        CheckStatus.FAIL,
+                        "instrument contract payload is invalid",
+                    )
+                )
 
     for logical, venue in sorted(symbol_map.items()):
         depth_path = f"/api/market/{venue}/deep?marketLevel=1"
@@ -293,8 +305,14 @@ async def _qualify(
                         observed_headers=_public_headers(depth.headers),
                     )
                 )
-            except (AttributeError, ValueError) as exc:
-                checks.append(QualificationCheck(f"depth:{logical}", CheckStatus.FAIL, str(exc)))
+            except (AttributeError, ValueError):
+                checks.append(
+                    QualificationCheck(
+                        f"depth:{logical}",
+                        CheckStatus.FAIL,
+                        "depth payload is invalid",
+                    )
+                )
 
         trades_path = f"/api/market/{venue}/recent-trades"
         trades = await fetch(trades_path)
@@ -334,8 +352,14 @@ async def _qualify(
                         observed_headers=_public_headers(trades.headers),
                     )
                 )
-            except (ValueError, TypeError) as exc:
-                checks.append(QualificationCheck(f"recent_trades:{logical}", CheckStatus.FAIL, str(exc)))
+            except (ValueError, TypeError):
+                checks.append(
+                    QualificationCheck(
+                        f"recent_trades:{logical}",
+                        CheckStatus.FAIL,
+                        "recent-trades payload is invalid",
+                    )
+                )
 
     if not jwt:
         checks.append(
@@ -386,12 +410,12 @@ async def _qualify(
                         f"positions={len(snapshot.positions)} open_orders={len(snapshot.open_order_ids)}",
                     )
                 )
-            except Exception as exc:
+            except Exception:
                 checks.append(
                     QualificationCheck(
                         "authenticated_reconciliation",
                         CheckStatus.FAIL,
-                        f"{type(exc).__name__}: {exc}",
+                        "authenticated account reconciliation failed; exception details redacted",
                     )
                 )
         quota_headers = {
