@@ -188,7 +188,7 @@ async def measure_public_venue_sample(
     if not math.isfinite(notional_usd) or notional_usd <= 0 or notional_usd > 1_000:
         raise ValueError("recorder notional must be positive and no greater than $1,000")
     try:
-        from kairos_quant.venue_comparison import (  # type: ignore[import-untyped]
+        from kairos_quant.venue_comparison import (  # type: ignore[import-untyped,import-not-found]
             compare_venues,
             parse_binance_book,
             parse_evedex_book,
