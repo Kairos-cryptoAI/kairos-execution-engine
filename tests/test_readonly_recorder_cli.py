@@ -103,7 +103,7 @@ def test_error_output_cannot_include_raw_driver_secrets(tmp_path, monkeypatch, c
     path.write_text(configuration(tmp_path).model_dump_json(), encoding="utf-8")
 
     async def fail(config):
-        raise RuntimeError("Bearer fixture-secret-do-not-log postgresql://fixture-password")
+        raise RuntimeError("Bearer FIXTURE postgresql://fixture")
 
     monkeypatch.setattr(cli, "record", fail)
     assert cli.main(["record", "--config", str(path), "--confirm", cli.CONFIRMATION]) == 1
