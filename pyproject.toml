@@ -26,6 +26,7 @@ dependencies = [
 evedex = ["eth-account>=0.11,<1"]
 ccxt = ["ccxt>=4.3,<5", "urllib3>=2.8.0,<3"]
 production-evidence = ["cryptography==50.0.0"]
+recorder = ["kairos-quant-scouts>=0.1,<0.2"]
 
 [dependency-groups]
 dev = [
@@ -41,6 +42,7 @@ dev = [
 [project.scripts]
 kairos-execution-engine = "kairos_execution.service:main"
 kairos-evedex-qualify = "kairos_execution.qualification:main"
+kairos-evedex-record-readonly = "kairos_execution.readonly_recorder_cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["kairos_execution"]
@@ -69,6 +71,7 @@ required-version = "==0.12.3"
 [tool.uv.sources]
 kairos-core = { git = "https://github.com/Kairos-cryptoAI/kairos-core.git", rev = "6937eb4773fc00afaf5ba4e020b28b689f48e377" }
 kairos-persistence = { git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git", rev = "ea0c73395352f71da196270fe16659f1f0298a52" }
+kairos-quant-scouts = { git = "https://github.com/Kairos-cryptoAI/kairos-quant-scouts.git", rev = "7db2712dc9995e7adbb0947104572b88f45368a0" }
 
 [tool.ruff]
 line-length = 110
