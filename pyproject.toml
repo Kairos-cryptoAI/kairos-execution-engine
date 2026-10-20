@@ -24,7 +24,7 @@ dependencies = [
 
 [project.optional-dependencies]
 evedex = ["eth-account>=0.11,<1", "coincurve==21.0.0"]
-ccxt = ["ccxt>=4.3,<5", "urllib3>=2.8.0,<3"]
+ccxt = ["ccxt>=4.3,<5", "urllib3>=2.8.0,<3", "certifi>=2026.10.19"]
 production-evidence = ["cryptography==50.0.0"]
 recorder = ["kairos-quant-scouts>=0.1,<0.2"]
 
