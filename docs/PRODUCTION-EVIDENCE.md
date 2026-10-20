@@ -1,5 +1,12 @@
 # Production evidence and one-use claims (engineering only)
 
+For the owner's revised one-server scope, see
+[Single-host engineering profile](SINGLE-HOST-PRODUCTION.md). Its separate,
+versioned verifier does not require DEMO campaign or off-host-restore receipts
+and explicitly reports host-loss resilience as unestablished. The fourteen-gate
+V1 contract documented below remains unchanged historical compatibility, not an
+additional requirement silently imposed on that new profile.
+
 `production_readiness.py` now accepts the concrete `SignedReceiptInterpreter`,
 not injected boolean/mock interpreter results. The new receipt is explicitly
 `kairos.signed-production-evidence.v1`, domain-separated Ed25519 with a public-only
@@ -86,13 +93,14 @@ derived from the initial request lifetime, capped at 30 seconds. Authorization
 preparation, claim, callback, verification and terminal acknowledgment consume the
 same budget; a late terminal acknowledgment cannot release a signature.
 Cancellation cannot stop the worker thread; an admitted claim therefore remains
-unknown or terminal-but-not-returned and cannot authorize replay. No concrete
-KMS/backend, private key loading, generic/raw signing, Withdraw, exchange dispatch
-or provider factory is provided. The existing `SigningAuthorizationVerifier`
-interface remains unwired: real current operator/risk/manual authorization and
-native custody deadline/cancellation/reconciliation must be independently
-implemented and qualified before any production wiring. Offline fake callback
-tests do not establish native custody readiness.
+unknown or terminal-but-not-returned and cannot authorize replay. The separate
+`local_custody` module now supplies a bounded encrypted-keystore subprocess backend
+and independent signature recovery. It does not provide cloud KMS, raw signing,
+Withdraw, exchange dispatch or a production factory. The existing
+`SigningAuthorizationVerifier` interface remains unwired: real current
+operator/risk/manual authorization and deployed custody acceptance are still
+required before production wiring. Native SQL/local-worker tests use a synthetic
+wallet and fixture authorization; they do not qualify real production custody.
 
 ## Native isolated qualification
 

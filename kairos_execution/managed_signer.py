@@ -1,8 +1,9 @@
 """Unwired managed-custody boundary for reviewed typed-data signing only.
 
-No key loader, raw-digest signer, KMS client or production factory is provided.
-Deployment must independently provision a binding, backend, signature verifier
-and durable claim store. A failed/unknown dispatch is never retried here.
+This module never loads keys or provides raw-digest signing or a production
+factory. The separate local_custody module supplies a concrete isolated local
+backend, not default runtime wiring. Deployment must provision the binding,
+authorization, verifier and durable claims. Unknown dispatch is never retried.
 """
 
 from __future__ import annotations
