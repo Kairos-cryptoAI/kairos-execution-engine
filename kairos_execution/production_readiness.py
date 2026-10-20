@@ -7,7 +7,9 @@ The supported config/factory continue to reject LIVE unconditionally.
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import hmac
 import json
 from collections.abc import Mapping
 from datetime import datetime, timedelta
@@ -236,6 +238,39 @@ class ManualArmRequestV1(StrictRecord):
         return self
 
 
+class OwnerArmKeyV1(StrictRecord):
+    """Pinned public-key policy for authenticating an owner arm request.
+
+    This is verification-only policy. It contains no private key and is not a
+    LIVE capability or a production issuer.
+    """
+
+    version: Literal["kairos.owner-arm-key.v1"] = "kairos.owner-arm-key.v1"
+    owner_identity: Identity
+    key_id: Identity
+    public_key_base64: Annotated[str, Field(pattern=r"^[A-Za-z0-9+/]{43}=$")]
+    context: ProductionContextV1
+    valid_from: datetime
+    valid_until: datetime
+
+    _utc = field_validator("valid_from", "valid_until")(_aware)
+
+    @model_validator(mode="after")
+    def valid_policy(self) -> Self:
+        if self.valid_until <= self.valid_from:
+            raise ValueError("owner arm key validity interval is empty")
+        return self
+
+
+class SignedManualArmRequestV1(StrictRecord):
+    """Owner-signed complete manual-arm request; validation still grants no authority."""
+
+    version: Literal["kairos.signed-manual-arm-request.v1"] = "kairos.signed-manual-arm-request.v1"
+    request: ManualArmRequestV1
+    key_id: Identity
+    signature_base64: Annotated[str, Field(pattern=r"^[A-Za-z0-9+/]{86}==$", repr=False)]
+
+
 class DurableNonceStore(Protocol):
     def consume_once(self, *, owner_identity: str, nonce: str, request_sha256: str) -> bool:
         """Atomically persist one claim; unknown outcome must never become retry permission."""
@@ -335,3 +370,137 @@ async def validate_manual_arm_async(
     if admitted is not True:
         raise ValueError("manual-arm nonce is already consumed or unresolved")
     return "MANUAL_REQUEST_VALIDATED_ONLY"
+
+
+_OWNER_ARM_DOMAIN = b"kairos.signed-manual-arm-request.v1\x00"
+
+
+def _verify_owner_signed_arm(
+    signed_request: SignedManualArmRequestV1,
+    preconditions: PreconditionsV1,
+    *,
+    owner_key: OwnerArmKeyV1,
+    expected_owner_key_sha256: Digest,
+    expected_owner_identity: str,
+    now: datetime,
+    maximum_lifetime: timedelta,
+) -> tuple[ManualArmRequestV1, str]:
+    """Verify pinned owner signature and all request bounds without consuming a nonce."""
+    signed_request = SignedManualArmRequestV1.model_validate(signed_request)
+    owner_key = OwnerArmKeyV1.model_validate(owner_key)
+    if (
+        not isinstance(expected_owner_key_sha256, str)
+        or len(expected_owner_key_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in expected_owner_key_sha256)
+    ):
+        raise ValueError("an independently pinned owner signing-key digest is required")
+    if not hmac.compare_digest(canonical_digest(owner_key), expected_owner_key_sha256):
+        raise ValueError("owner signing key does not match the independently pinned policy")
+    request = _validated_manual_request(
+        signed_request.request,
+        preconditions,
+        expected_owner_identity=expected_owner_identity,
+        now=now,
+        maximum_lifetime=maximum_lifetime,
+    )
+    if (
+        owner_key.owner_identity != expected_owner_identity
+        or owner_key.context != request.context
+        or signed_request.key_id != owner_key.key_id
+        or not owner_key.valid_from <= request.created_at < request.expires_at <= owner_key.valid_until
+        or not owner_key.valid_from <= now < owner_key.valid_until
+    ):
+        raise ValueError("owner signing key identity, scope or validity mismatch")
+
+    # Import only when this explicit verification path is invoked. Never load a
+    # private key or create an authority-bearing object here.
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+        public_key = base64.b64decode(owner_key.public_key_base64, validate=True)
+        signature = base64.b64decode(signed_request.signature_base64, validate=True)
+        if (
+            len(public_key) != 32
+            or len(signature) != 64
+            or base64.b64encode(public_key).decode() != owner_key.public_key_base64
+            or base64.b64encode(signature).decode() != signed_request.signature_base64
+        ):
+            raise ValueError("invalid Ed25519 key or signature length")
+        payload = json.dumps(
+            request.model_dump(mode="json"), sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode()
+        Ed25519PublicKey.from_public_bytes(public_key).verify(signature, _OWNER_ARM_DOMAIN + payload)
+    except Exception:
+        raise ValueError("owner manual-arm signature verification failed") from None
+    return request, canonical_digest(request)
+
+
+def validate_signed_manual_arm(
+    signed_request: SignedManualArmRequestV1,
+    preconditions: PreconditionsV1,
+    *,
+    owner_key: OwnerArmKeyV1,
+    expected_owner_key_sha256: Digest,
+    expected_owner_identity: str,
+    nonce_store: DurableNonceStore,
+    now: datetime,
+    maximum_lifetime: timedelta,
+) -> Literal["OWNER_AUTHENTICATED_MANUAL_REQUEST_VALIDATED_ONLY"]:
+    """Authenticate a bounded owner arm request, then consume its nonce once.
+
+    This is not a LIVE capability issuer and cannot change startup policy.
+    """
+    request, request_digest = _verify_owner_signed_arm(
+        signed_request,
+        preconditions,
+        owner_key=owner_key,
+        expected_owner_key_sha256=expected_owner_key_sha256,
+        expected_owner_identity=expected_owner_identity,
+        now=now,
+        maximum_lifetime=maximum_lifetime,
+    )
+    try:
+        admitted = nonce_store.consume_once(
+            owner_identity=expected_owner_identity,
+            nonce=request.nonce,
+            request_sha256=request_digest,
+        )
+    except Exception:
+        raise ValueError("manual-arm nonce outcome is unresolved; do not retry") from None
+    if admitted is not True:
+        raise ValueError("manual-arm nonce is already consumed or unresolved")
+    return "OWNER_AUTHENTICATED_MANUAL_REQUEST_VALIDATED_ONLY"
+
+
+async def validate_signed_manual_arm_async(
+    signed_request: SignedManualArmRequestV1,
+    preconditions: PreconditionsV1,
+    *,
+    owner_key: OwnerArmKeyV1,
+    expected_owner_key_sha256: Digest,
+    expected_owner_identity: str,
+    nonce_store: AsyncDurableNonceStore,
+    now: datetime,
+    maximum_lifetime: timedelta,
+) -> Literal["OWNER_AUTHENTICATED_MANUAL_REQUEST_VALIDATED_ONLY"]:
+    """Async durable nonce variant; still no LIVE capability or authorization."""
+    request, request_digest = _verify_owner_signed_arm(
+        signed_request,
+        preconditions,
+        owner_key=owner_key,
+        expected_owner_key_sha256=expected_owner_key_sha256,
+        expected_owner_identity=expected_owner_identity,
+        now=now,
+        maximum_lifetime=maximum_lifetime,
+    )
+    try:
+        admitted = await nonce_store.consume_once_async(
+            owner_identity=expected_owner_identity,
+            nonce=request.nonce,
+            request_sha256=request_digest,
+        )
+    except Exception:
+        raise ValueError("manual-arm nonce outcome is unresolved; do not retry") from None
+    if admitted is not True:
+        raise ValueError("manual-arm nonce is already consumed or unresolved")
+    return "OWNER_AUTHENTICATED_MANUAL_REQUEST_VALIDATED_ONLY"

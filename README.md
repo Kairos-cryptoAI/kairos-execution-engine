@@ -13,6 +13,16 @@
   Low-level live adapter mutations also require a release authorization that the current build does
   not issue; a future LIVE release must wire that capability only after readiness and manual-arming
   checks.
+- Production precondition evidence and the optional signed manual-arm verifier are preparation-only.
+  The signed arm path verifies a domain-separated Ed25519 signature against an owner- and
+  exact-context-scoped public-key policy, and requires a separate `expected_owner_key_sha256` pin
+  from independently admitted server configuration. The pin covers the complete key policy; it is
+  not accepted from the signed request. It checks request/precondition/limit/expiry bindings and
+  consumes the nonce once. It returns only `OWNER_AUTHENTICATED_MANUAL_REQUEST_VALIDATED_ONLY`;
+  it does not create LIVE authority, configure a signer, enable a service, or qualify production.
+  This repository does not enroll or provide a trusted owner key/pin. Key enrollment and pin
+  admission, private-key handling, independent gate acceptance, Risk/operator integration,
+  deployment controls and end-to-end production qualification remain external future requirements.
 
 `KAIROS_DRY_RUN=false` is retired and is always a startup error. It never maps to
 `PAPER` or `LIVE`. `PAPER` also rejects the legacy `TacticalCommand -> ValidatedOrder`
