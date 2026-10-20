@@ -1243,7 +1243,7 @@ wheels = [
 [[package]]
 name = "kairos-core"
 version = "0.3.0"
-source = { git = "https://github.com/Kairos-cryptoAI/kairos-core.git?rev=37165e3078b53364513f876f4243357ba19a19ba#37165e3078b53364513f876f4243357ba19a19ba" }
+source = { git = "https://github.com/Kairos-cryptoAI/kairos-core.git?rev=d52fd9734a27f76f8e2bdbf053d477b8e04b81c9#d52fd9734a27f76f8e2bdbf053d477b8e04b81c9" }
 dependencies = [
     { name = "aiohttp" },
     { name = "orjson" },
@@ -1301,7 +1301,7 @@ requires-dist = [
     { name = "ccxt", marker = "extra == 'ccxt'", specifier = ">=4.3,<5" },
     { name = "cryptography", marker = "extra == 'production-evidence'", specifier = "==50.0.0" },
     { name = "eth-account", marker = "extra == 'evedex'", specifier = ">=0.11,<1" },
-    { name = "kairos-core", git = "https://github.com/Kairos-cryptoAI/kairos-core.git?rev=37165e3078b53364513f876f4243357ba19a19ba" },
+    { name = "kairos-core", git = "https://github.com/Kairos-cryptoAI/kairos-core.git?rev=d52fd9734a27f76f8e2bdbf053d477b8e04b81c9" },
     { name = "kairos-persistence", git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git?rev=2d88a351fc045de5b58bbf6acae209341096a850" },
     { name = "kairos-quant-scouts", marker = "extra == 'recorder'", git = "https://github.com/Kairos-cryptoAI/kairos-quant-scouts.git?rev=7b411f8cbc648474dc18caae869c4f6867c31542" },
     { name = "multidict", specifier = ">=6.9.1,<7" },

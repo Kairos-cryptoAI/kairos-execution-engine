@@ -69,7 +69,7 @@ exclude = [
 required-version = "==0.12.3"
 
 [tool.uv.sources]
-kairos-core = { git = "https://github.com/Kairos-cryptoAI/kairos-core.git", rev = "37165e3078b53364513f876f4243357ba19a19ba" }
+kairos-core = { git = "https://github.com/Kairos-cryptoAI/kairos-core.git", rev = "d52fd9734a27f76f8e2bdbf053d477b8e04b81c9" }
 kairos-persistence = { git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git", rev = "2d88a351fc045de5b58bbf6acae209341096a850" }
 kairos-quant-scouts = { git = "https://github.com/Kairos-cryptoAI/kairos-quant-scouts.git", rev = "7b411f8cbc648474dc18caae869c4f6867c31542" }
 
