@@ -85,7 +85,7 @@ python_version = "3.11"
 warn_unused_configs = true
 
 [[tool.mypy.overrides]]
-module = ["ccxt", "ccxt.*", "eth_account", "eth_account.*"]
+module = ["ccxt", "ccxt.*", "eth_account", "eth_account.*", "coincurve", "coincurve.*", "eth_utils", "eth_utils.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
