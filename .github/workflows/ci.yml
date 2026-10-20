@@ -109,6 +109,7 @@ jobs:
   execution-journal-integration:
     name: Execution journal / TimescaleDB
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     services:
       timescaledb:
         image: timescale/timescaledb:2.28.3-pg16
@@ -134,4 +135,8 @@ jobs:
           enable-cache: true
           python-version: "3.11"
       - run: uv sync --python 3.11 --locked --dev --extra evedex
+      - name: Bootstrap fresh synthetic claims-test database and roles
+        env:
+          KAIROS_PRODUCTION_CLAIMS_CI_BOOTSTRAP: "1"
+        run: uv run --python 3.11 --locked --dev --extra evedex python tests/bootstrap_production_claims_ci.py
       - run: uv run --python 3.11 --locked --dev --extra evedex pytest -q -m integration
