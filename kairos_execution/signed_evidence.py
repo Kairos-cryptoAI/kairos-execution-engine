@@ -16,7 +16,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Literal, Protocol, Self
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .production_readiness import (
     Digest,
@@ -385,6 +385,43 @@ class AlertFactsV1(EvidenceArtifactsV1):
         return self
 
 
+SINGLE_HOST_REQUIRED_ALERT_NAMES = (
+    "local-supervisor-restart",
+    "local-process-health",
+)
+
+
+class SingleHostAlertFactsV1(StrictRecord):
+    """Local alert/supervision evidence, with no claim of full-host resilience."""
+
+    schema_version: Literal["kairos.single-host-alert-facts.v1"] = "kairos.single-host-alert-facts.v1"
+    artifact_sha256s: tuple[Digest, ...] = Field(min_length=1, max_length=10000)
+    required_alert_names: tuple[Identity, ...] = Field(min_length=2, max_length=2)
+    deliveries: tuple[AlertDeliveryV1, ...] = Field(min_length=2, max_length=2)
+    notifier_restart_receipt_sha256: Digest
+    local_supervisor_identity: Identity
+    local_supervisor_restart_receipt_sha256: Digest
+    local_health_check_receipt_sha256: Digest
+    host_loss_resilience: Literal["NOT_ESTABLISHED"] = "NOT_ESTABLISHED"
+    unknown_sends: Literal[0]
+
+    @field_validator("artifact_sha256s")
+    @classmethod
+    def unique_single_host_artifacts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(value)) != len(value):
+            raise ValueError("duplicate independent artifact")
+        return value
+
+    @model_validator(mode="after")
+    def local_coverage(self) -> Self:
+        names = [delivery.alert_name for delivery in self.deliveries]
+        if len(set(names)) != len(names) or set(names) != set(self.required_alert_names):
+            raise ValueError("single-host local alert delivery coverage is incomplete")
+        if set(self.required_alert_names) != set(SINGLE_HOST_REQUIRED_ALERT_NAMES):
+            raise ValueError("single-host alert names differ from the fixed local profile")
+        return self
+
+
 class OperatorFactsV1(EvidenceArtifactsV1):
     control_database_identity: Identity
     operator_role: Identity
@@ -592,6 +629,23 @@ class SignedReceiptInterpreter:
             raise ValueError("duplicate issuer key identity")
         self._resolver = resolver
 
+    def _facts_schema(self) -> type[BaseModel]:
+        """Fixed schema hook; subclasses may only bind a reviewed constant schema."""
+
+        return FACT_SCHEMAS[self.kind]
+
+    def _validate_profile_alert_facts(
+        self, facts: BaseModel, frozen: FrozenGatePolicyV1, body: SignedReceiptBodyV1
+    ) -> None:
+        if isinstance(facts, AlertFactsV1) and tuple(sorted(facts.required_alert_names)) != tuple(
+            sorted(frozen.required_alert_names)
+        ):
+            raise ValueError("alert set differs from frozen required coverage")
+        if isinstance(facts, AlertFactsV1) and any(
+            delivery.owner_acknowledged_at > body.issued_at for delivery in facts.deliveries
+        ):
+            raise ValueError("alert receipt includes a future owner acknowledgment")
+
     def verify(self, reference: ReceiptReferenceV1, context: ProductionContextV1) -> VerifiedEvidenceV1:
         reference = ReceiptReferenceV1.model_validate(reference)
         context = ProductionContextV1.model_validate(context)
@@ -627,12 +681,14 @@ class SignedReceiptInterpreter:
         if len(public) != 32 or len(signature) != 64:
             raise ValueError("invalid public key or detached signature length")
         Ed25519PublicKey.from_public_bytes(public).verify(signature, _DOMAIN + canonical_bytes(body))
-        schema = FACT_SCHEMAS[self.kind]
+        schema = self._facts_schema()
         expected_schema = hashlib.sha256(canonical_bytes(schema.model_json_schema())).hexdigest()
         if body.facts_schema_sha256 != expected_schema:
             raise ValueError("unreviewed substantive gate schema")
         facts_json = json.loads(body.facts_json, object_pairs_hook=_unique_json)
         facts = schema.model_validate_json(canonical_bytes(facts_json))
+        if not isinstance(facts, (EvidenceArtifactsV1, SingleHostAlertFactsV1)):
+            raise ValueError("receipt facts do not use a reviewed production schema")
         policy_raw = self._resolver.artifact_bytes(context.frozen_policy_sha256)
         if (
             len(policy_raw) > _MAX_BYTES
@@ -714,14 +770,7 @@ class SignedReceiptInterpreter:
 
             if facts.typed_schema_sha256 != reviewed_schema_sha256(facts.chain_id):
                 raise ValueError("custody proof uses an unreviewed local typed schema/domain")
-        if isinstance(facts, AlertFactsV1) and tuple(sorted(facts.required_alert_names)) != tuple(
-            sorted(frozen.required_alert_names)
-        ):
-            raise ValueError("alert set differs from frozen required coverage")
-        if isinstance(facts, AlertFactsV1) and any(
-            delivery.owner_acknowledged_at > body.issued_at for delivery in facts.deliveries
-        ):
-            raise ValueError("alert receipt includes a future owner acknowledgment")
+        self._validate_profile_alert_facts(facts, frozen, body)
         for name in ("ended_at", "resumed_at", "killed_at"):
             if hasattr(facts, name) and getattr(facts, name) > body.issued_at:
                 raise ValueError("receipt includes future operational observations")
@@ -750,3 +799,29 @@ class SignedReceiptInterpreter:
             verified_issuer_key_id=body.key_id,
             binding_facts_json=canonical_bytes(binding_facts).decode(),
         )
+
+
+class SingleHostAlertReceiptInterpreter(SignedReceiptInterpreter):
+    """Fixed single-host alert schema; no generic caller-supplied schema hook."""
+
+    def __init__(self, registry: tuple[IssuerPolicyV1, ...], resolver: EvidenceResolver):
+        super().__init__(EvidenceKind.ALERT_DELIVERY, registry, resolver)
+
+    def _facts_schema(self) -> type[BaseModel]:
+        return SingleHostAlertFactsV1
+
+    def _validate_profile_alert_facts(
+        self, facts: BaseModel, frozen: FrozenGatePolicyV1, body: SignedReceiptBodyV1
+    ) -> None:
+        if type(facts) is not SingleHostAlertFactsV1:
+            raise ValueError("single-host profile requires its versioned local alert facts")
+        expected_names = tuple(sorted(SINGLE_HOST_REQUIRED_ALERT_NAMES))
+        if (
+            tuple(sorted(facts.required_alert_names)) != expected_names
+            or tuple(sorted(frozen.required_alert_names)) != expected_names
+        ):
+            raise ValueError("single-host alert names differ from the fresh local profile policy")
+        if facts.host_loss_resilience != "NOT_ESTABLISHED":
+            raise ValueError("single-host evidence cannot claim full-host-loss resilience")
+        if any(delivery.owner_acknowledged_at > body.issued_at for delivery in facts.deliveries):
+            raise ValueError("single-host alert receipt includes a future owner acknowledgment")
