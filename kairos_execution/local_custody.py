@@ -68,6 +68,8 @@ def _regular_protected_file(path: Path) -> Path:
 
 def _assert_private_windows_acl(path: Path) -> None:
     """Require the current user as owner and only user/SYSTEM DACL entries."""
+    if sys.platform != "win32":
+        raise LocalCustodyError("Windows ACL verification is unavailable on this platform")
     import ctypes
     from ctypes import wintypes
 
