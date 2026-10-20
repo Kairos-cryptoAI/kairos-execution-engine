@@ -1,4 +1,4 @@
-"""Offline guards for the candidate-only claims CI integration wiring."""
+"""Offline guards for the claims CI integration wiring."""
 
 import re
 import unittest
@@ -53,10 +53,15 @@ class ClaimsWorkflowRegressionTests(unittest.TestCase):
         self.assertNotIn("api_key", BOOTSTRAP.lower())
 
     def test_environment_values_are_fresh_and_bound_to_test_only_database(self):
-        from tests.bootstrap_production_claims_ci import DATABASE, github_environment_values
+        from tests.bootstrap_production_claims_ci import (
+            DATABASE,
+            SIMULATOR_DATABASE,
+            github_environment_values,
+        )
 
-        first = github_environment_values("00000000-0000-4000-8000-000000000001")
-        second = github_environment_values("00000000-0000-4000-8000-000000000002")
+        created = frozenset({DATABASE, SIMULATOR_DATABASE})
+        first = github_environment_values("00000000-0000-4000-8000-000000000001", created_databases=created)
+        second = github_environment_values("00000000-0000-4000-8000-000000000002", created_databases=created)
         self.assertEqual(first["KAIROS_PRODUCTION_CLAIMS_TEST_DATABASE"], DATABASE)
         self.assertNotEqual(
             first["KAIROS_PRODUCTION_CLAIMS_TEST_DATABASE_UUID"],
@@ -66,6 +71,27 @@ class ClaimsWorkflowRegressionTests(unittest.TestCase):
         self.assertIn(
             "claims-runtime-ci-public-test-only", first["KAIROS_PRODUCTION_CLAIMS_TEST_RUNTIME_DSN"]
         )
+        self.assertEqual(
+            first["KAIROS_SIM_CONTROLLER_DATABASE_URL"],
+            "postgresql://kairos:kairos_test@localhost:5432/" + SIMULATOR_DATABASE,
+        )
+        for created_databases in (frozenset(), frozenset({DATABASE})):
+            with self.subTest(created_databases=created_databases), self.assertRaises(ValueError):
+                github_environment_values(
+                    "00000000-0000-4000-8000-000000000001",
+                    created_databases=created_databases,
+                )
+
+    def test_simulator_database_is_separate_fixed_test_target(self):
+        from tests.bootstrap_production_claims_ci import SIMULATOR_DATABASE, bootstrap_sql
+
+        statements = bootstrap_sql()
+        self.assertEqual(SIMULATOR_DATABASE, "kairos_sim_controller_ci_000000000001")
+        self.assertIn(f"CREATE DATABASE {SIMULATOR_DATABASE} OWNER kairos", statements)
+        self.assertNotIn("IF NOT EXISTS", " ".join(statements))
+        self.assertNotIn("DROP DATABASE", " ".join(statements))
+        self.assertNotIn("KAIROS_SIM_CONTROLLER_DATABASE_URL", "\n".join(statements))
+        self.assertNotIn("KAIROS_SIM_CONTROLLER_DATABASE_URL", WORKFLOW)
 
     def test_bootstrap_refuses_wrong_repository_job_and_missing_output_before_connect(self):
         from tests.bootstrap_production_claims_ci import validate_ci_environment

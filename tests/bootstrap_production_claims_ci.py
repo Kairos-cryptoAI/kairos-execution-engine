@@ -14,6 +14,7 @@ from pathlib import Path
 from uuid import uuid4
 
 DATABASE = "kairos_production_evidence_ci_000000000001"
+SIMULATOR_DATABASE = "kairos_sim_controller_ci_000000000001"
 OWNER_ROLE = "kairos_claim_owner_ci"
 RUNTIME_ROLE = "kairos_claim_runtime_ci"
 OWNER_PASSWORD = "claims-owner-ci-public-test-only"
@@ -21,8 +22,10 @@ RUNTIME_PASSWORD = "claims-runtime-ci-public-test-only"
 ADMIN_DSN = "postgresql://kairos:kairos_test@localhost:5432/kairos_execution_test_000000000001"
 
 
-def github_environment_values(database_uuid: str) -> dict[str, str]:
-    """Return the opt-in test settings; values contain synthetic CI credentials only."""
+def github_environment_values(database_uuid: str, *, created_databases: frozenset[str]) -> dict[str, str]:
+    """Return test settings only after both isolated databases were created."""
+    if not {DATABASE, SIMULATOR_DATABASE}.issubset(created_databases):
+        raise ValueError("test database URLs require successful fresh database creation")
     return {
         "KAIROS_PRODUCTION_CLAIMS_TEST_PROVISION": "1",
         "KAIROS_PRODUCTION_CLAIMS_TEST_OWNER_DSN": (
@@ -36,6 +39,9 @@ def github_environment_values(database_uuid: str) -> dict[str, str]:
         "KAIROS_PRODUCTION_CLAIMS_TEST_POLICY_NAMESPACE": f"ci-claims:{database_uuid}",
         "KAIROS_PRODUCTION_CLAIMS_TEST_OWNER_ROLE": OWNER_ROLE,
         "KAIROS_PRODUCTION_CLAIMS_TEST_RUNTIME_ROLE": RUNTIME_ROLE,
+        "KAIROS_SIM_CONTROLLER_DATABASE_URL": (
+            f"postgresql://kairos:kairos_test@localhost:5432/{SIMULATOR_DATABASE}"
+        ),
     }
 
 
@@ -49,6 +55,9 @@ def bootstrap_sql() -> tuple[str, ...]:
         f"CREATE DATABASE {DATABASE} OWNER {OWNER_ROLE}",
         f"REVOKE CONNECT ON DATABASE {DATABASE} FROM PUBLIC",
         f"GRANT CONNECT ON DATABASE {DATABASE} TO {OWNER_ROLE}, {RUNTIME_ROLE}",
+        f"CREATE DATABASE {SIMULATOR_DATABASE} OWNER kairos",
+        f"REVOKE CONNECT ON DATABASE {SIMULATOR_DATABASE} FROM PUBLIC",
+        f"GRANT CONNECT ON DATABASE {SIMULATOR_DATABASE} TO kairos",
     )
 
 
@@ -83,15 +92,20 @@ async def bootstrap() -> None:
                 raise RuntimeError("unexpected synthetic CI bootstrap identity")
             if identity["role"] != "kairos":
                 raise RuntimeError("unexpected synthetic CI bootstrap identity")
+            created_databases: set[str] = set()
             for statement in bootstrap_sql():
                 await connection.execute(statement)
+                if statement == f"CREATE DATABASE {DATABASE} OWNER {OWNER_ROLE}":
+                    created_databases.add(DATABASE)
+                elif statement == f"CREATE DATABASE {SIMULATOR_DATABASE} OWNER kairos":
+                    created_databases.add(SIMULATOR_DATABASE)
         finally:
             await connection.close()
     except Exception:
         # Never expose a DSN, password, or raw connection/server diagnostic.
         raise SystemExit("fresh synthetic claims database bootstrap failed") from None
 
-    values = github_environment_values(str(uuid4()))
+    values = github_environment_values(str(uuid4()), created_databases=frozenset(created_databases))
     with Path(github_env).open("a", encoding="utf-8", newline="\n") as env_file:
         for name, value in values.items():
             if "\n" in name or "\n" in value or "\r" in value:
