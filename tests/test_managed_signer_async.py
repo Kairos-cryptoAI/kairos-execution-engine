@@ -156,24 +156,38 @@ async def test_claim_latency_consumes_backend_budget_timeout_preserves_unknown()
 
 
 @pytest.mark.asyncio
-async def test_late_terminal_commit_never_returns_a_signature_or_grants_replay():
+async def test_late_terminal_commit_never_returns_a_signature_or_grants_replay(monkeypatch):
     signer, request, backend, _, _ = setup_signer()
     request = request.model_copy(update={"expires_at": NOW + timedelta(milliseconds=30)})
     claims, db = claims_fixture(context=request.context)
     original = claims.finish_signing_async
+    entered, terminal_committed = asyncio.Event(), asyncio.Event()
+
+    async def immediate_thread_call(function, *args, **kwargs):
+        # Keep worker-thread startup from consuming this test's short deadline;
+        # the test is about the terminal callback's cancellation/commit order.
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", immediate_thread_call)
 
     async def late_terminal(**kwargs):
-        # A misbehaving dependency can suppress cancellation after COMMIT.
-        # The explicit monotonic check must still reject its late result.
-        await original(**kwargs)
+        # Hold the terminal write until the signing deadline cancels this
+        # callback, then deliberately finish COMMIT despite cancellation.
+        # This makes the late-commit ordering deterministic without sleeping.
+        entered.set()
         try:
-            await asyncio.sleep(0.2)
+            await asyncio.Event().wait()
         except asyncio.CancelledError:
-            await asyncio.sleep(0.005)
+            await original(**kwargs)
+            terminal_committed.set()
+            raise
 
     claims.finish_signing_async = late_terminal
+    task = asyncio.create_task(signer.sign_async(request, now=NOW, claims=claims))
+    await asyncio.wait_for(entered.wait(), timeout=2)
     with pytest.raises(ManagedSigningError, match="end-to-end signing deadline"):
-        await signer.sign_async(request, now=NOW, claims=claims)
+        await asyncio.wait_for(task, timeout=2)
+    await asyncio.wait_for(terminal_committed.wait(), timeout=2)
     assert next(iter(db.terminals.values()))["terminal_status"] == "COMPLETED"
     with pytest.raises(ManagedSigningError, match="claimed or unresolved"):
         await signer.sign_async(request, now=NOW, claims=claims)
