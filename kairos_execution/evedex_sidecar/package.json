@@ -16,6 +16,7 @@
     "ws": "8.21.3"
   },
   "overrides": {
+    "follow-redirects": "1.16.1",
     "@evedex/exchange-bot-sdk": {
       "axios": "1.20.0"
     }
