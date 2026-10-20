@@ -6,12 +6,23 @@ No database/role creation, data deletion or cleanup is performed by this test.
 """
 
 import asyncio
+import json
 import os
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from uuid import UUID
 
 import asyncpg
 import pytest
 
+from kairos_execution.local_custody import CoincurveTypedDataVerifier, LocalEncryptedKeystoreBackend
+from kairos_execution.managed_signer import (
+    CustodyBindingV1,
+    ManagedSignerBoundary,
+    ManagedSigningError,
+    ManagedSigningRequestV1,
+    reviewed_schema_sha256,
+)
 from kairos_execution.production_claims import (
     SCHEMA,
     PostgresProductionClaims,
@@ -21,9 +32,102 @@ from kairos_execution.production_claims import (
 from tests.production_evidence_fixtures import signed_gate_fixture
 
 
+async def _qualify_synthetic_local_custody(store, restarted, scope, tmp_path):
+    """Real SQL claims + one-shot child + independent recovery; no venue authority.
+
+    The authorization here is deliberately a test double, not a production
+    issuer/operator/risk verifier. The public key-one wallet never has funds.
+    """
+    from eth_account import Account
+
+    from tests.test_local_custody import _make_private
+
+    chain = 161803
+    instruments = ("BTCUSD", "ETHUSD", "SOLUSD", "BNBUSD", "XRPUSD")
+    synthetic_key = (1).to_bytes(32, "big")
+    unlock = "synthetic-native-test-only"
+    wallet = Account.from_key(synthetic_key).address
+    key_path, unlock_path = tmp_path / "synthetic-wallet.json", tmp_path / "synthetic-unlock.txt"
+    _make_private(key_path, json.dumps(Account.encrypt(synthetic_key, unlock, kdf="pbkdf2")).encode())
+    _make_private(unlock_path, unlock.encode())
+    binding = CustodyBindingV1(
+        context=scope,
+        custody_reference="fixture:native-local-custody",
+        wallet_address=wallet,
+        chain_id=chain,
+        schema_sha256=reviewed_schema_sha256(chain),
+        approved_instruments=instruments,
+        custody_receipt_sha256="a" * 64,
+    )
+
+    class FixtureAuthorization:
+        def verify_request(self, request, expected_binding):
+            assert expected_binding == binding
+            assert request.manual_request_sha256 == "b" * 64
+
+    backend = LocalEncryptedKeystoreBackend(
+        python_executable=Path(os.path.abspath(os.sys.executable)),
+        keystore_file=key_path,
+        unlock_file=unlock_path,
+        custody_reference=binding.custody_reference,
+        wallet_address=wallet,
+        chain_id=chain,
+        approved_instruments=instruments,
+    )
+    signer = ManagedSignerBoundary(
+        binding,
+        backend=backend,
+        verifier=CoincurveTypedDataVerifier(),
+        claims=store,  # Only the async API below is used.
+        authorization=FixtureAuthorization(),
+    )
+    now = datetime.now(UTC)
+    message = {
+        "id": "00384:ABCDEF0123456789ABCDEF0123",
+        "instrument": instruments[0],
+        "side": "BUY",
+        "leverage": 1,
+        "quantity": 100,
+        "limitPrice": 1000,
+        "chainId": chain,
+    }
+    request = ManagedSigningRequestV1(
+        request_id="native-local-once",
+        context=scope,
+        manual_request_sha256="b" * 64,
+        custody_receipt_sha256=binding.custody_receipt_sha256,
+        operation="New limit order",
+        message_json=json.dumps(message),
+        expires_at=now + timedelta(seconds=30),
+    )
+    result = await signer.sign_async(request, now=now, claims=store)
+    row = await restarted.load_claim(
+        kind="TYPED_SIGNING", namespace=binding.custody_reference, identity=request.request_id
+    )
+    assert row["terminal_status"] == "COMPLETED"
+    assert row["result_sha256"] == result.signature_sha256
+    assert result.signature not in repr(result) and "signature" not in result.model_dump()
+    with pytest.raises(ManagedSigningError, match="claimed or unresolved"):
+        await signer.sign_async(request, now=now, claims=restarted)
+
+    # A failed real decrypt becomes an immutable native UNRESOLVED terminal.
+    # Fixing the file afterwards cannot release or replay that consumed claim.
+    _make_private(unlock_path, b"intentionally-wrong-test-unlock")
+    failed = request.model_copy(update={"request_id": "native-local-failed"})
+    with pytest.raises(ManagedSigningError, match="unresolved"):
+        await signer.sign_async(failed, now=now, claims=store)
+    failed_row = await restarted.load_claim(
+        kind="TYPED_SIGNING", namespace=binding.custody_reference, identity=failed.request_id
+    )
+    assert failed_row["terminal_status"] == "UNRESOLVED"
+    _make_private(unlock_path, unlock.encode())
+    with pytest.raises(ManagedSigningError, match="claimed or unresolved"):
+        await signer.sign_async(failed, now=now, claims=restarted)
+
+
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_native_isolated_claims_races_restart_unknown_and_role_boundary():
+async def test_native_isolated_claims_races_restart_unknown_and_role_boundary(tmp_path):
     if os.getenv("KAIROS_PRODUCTION_CLAIMS_TEST_PROVISION") != "1":
         pytest.skip("explicit isolated production-claims provisioning is not enabled")
     names = (
@@ -75,6 +179,9 @@ async def test_native_isolated_claims_races_restart_unknown_and_role_boundary():
         await pool.close()
         pool = await asyncpg.create_pool(settings["RUNTIME_DSN"], min_size=1, max_size=4, command_timeout=5)
         restarted = PostgresProductionClaims(pool, **kwargs)
+        await _qualify_synthetic_local_custody(
+            PostgresProductionClaims(pool, **kwargs), restarted, scope, tmp_path
+        )
         assert await restarted.claim_once_async(**claim) is False
         row = await restarted.load_claim(
             kind="TYPED_SIGNING", namespace="fixture:custody", identity="concurrent-once"

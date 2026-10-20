@@ -1276,6 +1276,7 @@ ccxt = [
     { name = "urllib3" },
 ]
 evedex = [
+    { name = "coincurve" },
     { name = "eth-account" },
 ]
 production-evidence = [
@@ -1300,6 +1301,7 @@ dev = [
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.14.4,<4" },
     { name = "ccxt", marker = "extra == 'ccxt'", specifier = ">=4.3,<5" },
+    { name = "coincurve", marker = "extra == 'evedex'", specifier = "==21.0.0" },
     { name = "cryptography", marker = "extra == 'production-evidence'", specifier = "==50.0.0" },
     { name = "eth-account", marker = "extra == 'evedex'", specifier = ">=0.11,<1" },
     { name = "kairos-core", git = "https://github.com/Kairos-cryptoAI/kairos-core.git?rev=d52fd9734a27f76f8e2bdbf053d477b8e04b81c9" },
