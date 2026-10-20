@@ -13,7 +13,7 @@ authors = [{ name = "TheLitis" }]
 dependencies = [
     "kairos-core>=0.3,<0.4",
     "kairos-persistence>=0.1,<0.2",
-    "aiohttp>=3.9,<4",
+    "aiohttp>=3.14.4,<4",
     # GHSA-54p9-h82j-f925: exclude the vulnerable aiohttp transitive versions.
     "multidict>=6.9.1,<7",
     "redis>=6.4,<9",
@@ -69,9 +69,9 @@ exclude = [
 required-version = "==0.12.3"
 
 [tool.uv.sources]
-kairos-core = { git = "https://github.com/Kairos-cryptoAI/kairos-core.git", rev = "6937eb4773fc00afaf5ba4e020b28b689f48e377" }
-kairos-persistence = { git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git", rev = "ea0c73395352f71da196270fe16659f1f0298a52" }
-kairos-quant-scouts = { git = "https://github.com/Kairos-cryptoAI/kairos-quant-scouts.git", rev = "7db2712dc9995e7adbb0947104572b88f45368a0" }
+kairos-core = { git = "https://github.com/Kairos-cryptoAI/kairos-core.git", rev = "37165e3078b53364513f876f4243357ba19a19ba" }
+kairos-persistence = { git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git", rev = "2d88a351fc045de5b58bbf6acae209341096a850" }
+kairos-quant-scouts = { git = "https://github.com/Kairos-cryptoAI/kairos-quant-scouts.git", rev = "7b411f8cbc648474dc18caae869c4f6867c31542" }
 
 [tool.ruff]
 line-length = 110
