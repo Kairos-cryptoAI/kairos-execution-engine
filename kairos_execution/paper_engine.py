@@ -23,7 +23,6 @@ from kairos_core.contracts import (
 from kairos_core.enums import (
     CandidateReviewTier,
     EntryPolicy,
-    EvedexProfile,
     OrderRole,
     OrderSide,
     OrderStatus,
@@ -57,6 +56,7 @@ from kairos_persistence.operator_control import OperatorControlRefused, Operator
 from .adapters.evedex_sidecar import EvedexSidecarAdapter
 from .canary_admission import CanaryAdmissionRepository, load_expected_scope
 from .config import ExecSettings
+from .lifecycle_scope import LifecycleAdmissionPolicy, PaperDevCanaryPolicy
 from .operator_control import PaperOperatorControl
 from .state_machine import client_order_id
 
@@ -142,6 +142,8 @@ class PaperExecutionEngine:
         self.adapter = adapter
         self.trades = trades
         self.effects = effects
+        self._lifecycle_policy: LifecycleAdmissionPolicy = PaperDevCanaryPolicy.from_settings(settings)
+        self._lifecycle_scope = self._lifecycle_policy.scope
         self.mutation_budget = mutation_budget or ExecutionMutationBudgetRepository(trades.pool)
         self.runtime_health = runtime_health or ExecutionRuntimeHealthRepository(trades.pool)
         self.settings = settings
@@ -186,7 +188,7 @@ class PaperExecutionEngine:
     async def _initialize_recovery_unlocked(self) -> tuple[str, ...]:
         """Block entries, preflight DEV, then reconcile all known durable state."""
         environment = self._environment
-        account_id = self.settings.account_id
+        account_id = self._lifecycle_scope.account_id
         recovery = await self.trades.begin_recovery(
             environment=environment,
             account_id=account_id,
@@ -274,7 +276,7 @@ class PaperExecutionEngine:
 
         scoped = await self.trades.list_trades_for_scope(
             environment=self._environment,
-            account_id=self.settings.account_id,
+            account_id=self._lifecycle_scope.account_id,
             exchange=self.adapter.name,
             include_terminal=True,
         )
@@ -315,7 +317,7 @@ class PaperExecutionEngine:
         message = detail.strip()[:2_000] or "authoritative PAPER reconciliation required"
         await self.trades.begin_recovery(
             environment=self._environment,
-            account_id=self.settings.account_id,
+            account_id=self._lifecycle_scope.account_id,
             exchange=self.adapter.name,
         )
         self._recovery_blockers = (message,)
@@ -343,7 +345,7 @@ class PaperExecutionEngine:
             return PaperExecutionResult(events=())
         if self.recovery_blocked or not await self.trades.entries_allowed(
             environment=self._environment,
-            account_id=self.settings.account_id,
+            account_id=self._lifecycle_scope.account_id,
             exchange=self.adapter.name,
         ):
             raise PaperExecutionSafetyError(
@@ -698,7 +700,7 @@ class PaperExecutionEngine:
         recovery_effects = await self.effects.recovery_required(
             exchange=self.adapter.name,
             environment=self._environment,
-            account_id=self.settings.account_id,
+            account_id=self._lifecycle_scope.account_id,
         )
         eligible_effect_keys = {effect.effect_key for effect in recovery_effects}
         for effect in recovery_effects:
@@ -828,7 +830,7 @@ class PaperExecutionEngine:
             return []
         if not await self.trades.entries_allowed(
             environment=self._environment,
-            account_id=self.settings.account_id,
+            account_id=self._lifecycle_scope.account_id,
             exchange=self.adapter.name,
         ):
             self._recovery_blockers = ("durable account recovery is active",)
@@ -836,7 +838,7 @@ class PaperExecutionEngine:
         eligible_recovery_effects = await self.effects.recovery_required(
             exchange=self.adapter.name,
             environment=self._environment,
-            account_id=self.settings.account_id,
+            account_id=self._lifecycle_scope.account_id,
         )
         if eligible_recovery_effects:
             raise PaperExecutionSafetyError("execution journal requires a durable account recovery epoch")
@@ -846,7 +848,7 @@ class PaperExecutionEngine:
         self._recovered_events = []
         for trade in await self.trades.recovery_required(
             environment=self._environment,
-            account_id=self.settings.account_id,
+            account_id=self._lifecycle_scope.account_id,
         ):
             async with self.trades.trade_lock(trade.trade_id):
                 current_trade = await self.trades.get(trade.trade_id)
@@ -886,7 +888,7 @@ class PaperExecutionEngine:
         remote_identities = {
             str(account[key]) for key in ("id", "exchangeId", "user") if account.get(key) is not None
         }
-        if self.settings.evedex_dev_expected_account_id not in remote_identities:
+        if self._lifecycle_scope.remote_account_id not in remote_identities:
             raise PaperExecutionSafetyError("account snapshot identity differs from PAPER preflight")
         if account.get("marginCall") is not False:
             raise PaperExecutionSafetyError("EVEDEX PAPER account is in margin call or lacks its flag")
@@ -904,11 +906,9 @@ class PaperExecutionEngine:
             raise PaperExecutionSafetyError("reconciled PAPER equity is not positive")
         durable_trades = await self.trades.recovery_required(
             environment=self._environment,
-            account_id=self.settings.account_id,
+            account_id=self._lifecycle_scope.account_id,
         )
-        by_venue_symbol = {
-            self.settings.evedex_dev_symbol_map[trade.symbol]: trade for trade in durable_trades
-        }
+        by_venue_symbol = {self._lifecycle_scope.symbol_map[trade.symbol]: trade for trade in durable_trades}
         by_entry_id = {trade.entry_client_order_id: trade for trade in durable_trades}
         owned_tpsl_ids = {
             order_id
@@ -1044,7 +1044,7 @@ class PaperExecutionEngine:
         # lineage and protection invariant above has passed.
         equity_state = await self.trades.record_equity(
             environment=self._environment,
-            account_id=self.settings.account_id,
+            account_id=self._lifecycle_scope.account_id,
             exchange=self.adapter.name,
             captured_at=captured,
             equity_usd=equity,
@@ -1052,9 +1052,9 @@ class PaperExecutionEngine:
         detail = "SDK account, balance summaries, lifecycle lineage, effects and protection reconciled"
         return AccountSnapshotV2(
             source=self.settings.service_name,
-            trading_mode=TradingMode.PAPER,
-            evedex_profile=EvedexProfile.DEV,
-            account_id=self.settings.account_id,
+            trading_mode=self._lifecycle_scope.trading_mode,
+            evedex_profile=self._lifecycle_scope.profile,
+            account_id=self._lifecycle_scope.account_id,
             equity_usd=equity,
             available_balance_usd=available,
             margin_used_usd=margin_used,
@@ -1083,7 +1083,7 @@ class PaperExecutionEngine:
         identities = {
             str(account[key]) for key in ("id", "exchangeId", "user") if account.get(key) is not None
         }
-        if self.settings.evedex_dev_expected_account_id not in identities:
+        if self._lifecycle_scope.remote_account_id not in identities:
             blockers.append("authenticated account identity differs from the dedicated DEV account")
         if account.get("marginCall") is not False:
             blockers.append("authenticated DEV account is in margin call or lacks its flag")
@@ -1093,7 +1093,7 @@ class PaperExecutionEngine:
         by_entry: dict[str, TradeRecord] = {}
         protection: dict[str, tuple[TradeRecord, OrderRole, str, float]] = {}
         for trade in included:
-            venue_symbol = self.settings.evedex_dev_symbol_map.get(trade.symbol)
+            venue_symbol = self._lifecycle_scope.symbol_map.get(trade.symbol)
             if venue_symbol is None:
                 blockers.append(f"trade {trade.trade_id} has a symbol outside the DEV allowlist")
                 continue
@@ -1195,7 +1195,7 @@ class PaperExecutionEngine:
             trade, _, tpsl_type, price = lineage
             self._validate_tpsl_record(
                 item,
-                venue_symbol=self.settings.evedex_dev_symbol_map[trade.symbol],
+                venue_symbol=self._lifecycle_scope.symbol_map[trade.symbol],
                 side=trade.side,
                 tpsl_type=tpsl_type,
                 price=price,
@@ -1205,7 +1205,7 @@ class PaperExecutionEngine:
             )
 
         for trade in included:
-            position_open = self.settings.evedex_dev_symbol_map[trade.symbol] in {
+            position_open = self._lifecycle_scope.symbol_map[trade.symbol] in {
                 symbol for symbol, _ in actual_positions
             }
             if trade.state is TradeState.ACTIVE and not position_open:
@@ -1567,7 +1567,7 @@ class PaperExecutionEngine:
         # mutation backed by stale EVEDEX book/basis/depth measurements.
         if not await self.trades.entries_allowed(
             environment=self._environment,
-            account_id=self.settings.account_id,
+            account_id=self._lifecycle_scope.account_id,
             exchange=self.adapter.name,
         ):
             raise PaperExecutionSafetyError("durable account recovery revoked entry authority")
@@ -1649,7 +1649,7 @@ class PaperExecutionEngine:
     async def _assert_entry_admission(self, trade: TradeRecord) -> None:
         if not await self.trades.entries_allowed(
             environment=self._environment,
-            account_id=self.settings.account_id,
+            account_id=self._lifecycle_scope.account_id,
             exchange=self.adapter.name,
         ):
             raise PaperExecutionSafetyError("durable account recovery revoked entry authority")
@@ -1657,7 +1657,7 @@ class PaperExecutionEngine:
         venue = await self.adapter.fetch_paper_state()
         durable = await self.trades.recovery_required(
             environment=self._environment,
-            account_id=self.settings.account_id,
+            account_id=self._lifecycle_scope.account_id,
         )
         others = [candidate for candidate in durable if candidate.trade_id != trade.trade_id]
         blockers = self._authoritative_account_blockers(
@@ -1877,7 +1877,7 @@ class PaperExecutionEngine:
             "trade_id": trade.trade_id,
             "client_order_id": client_order_id,
             "parent_order_id": trade.entry_client_order_id,
-            "venue_symbol": self.settings.evedex_dev_symbol_map[trade.symbol],
+            "venue_symbol": self._lifecycle_scope.symbol_map[trade.symbol],
             "side": trade.side,
             "tpsl_type": tpsl_type,
             "quantity_hex": float(0).hex(),
@@ -1938,7 +1938,7 @@ class PaperExecutionEngine:
         request = {
             "trade_id": trade.trade_id,
             "client_order_id": client_order_id,
-            "venue_symbol": self.settings.evedex_dev_symbol_map[trade.symbol],
+            "venue_symbol": self._lifecycle_scope.symbol_map[trade.symbol],
             "quantity_hex": float(quantity).hex(),
             "leverage_hex": float(leverage).hex(),
         }
@@ -2506,7 +2506,7 @@ class PaperExecutionEngine:
         request = {
             "trade_id": trade.trade_id,
             "client_order_id": trade.entry_client_order_id,
-            "venue_symbol": self.settings.evedex_dev_symbol_map[trade.symbol],
+            "venue_symbol": self._lifecycle_scope.symbol_map[trade.symbol],
         }
         preparation = await self.effects.prepare(
             effect_key=effect_id,
@@ -2852,7 +2852,7 @@ class PaperExecutionEngine:
             if geometry_record is not None:
                 self._validate_tpsl_record(
                     geometry_record,
-                    venue_symbol=self.settings.evedex_dev_symbol_map[trade.symbol],
+                    venue_symbol=self._lifecycle_scope.symbol_map[trade.symbol],
                     side=trade.side,
                     tpsl_type=tpsl_type,
                     price=price,
@@ -2897,7 +2897,7 @@ class PaperExecutionEngine:
             if record is not None:
                 self._validate_tpsl_record(
                     record,
-                    venue_symbol=self.settings.evedex_dev_symbol_map[trade.symbol],
+                    venue_symbol=self._lifecycle_scope.symbol_map[trade.symbol],
                     side=trade.side,
                     tpsl_type=tpsl_type,
                     price=price,
@@ -2933,7 +2933,7 @@ class PaperExecutionEngine:
                 "trade_id": trade.trade_id,
                 "client_order_id": client_id,
                 "tpsl_id": tpsl_id,
-                "venue_symbol": self.settings.evedex_dev_symbol_map[trade.symbol],
+                "venue_symbol": self._lifecycle_scope.symbol_map[trade.symbol],
             }
             preparation = await self.effects.prepare(
                 effect_key=effect_id,
@@ -3032,7 +3032,7 @@ class PaperExecutionEngine:
             for record in records:
                 self._validate_tpsl_record(
                     record,
-                    venue_symbol=self.settings.evedex_dev_symbol_map[trade.symbol],
+                    venue_symbol=self._lifecycle_scope.symbol_map[trade.symbol],
                     side=trade.side,
                     tpsl_type=tpsl_type,
                     price=price,
@@ -3116,7 +3116,7 @@ class PaperExecutionEngine:
     ) -> tuple[float, float, float]:
         if self._required_text(order.get("id"), "trigger order ID") != trigger_order_id:
             raise PaperExecutionSafetyError("trigger order history changed the generated order ID")
-        expected_symbol = self.settings.evedex_dev_symbol_map[trade.symbol]
+        expected_symbol = self._lifecycle_scope.symbol_map[trade.symbol]
         if str(order.get("instrument", "")).upper() != expected_symbol.upper():
             raise PaperExecutionSafetyError("trigger order has the wrong DEV instrument")
         expected_side = "SELL" if trade.side == "BUY" else "BUY"
@@ -3243,7 +3243,7 @@ class PaperExecutionEngine:
         fingerprint = hashlib.sha256(
             json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
-        fact_key = f"paper.v1:{event_type.value}:{fingerprint}"
+        fact_key = f"{self._lifecycle_scope.event_namespace}:{event_type.value}:{fingerprint}"
         occurred_at_ms = int(self.clock().astimezone(UTC).timestamp() * 1000)
         event_details = tuple((*details, *self.operational_telemetry))
 
@@ -3254,8 +3254,8 @@ class PaperExecutionEngine:
                 occurred_at_ms=occurred_at_ms,
                 event_type=event_type,
                 lifecycle_state=lifecycle_state,
-                trading_mode=TradingMode.PAPER,
-                evedex_profile=EvedexProfile.DEV,
+                trading_mode=self._lifecycle_scope.trading_mode,
+                evedex_profile=self._lifecycle_scope.profile,
                 account_id=trade.account_id,
                 venue_symbol=decision.venue_symbol,
                 strategy_id=trade.strategy_id,
@@ -3547,15 +3547,10 @@ class PaperExecutionEngine:
         )
 
     def _validate_decision(self, decision: RiskTradeDecisionV1) -> None:
-        if decision.trading_mode is not TradingMode.PAPER:
-            raise PaperExecutionSafetyError("PAPER consumer rejects non-PAPER decisions")
-        if decision.evedex_profile is not EvedexProfile.DEV:
-            raise PaperExecutionSafetyError("PAPER consumer rejects non-DEV decisions")
-        if decision.account_id != self.settings.account_id:
-            raise PaperExecutionSafetyError("risk decision targets a different PAPER account")
-        expected_symbol = self.settings.evedex_dev_symbol_map.get(decision.intent.symbol)
-        if expected_symbol != decision.venue_symbol:
-            raise PaperExecutionSafetyError("risk decision venue symbol is outside the DEV allowlist")
+        try:
+            self._lifecycle_policy.validate_decision_scope(decision)
+        except ValueError as exc:
+            raise PaperExecutionSafetyError(str(exc)) from exc
         if not decision.approved:
             # Reparse rather than trusting a model_copy/model_construct caller:
             # the strict contracts verify hashes and nested immutable lineage.
@@ -3736,26 +3731,27 @@ class PaperExecutionEngine:
 
     @property
     def _environment(self) -> str:
-        return f"{self.settings.environment}:EVEDEX:DEV:PAPER"
+        return self._lifecycle_scope.environment
 
     @property
     def _remote_account_scope(self) -> dict[str, str]:
         return {
-            "environment": "evedex-dev",
+            "environment": self._lifecycle_scope.remote_environment,
             "account_id": self._required_text(
-                self.settings.evedex_dev_expected_account_id,
+                self._lifecycle_scope.remote_account_id,
                 "expected EVEDEX DEV account ID",
             ),
-            "exchange": self.adapter.name,
+            "exchange": self._lifecycle_scope.exchange,
         }
 
     @staticmethod
     def _order_side(decision: RiskTradeDecisionV1) -> OrderSide:
         return OrderSide.BUY if decision.intent.side is Side.LONG else OrderSide.SELL
 
-    @staticmethod
-    def _effect_id(trade_id: str, role: OrderRole, operation: str) -> str:
-        return hashlib.sha256(f"paper.v1:{trade_id}:{role.value}:{operation}".encode()).hexdigest()
+    def _effect_id(self, trade_id: str, role: OrderRole, operation: str) -> str:
+        return hashlib.sha256(
+            f"{self._lifecycle_scope.mutation_namespace}:{trade_id}:{role.value}:{operation}".encode()
+        ).hexdigest()
 
     @staticmethod
     def _client_id(trade_id: str, role: OrderRole, decided_at_ms: int) -> str:
@@ -3990,7 +3986,7 @@ class PaperExecutionEngine:
         return int(parsed.astimezone(UTC).timestamp() * 1_000)
 
     def _position_quantity(self, venue: dict[str, Any], logical_symbol: str) -> float:
-        expected = self.settings.evedex_dev_symbol_map[logical_symbol]
+        expected = self._lifecycle_scope.symbol_map[logical_symbol]
         return sum(
             self._required_nonnegative_number(item, "quantity")
             for item in self._list(venue.get("positions"))
@@ -3998,7 +3994,7 @@ class PaperExecutionEngine:
         )
 
     def _position_quantity_for_trade(self, venue: dict[str, Any], trade: TradeRecord) -> float:
-        expected = self.settings.evedex_dev_symbol_map[trade.symbol]
+        expected = self._lifecycle_scope.symbol_map[trade.symbol]
         matches = [
             item
             for item in self._list(venue.get("positions"))
