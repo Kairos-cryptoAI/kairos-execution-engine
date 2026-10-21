@@ -428,14 +428,24 @@ class PostgresProductionClaims:
             raise ProductionClaimError("unsupported claim kind")
         try:
             async with self._connection() as connection:
-                terminal_table = "wire_terminals" if kind == "WIRE_DISPATCH" else "terminals"
-                terminal_value = "response_sha256" if kind == "WIRE_DISPATCH" else "result_sha256"
+                if kind == "WIRE_DISPATCH":
+                    query = (
+                        "SELECT c.*,t.terminal_status,t.response_sha256 AS result_sha256 "
+                        "FROM kairos_production_evidence_v1.claims c "
+                        "LEFT JOIN kairos_production_evidence_v1.wire_terminals t "
+                        "USING(claim_kind,namespace,identity) "
+                        "WHERE claim_kind=$1 AND namespace=$2 AND identity=$3"
+                    )
+                else:
+                    query = (
+                        "SELECT c.*,t.terminal_status,t.result_sha256 "
+                        "FROM kairos_production_evidence_v1.claims c "
+                        "LEFT JOIN kairos_production_evidence_v1.terminals t "
+                        "USING(claim_kind,namespace,identity) "
+                        "WHERE claim_kind=$1 AND namespace=$2 AND identity=$3"
+                    )
                 row = await connection.fetchrow(
-                    f"SELECT c.*,t.terminal_status,t.{terminal_value} AS result_sha256 "
-                    "FROM kairos_production_evidence_v1.claims c "
-                    f"LEFT JOIN kairos_production_evidence_v1.{terminal_table} t "
-                    "USING(claim_kind,namespace,identity) "
-                    "WHERE claim_kind=$1 AND namespace=$2 AND identity=$3",
+                    query,
                     kind,
                     namespace,
                     identity,
