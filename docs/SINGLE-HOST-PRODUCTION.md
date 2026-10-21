@@ -37,9 +37,19 @@ are not changed or silently adopted into this profile.
   state, fixed 0.25% / 1% risk ceilings and explicit owner limits. Signing must
   finish inside the risk lease and, for exits, the exposure lease. Reducing
   exits use authenticated historical arm lineage and current exposure, not a
-  still-ARMED entry latch or an entry-notional cap. Its state-source protocol is
-  **not** a shipped PROD database reader: synthetic evaluator tests do not close
-  service composition or authorize signing on the real account.
+  still-ARMED entry latch or an entry-notional cap.
+- `production_state.py` provides an async PostgreSQL source and explicit
+  owner-only provisioning for append-only owner-arm, operator, risk and exposure
+  records. It binds the claims schema and production-state schema to one exact
+  isolated database UUID, context, database name and reader login. The operator,
+  risk and exposure producers have separate database roles and table grants;
+  the source verifies grants, ownership, immutable payload digests, newest
+  monotonic operator/exposure observations, and reads all evidence plus the
+  accepted owner nonce in one bounded read-only repeatable-read transaction.
+  This is a concrete persistence/source adapter, not a deployed authoritative
+  risk calculator. Pending-risk/notional reservations and independent source
+  service provisioning remain unqualified; the adapter does not compute or
+  synthesize aggregate exposure.
 - Native asynchronous authorization reads run inside the signer's same bounded
   deadline, before the durable signing claim. The verifier rechecks the clock
   and all leases after the read. Async-only state sources cannot be used through
@@ -72,11 +82,13 @@ fresh isolated test database; no primary database or legacy queue is involved.
 
 ## Explicitly not completed by these components
 
-The service does not yet compose a production lifecycle executor, authoritative
-PROD operator/risk state readers and a capability issuer. The signing policy
-evaluator is implemented but not deployed as an authorization source. Settings
-and factory still reject LIVE. A signed readiness record or presence of keys
-must not be converted into a permissive boolean or the old low-level capability.
+The service does not yet compose a production lifecycle executor, independently
+operated PROD state producers, atomic account-scoped pending-risk/notional
+reservation, and a capability issuer. The async PostgreSQL reader is a component,
+not evidence that its upstream writers are deployed or that risk calculations
+are independently qualified. Settings and factory still reject LIVE. A signed
+readiness record or presence of keys must not be converted into a permissive
+boolean or the old low-level capability.
 
 Before real dispatch, a reviewed composition must bind the future qualified
 adaptive strategy, source set, authentic PROD account/wallet/chain, deployed
