@@ -263,7 +263,7 @@ class ProductionEffectDispatcher:
     ) -> dict[str, Any]:
         if request.context != self.context or request.database_uuid != self.database_uuid:
             raise ProductionDispatchError("wire request differs from the pinned production scope")
-        _validate_effect(request)
+        message = _validate_effect(request)
 
         wall_high_water = initial_now
 
@@ -281,7 +281,9 @@ class ProductionEffectDispatcher:
         if initial_now >= request.signing_request.expires_at:
             raise ProductionDispatchError("wire request expired before durable admission")
 
-        body = json.loads(_canonical_bytes(request.body))
+        # Derive the frozen transport body from the verified typed geometry,
+        # not the caller-owned mutable body mapping after its validation.
+        body = json.loads(_canonical_bytes({**message, "signature": request.signed.signature}))
         body_digest = _sha256(_canonical_bytes(body))
         context_digest = canonical_digest(self.context)
         claim_record = {
