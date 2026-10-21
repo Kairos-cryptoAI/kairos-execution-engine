@@ -217,16 +217,43 @@ async def test_native_async_production_source_reads_exact_scoped_state():
         verifier._claim_database_uuid = database_uuid
         with pytest.raises(ManagedSigningError, match="async state source requires async authorization"):
             verifier.verify_request_at(request, binding, now=now)
+        # This fixture is a position-close request. Exits validate the
+        # authoritative exposure lineage but do not reserve additive entry
+        # risk; retain the native exit-resolution assertion separately.
         await verifier.verify_request_async(request, binding)
+        assert (
+            await pools["reader"].fetchval(
+                f"SELECT count(*) FROM {STATE_SCHEMA}.risk_reservations WHERE account_sha256=$1",
+                _account_scope_sha256(context),
+            )
+            == 0
+        )
+
+        # Exercise the durable reserve-before-sign path with a fresh entry
+        # request in the same database/account context and accepted owner arm.
+        entry_verifier, entry_request, entry_binding, entry_expected, _ = fixture()
+        entry_request = entry_request.model_copy(
+            update={"expires_at": datetime.now(UTC) + timedelta(seconds=20)}
+        )
+        entry_risk = entry_expected.risk.model_copy(
+            update={
+                "observed_at": datetime.now(UTC) - timedelta(milliseconds=200),
+                "valid_until": datetime.now(UTC) + timedelta(seconds=20),
+            }
+        )
+        await risk_writer.append_risk_decision_async(entry_risk)
+        entry_verifier._source = source
+        entry_verifier._claim_database_uuid = database_uuid
+        await entry_verifier.verify_request_async(entry_request, entry_binding)
         initial_reservation = await pools["reader"].fetchrow(
             f"SELECT account_sha256,effect_id,risk_usd,notional_usd FROM {STATE_SCHEMA}.risk_reservations "
             "WHERE context_sha256=$1 AND signing_request_id=$2",
             canonical_digest(context),
-            request.request_id,
+            entry_request.request_id,
         )
         assert initial_reservation is not None
         assert initial_reservation["account_sha256"] == _account_scope_sha256(context)
-        assert initial_reservation["effect_id"] == risk.effect_id
+        assert initial_reservation["effect_id"] == entry_risk.effect_id
         assert initial_reservation["risk_usd"] == Decimal("1")
         assert initial_reservation["notional_usd"] == Decimal("0.0000000001")
 
@@ -246,9 +273,9 @@ async def test_native_async_production_source_reads_exact_scoped_state():
                 return True
 
         backend = NeverBackend()
-        missing_risk = request.model_copy(
+        missing_risk = entry_request.model_copy(
             update={
-                "request_id": request.request_id + "-missing-risk",
+                "request_id": entry_request.request_id + "-missing-risk",
                 "expires_at": datetime.now(UTC) + timedelta(seconds=20),
             }
         )
@@ -257,7 +284,7 @@ async def test_native_async_production_source_reads_exact_scoped_state():
             backend=backend,
             verifier=NeverSignatureVerifier(),
             claims=claims,
-            authorization=verifier,
+            authorization=entry_verifier,
         )
         with pytest.raises(ManagedSigningError, match="independent signing authorization failed"):
             await signer.sign_async(missing_risk, now=datetime.now(UTC), claims=claims)
@@ -365,10 +392,10 @@ async def test_native_async_production_source_reads_exact_scoped_state():
             await writer.append_risk_decision_async(candidate_risk)
             return candidate_request
 
-        candidate1 = await add_candidate(request, risk, risk_writer, suffix="ctx1-01", loss="6")
+        candidate1 = await add_candidate(entry_request, entry_risk, risk_writer, suffix="ctx1-01", loss="6")
         candidate2 = await add_candidate(request2, expected2.risk, risk_writer2, suffix="ctx2-02", loss="6")
         results = await asyncio.gather(
-            verifier.verify_request_async(candidate1, binding),
+            entry_verifier.verify_request_async(candidate1, entry_binding),
             verifier2.verify_request_async(candidate2, binding2),
             return_exceptions=True,
         )
@@ -395,9 +422,11 @@ async def test_native_async_production_source_reads_exact_scoped_state():
             await source2.reserve_entry_async(
                 request=candidate3, binding=binding2, evidence=rebound_evidence3
             )
-        candidate4 = await add_candidate(request, risk, risk_writer, suffix="ctx1-04", loss="0.01")
+        candidate4 = await add_candidate(
+            entry_request, entry_risk, risk_writer, suffix="ctx1-04", loss="0.01"
+        )
         with pytest.raises(ManagedSigningError, match="independent signing authorization failed"):
-            await verifier.verify_request_async(candidate4, binding)
+            await entry_verifier.verify_request_async(candidate4, entry_binding)
         retained_count = await pools["reader"].fetchval(
             f"SELECT count(*) FROM {STATE_SCHEMA}.risk_reservations WHERE account_sha256=$1",
             _account_scope_sha256(context),

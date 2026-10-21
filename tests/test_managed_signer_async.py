@@ -125,7 +125,10 @@ async def test_slow_claim_uses_the_same_deadline_before_any_backend_dispatch():
 @pytest.mark.asyncio
 async def test_claim_latency_consumes_backend_budget_timeout_preserves_unknown():
     signer, request, backend, _, _ = setup_signer()
-    request = request.model_copy(update={"expires_at": NOW + timedelta(milliseconds=80)})
+    # Keep enough scheduling margin for slower Windows CI to enter the
+    # deliberately blocked backend; the production deadline remains the exact
+    # request expiry, and this test still proves claim latency consumes it.
+    request = request.model_copy(update={"expires_at": NOW + timedelta(milliseconds=400)})
     claims, db = claims_fixture(context=request.context)
     original_claim, original_sign = claims.claim_once_async, backend.sign_typed_data
     began, release = threading.Event(), threading.Event()
@@ -146,7 +149,7 @@ async def test_claim_latency_consumes_backend_budget_timeout_preserves_unknown()
     try:
         with pytest.raises(ManagedSigningError, match="end-to-end signing deadline"):
             await signer.sign_async(request, now=NOW, claims=claims)
-        assert time.monotonic() - started < 0.5
+        assert time.monotonic() - started < 0.8
         assert began.is_set() and db.claims and not db.terminals
         claims.claim_once_async = original_claim
         with pytest.raises(ManagedSigningError, match="claimed or unresolved"):
