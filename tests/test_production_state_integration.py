@@ -231,10 +231,16 @@ async def test_native_async_production_source_reads_exact_scoped_state():
 
         # Exercise the durable reserve-before-sign path with a fresh entry
         # request in the same database/account context and accepted owner arm.
-        entry_verifier, entry_request, entry_binding, entry_expected, _ = fixture()
+        _, entry_request, _, entry_expected, _ = fixture()
+        # Keep the owner arm, preconditions, and verifier from the already
+        # persisted fixture together; independently generated fixture
+        # timestamps would produce a different readiness digest.
+        entry_verifier = verifier
+        entry_binding = binding
         entry_request = entry_request.model_copy(
             update={
                 "request_id": request.request_id + "-entry",
+                "manual_request_sha256": canonical_digest(expected.owner_arm.request),
                 "expires_at": datetime.now(UTC) + timedelta(seconds=20),
             }
         )
@@ -379,7 +385,7 @@ async def test_native_async_production_source_reads_exact_scoped_state():
                 }
             )
             geometry = json.loads(candidate_request.message_json)
-            geometry["id"] = "00384:" + format(int(suffix[-2:], 16), "024X")
+            geometry["id"] = "00384:" + format(int(suffix[-2:], 16), "026X")
             candidate_request = candidate_request.model_copy(
                 update={"message_json": json.dumps(geometry, sort_keys=True)}
             )
@@ -404,13 +410,27 @@ async def test_native_async_production_source_reads_exact_scoped_state():
 
         candidate1 = await add_candidate(entry_request, entry_risk, risk_writer, suffix="ctx1-01", loss="6")
         candidate2 = await add_candidate(request2, expected2.risk, risk_writer2, suffix="ctx2-02", loss="6")
+        # Candidate setup writes are intentionally sequential. Refresh both
+        # authoritative operator observations immediately before the race so
+        # the test measures the account-wide reservation lock, not an expired
+        # five-second evidence lease under slow native CI scheduling.
+        race_observed_at = datetime.now(UTC) - timedelta(milliseconds=50)
+        await operator_writer.append_operator_observation_async(
+            armed.model_copy(update={"observed_at": race_observed_at})
+        )
+        await operator_writer2.append_operator_observation_async(
+            armed2.model_copy(update={"observed_at": race_observed_at})
+        )
         results = await asyncio.gather(
             entry_verifier.verify_request_async(candidate1, entry_binding),
             verifier2.verify_request_async(candidate2, binding2),
             return_exceptions=True,
         )
-        assert sum(result is None for result in results) == 1
-        assert sum(isinstance(result, ManagedSigningError) for result in results) == 1
+        failures = [
+            f"{type(result).__name__}: {result}" for result in results if isinstance(result, Exception)
+        ]
+        assert sum(result is None for result in results) == 1, failures
+        assert sum(isinstance(result, ManagedSigningError) for result in results) == 1, failures
         total_after_race = await pools["reader"].fetchval(
             f"SELECT sum(risk_usd) FROM {STATE_SCHEMA}.risk_reservations WHERE account_sha256=$1",
             _account_scope_sha256(context),
