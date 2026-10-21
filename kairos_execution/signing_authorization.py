@@ -237,9 +237,9 @@ class ProductionSigningAuthorizationVerifier:
         self, request: ManagedSigningRequestV1, binding: CustodyBindingV1, *, now: datetime
     ) -> None:
         request, binding = self._validate_scope(request, binding, now=now)
+        if not isinstance(self._source, ProductionSigningStateSource):
+            raise ManagedSigningError("async state source requires async authorization")
         try:
-            if not isinstance(self._source, ProductionSigningStateSource):
-                raise ManagedSigningError("async state source requires async authorization")
             evidence = ProductionSigningEvidenceV1.model_validate(
                 self._source.resolve_signing_evidence(request=request, binding=binding, now=now)
             )

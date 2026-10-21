@@ -35,7 +35,7 @@ async def test_async_policy_uses_native_source_and_retains_exact_policy():
     )
     with pytest.raises(ManagedSigningError, match="geometry"):
         await verifier.verify_request_async(request, binding)
-    with pytest.raises(ManagedSigningError, match="unavailable"):
+    with pytest.raises(ManagedSigningError, match="async state source requires async authorization"):
         verifier.verify_request_at(request, binding, now=now)
 
 
