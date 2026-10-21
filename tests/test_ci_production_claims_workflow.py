@@ -35,6 +35,9 @@ class ClaimsWorkflowRegressionTests(unittest.TestCase):
         self.assertIn('DATABASE = "kairos_production_evidence_ci_000000000001"', BOOTSTRAP)
         self.assertIn('OWNER_ROLE = "kairos_claim_owner_ci"', BOOTSTRAP)
         self.assertIn('RUNTIME_ROLE = "kairos_claim_runtime_ci"', BOOTSTRAP)
+        self.assertIn('OPERATOR_WRITER_ROLE = "kairos_operator_writer_ci"', BOOTSTRAP)
+        self.assertIn('RISK_WRITER_ROLE = "kairos_risk_writer_ci"', BOOTSTRAP)
+        self.assertIn('EXPOSURE_WRITER_ROLE = "kairos_exposure_writer_ci"', BOOTSTRAP)
         self.assertIn("str(uuid4())", BOOTSTRAP)
         self.assertIn('"KAIROS_PRODUCTION_CLAIMS_TEST_PROVISION": "1"', BOOTSTRAP)
         self.assertRegex(BOOTSTRAP, re.compile(r"CREATE DATABASE .*OWNER", re.IGNORECASE))
@@ -70,6 +73,18 @@ class ClaimsWorkflowRegressionTests(unittest.TestCase):
         self.assertIn("claims-owner-ci-public-test-only", first["KAIROS_PRODUCTION_CLAIMS_TEST_OWNER_DSN"])
         self.assertIn(
             "claims-runtime-ci-public-test-only", first["KAIROS_PRODUCTION_CLAIMS_TEST_RUNTIME_DSN"]
+        )
+        self.assertIn(
+            "operator-writer-ci-public-test-only",
+            first["KAIROS_PRODUCTION_STATE_TEST_OPERATOR_WRITER_DSN"],
+        )
+        self.assertIn(
+            "risk-writer-ci-public-test-only",
+            first["KAIROS_PRODUCTION_STATE_TEST_RISK_WRITER_DSN"],
+        )
+        self.assertIn(
+            "exposure-writer-ci-public-test-only",
+            first["KAIROS_PRODUCTION_STATE_TEST_EXPOSURE_WRITER_DSN"],
         )
         self.assertEqual(
             first["KAIROS_SIM_CONTROLLER_DATABASE_URL"],

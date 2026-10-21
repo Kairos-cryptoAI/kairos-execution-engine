@@ -15,13 +15,14 @@ DATABASE_UUID = UUID("019ff67f-4e1c-7512-8d55-329813370a53")
 
 class FakeConnection:
     def __init__(self):
-        self.claims, self.terminals = {}, {}
+        self.claims, self.terminals, self.wire_terminals = {}, {}, {}
         self.events = []
         self.lock = asyncio.Lock()
         self.commit_lost = False
         self.db = DATABASE
         self.role = "evidence_runtime"
         self.uuid = DATABASE_UUID
+        self.schema_version = 2
         self.owner = "evidence_owner"
         self.schema_owner = self.owner
         self.table_owner = self.owner
@@ -51,7 +52,7 @@ class FakeConnection:
         if ".identity WHERE" in sql:
             return {
                 "database_uuid": self.uuid,
-                "schema_version": 1,
+                "schema_version": self.schema_version,
                 "policy_namespace": "policy-v1",
                 "owner_role": self.owner,
                 "runtime_role": self.role,
@@ -76,13 +77,21 @@ class FakeConnection:
             row = self.claims.get(tuple(args))
             if row is None:
                 return None
+            terminals = self.wire_terminals if "wire_terminals" in sql else self.terminals
             return {
                 **row,
-                **self.terminals.get(tuple(args), {"terminal_status": None, "result_sha256": None}),
+                **terminals.get(tuple(args), {"terminal_status": None, "result_sha256": None}),
             }
         if ".claims " in sql:
-            key = tuple(args) if len(args) == 3 else ("TYPED_SIGNING", *args)
+            if "WIRE_DISPATCH" in sql:
+                key = ("WIRE_DISPATCH", *args)
+            elif "TYPED_SIGNING" in sql:
+                key = ("TYPED_SIGNING", *args)
+            else:
+                key = tuple(args)
             return self.claims.get(key)
+        if ".wire_terminals WHERE" in sql:
+            return self.wire_terminals.get(("WIRE_DISPATCH", *args))
         if ".terminals WHERE" in sql:
             return self.terminals.get(("TYPED_SIGNING", *args))
         raise AssertionError("unexpected fixture SELECT")
@@ -107,14 +116,17 @@ class FakeConnection:
     async def execute(self, sql, *args):
         if "SET LOCAL" in sql:
             return "SET"
-        if ".terminals VALUES" in sql:
+        if ".terminals VALUES" in sql or ".wire_terminals VALUES" in sql:
             namespace, identity, digest, status, result = args
-            self.terminals.setdefault(
-                ("TYPED_SIGNING", namespace, identity),
+            kind = "WIRE_DISPATCH" if ".wire_terminals VALUES" in sql else "TYPED_SIGNING"
+            terminals = self.wire_terminals if kind == "WIRE_DISPATCH" else self.terminals
+            terminals.setdefault(
+                (kind, namespace, identity),
                 {
                     "request_sha256": digest,
                     "terminal_status": status,
                     "result_sha256": result,
+                    "response_sha256": result,
                 },
             )
             self.events.append("INSERT_TERMINAL")
@@ -183,12 +195,48 @@ async def test_terminal_exact_claim_is_immutable_and_unknown_cannot_promote():
     assert await store.claim_once_async(**kwargs) is False
 
 
+@pytest.mark.asyncio
+async def test_wire_claim_is_distinct_from_signing_and_has_immutable_terminal():
+    store, db = claims_fixture()
+    kwargs = dict(namespace="wire:" + "c" * 64, effect_id="d" * 64, request_sha256="a" * 64)
+    assert await store.claim_wire_once_async(**kwargs) is True
+    assert (
+        await store.claim_once_async(
+            custody_reference=kwargs["namespace"], request_id=kwargs["effect_id"], request_sha256="a" * 64
+        )
+        is True
+    )
+    assert ("WIRE_DISPATCH", kwargs["namespace"], kwargs["effect_id"]) in db.claims
+    assert ("TYPED_SIGNING", kwargs["namespace"], kwargs["effect_id"]) in db.claims
+    await store.finish_wire_async(
+        namespace=kwargs["namespace"],
+        effect_id=kwargs["effect_id"],
+        request_sha256=kwargs["request_sha256"],
+        terminal_status="COMPLETED",
+        response_sha256="b" * 64,
+    )
+    row = await store.load_claim(
+        kind="WIRE_DISPATCH", namespace=kwargs["namespace"], identity=kwargs["effect_id"]
+    )
+    assert row["terminal_status"] == "COMPLETED" and row["result_sha256"] == "b" * 64
+    assert await store.claim_wire_once_async(**kwargs) is False
+    with pytest.raises(ProductionClaimError, match="conflict"):
+        await store.finish_wire_async(
+            namespace=kwargs["namespace"],
+            effect_id=kwargs["effect_id"],
+            request_sha256=kwargs["request_sha256"],
+            terminal_status="UNRESOLVED",
+            response_sha256=None,
+        )
+
+
 @pytest.mark.parametrize(
     "change",
     [
         "db",
         "role",
         "uuid",
+        "schema_version",
         "schema_owner",
         "table_owner",
         "unsafe",
@@ -208,6 +256,7 @@ async def test_exact_positive_database_identity_owner_and_least_privilege(change
             "db": "kairos",
             "role": "foreign",
             "uuid": UUID(int=1),
+            "schema_version": 1,
             "schema_owner": "foreign",
             "table_owner": "foreign",
         }.get(change, True),

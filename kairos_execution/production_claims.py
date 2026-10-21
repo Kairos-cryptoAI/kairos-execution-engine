@@ -18,17 +18,18 @@ import asyncpg  # type: ignore[import-untyped]  # Upstream ships no typing marke
 from .production_readiness import ProductionContextV1, canonical_digest
 
 SCHEMA = "kairos_production_evidence_v1"
+SCHEMA_VERSION = 2
 DDL = """
 CREATE SCHEMA kairos_production_evidence_v1;
 REVOKE ALL ON SCHEMA kairos_production_evidence_v1 FROM PUBLIC;
 CREATE TABLE kairos_production_evidence_v1.identity (
  singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
  database_uuid uuid NOT NULL, policy_namespace text NOT NULL,
- schema_version integer NOT NULL CHECK(schema_version=1),
+ schema_version integer NOT NULL CHECK(schema_version=2),
  owner_role name NOT NULL, runtime_role name NOT NULL
 );
 CREATE TABLE kairos_production_evidence_v1.claims (
- claim_kind text NOT NULL CHECK(claim_kind IN ('MANUAL_NONCE','TYPED_SIGNING')),
+ claim_kind text NOT NULL CHECK(claim_kind IN ('MANUAL_NONCE','TYPED_SIGNING','WIRE_DISPATCH')),
  namespace text NOT NULL CHECK(length(namespace) BETWEEN 1 AND 160),
  identity text NOT NULL CHECK(length(identity) BETWEEN 1 AND 160),
  request_sha256 text NOT NULL CHECK(request_sha256 ~ '^[a-f0-9]{64}$'),
@@ -50,6 +51,19 @@ CREATE TABLE kairos_production_evidence_v1.terminals (
  CHECK((terminal_status='COMPLETED' AND result_sha256 IS NOT NULL)
     OR (terminal_status='UNRESOLVED' AND result_sha256 IS NULL))
 );
+CREATE TABLE kairos_production_evidence_v1.wire_terminals (
+ claim_kind text NOT NULL CHECK(claim_kind='WIRE_DISPATCH'),
+ namespace text NOT NULL, identity text NOT NULL,
+ request_sha256 text NOT NULL CHECK(request_sha256 ~ '^[a-f0-9]{64}$'),
+ terminal_status text NOT NULL CHECK(terminal_status IN ('COMPLETED','UNRESOLVED')),
+ response_sha256 text CHECK(response_sha256 ~ '^[a-f0-9]{64}$'),
+ observed_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+ PRIMARY KEY(claim_kind,namespace,identity),
+ FOREIGN KEY(claim_kind,namespace,identity,request_sha256)
+  REFERENCES kairos_production_evidence_v1.claims(claim_kind,namespace,identity,request_sha256),
+ CHECK((terminal_status='COMPLETED' AND response_sha256 IS NOT NULL)
+    OR (terminal_status='UNRESOLVED' AND response_sha256 IS NULL))
+);
 CREATE FUNCTION kairos_production_evidence_v1.reject_mutation() RETURNS trigger
  LANGUAGE plpgsql SET search_path=pg_catalog AS $$
  BEGIN RAISE EXCEPTION 'immutable production evidence record'; END $$;
@@ -58,6 +72,9 @@ CREATE TRIGGER identity_immutable BEFORE UPDATE OR DELETE ON kairos_production_e
 CREATE TRIGGER claims_immutable BEFORE UPDATE OR DELETE ON kairos_production_evidence_v1.claims
  FOR EACH ROW EXECUTE FUNCTION kairos_production_evidence_v1.reject_mutation();
 CREATE TRIGGER terminals_immutable BEFORE UPDATE OR DELETE ON kairos_production_evidence_v1.terminals
+ FOR EACH ROW EXECUTE FUNCTION kairos_production_evidence_v1.reject_mutation();
+CREATE TRIGGER wire_terminals_immutable BEFORE UPDATE OR DELETE
+ ON kairos_production_evidence_v1.wire_terminals
  FOR EACH ROW EXECUTE FUNCTION kairos_production_evidence_v1.reject_mutation();
 REVOKE ALL ON ALL TABLES IN SCHEMA kairos_production_evidence_v1 FROM PUBLIC;
 REVOKE ALL ON ALL FUNCTIONS IN SCHEMA kairos_production_evidence_v1 FROM PUBLIC;
@@ -131,7 +148,7 @@ async def provision_isolated_schema(
     async with connection.transaction():
         await connection.execute(DDL)
         await connection.execute(
-            "INSERT INTO kairos_production_evidence_v1.identity VALUES(true,$1,$2,1,$3,$4)",
+            "INSERT INTO kairos_production_evidence_v1.identity VALUES(true,$1,$2,2,$3,$4)",
             database_uuid,
             policy_namespace,
             owner_role,
@@ -139,7 +156,9 @@ async def provision_isolated_schema(
         )
         await connection.execute(f'GRANT USAGE ON SCHEMA {SCHEMA} TO "{runtime_role}"')
         await connection.execute(f'GRANT SELECT ON ALL TABLES IN SCHEMA {SCHEMA} TO "{runtime_role}"')
-        await connection.execute(f'GRANT INSERT ON {SCHEMA}.claims,{SCHEMA}.terminals TO "{runtime_role}"')
+        await connection.execute(
+            f'GRANT INSERT ON {SCHEMA}.claims,{SCHEMA}.terminals,{SCHEMA}.wire_terminals TO "{runtime_role}"'
+        )
 
 
 class PostgresProductionClaims:
@@ -173,7 +192,7 @@ class PostgresProductionClaims:
         )
         if identity is None or (
             identity["database_uuid"] != self.database_uuid
-            or identity["schema_version"] != 1
+            or identity["schema_version"] != SCHEMA_VERSION
             or identity["policy_namespace"] != self.policy_namespace
             or identity["runtime_role"] != self.runtime_role
             or identity["owner_role"] == self.runtime_role
@@ -196,7 +215,7 @@ class PostgresProductionClaims:
             )
         ):
             raise ProductionClaimError("production claim runtime has unsafe privileges")
-        for table in ("identity", "claims", "terminals"):
+        for table in ("identity", "claims", "terminals", "wire_terminals"):
             name = f"{SCHEMA}.{table}"
             table_owner = await connection.fetchval(
                 "SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid=to_regclass($1)", name
@@ -227,14 +246,14 @@ class PostgresProductionClaims:
 
     async def claim(
         self,
-        kind: Literal["MANUAL_NONCE", "TYPED_SIGNING"],
+        kind: Literal["MANUAL_NONCE", "TYPED_SIGNING", "WIRE_DISPATCH"],
         namespace: str,
         identity: str,
         request_sha256: str,
     ) -> bool:
         namespace, identity = _identity(namespace), _identity(identity)
         request_sha256 = _digest(request_sha256)
-        if kind not in {"MANUAL_NONCE", "TYPED_SIGNING"}:
+        if kind not in {"MANUAL_NONCE", "TYPED_SIGNING", "WIRE_DISPATCH"}:
             raise ProductionClaimError("unsupported claim kind")
         try:
             async with self._connection() as connection:
@@ -339,16 +358,82 @@ class PostgresProductionClaims:
         except Exception:
             raise ProductionClaimError("signing terminal outcome unresolved; do not retry") from None
 
+    async def claim_wire_once_async(self, *, namespace: str, effect_id: str, request_sha256: str) -> bool:
+        """Durably claim one exact venue wire effect, distinct from key signing."""
+        return await self.claim("WIRE_DISPATCH", namespace, effect_id, request_sha256)
+
+    async def finish_wire_async(
+        self,
+        *,
+        namespace: str,
+        effect_id: str,
+        request_sha256: str,
+        terminal_status: Literal["COMPLETED", "UNRESOLVED"],
+        response_sha256: str | None,
+    ) -> None:
+        namespace, effect_id = _identity(namespace), _identity(effect_id)
+        request_sha256 = _digest(request_sha256)
+        if (
+            terminal_status not in {"COMPLETED", "UNRESOLVED"}
+            or (terminal_status == "COMPLETED" and response_sha256 is None)
+            or (terminal_status == "UNRESOLVED" and response_sha256 is not None)
+        ):
+            raise ProductionClaimError("invalid wire terminal evidence")
+        if response_sha256 is not None:
+            response_sha256 = _digest(response_sha256)
+        try:
+            async with self._connection() as connection:
+                async with connection.transaction():
+                    await connection.execute("SET LOCAL statement_timeout='5s'")
+                    prior = await connection.fetchrow(
+                        "SELECT * FROM kairos_production_evidence_v1.claims "
+                        "WHERE claim_kind='WIRE_DISPATCH' AND namespace=$1 AND identity=$2",
+                        namespace,
+                        effect_id,
+                    )
+                    if (
+                        prior is None
+                        or prior["request_sha256"] != request_sha256
+                        or (prior["context_sha256"] != self.context_sha256)
+                    ):
+                        raise ProductionClaimError("wire terminal does not resolve its exact claim")
+                    await connection.execute(
+                        "INSERT INTO kairos_production_evidence_v1.wire_terminals "
+                        "VALUES('WIRE_DISPATCH',$1,$2,$3,$4,$5,DEFAULT) ON CONFLICT DO NOTHING",
+                        namespace,
+                        effect_id,
+                        request_sha256,
+                        terminal_status,
+                        response_sha256,
+                    )
+                    terminal = await connection.fetchrow(
+                        "SELECT * FROM kairos_production_evidence_v1.wire_terminals "
+                        "WHERE claim_kind='WIRE_DISPATCH' AND namespace=$1 AND identity=$2",
+                        namespace,
+                        effect_id,
+                    )
+                    if (
+                        terminal["terminal_status"] != terminal_status
+                        or terminal["response_sha256"] != response_sha256
+                    ):
+                        raise ProductionClaimError("immutable wire terminal conflict")
+        except ProductionClaimError:
+            raise
+        except Exception:
+            raise ProductionClaimError("wire terminal outcome unresolved; do not retry") from None
+
     async def load_claim(self, *, kind: str, namespace: str, identity: str) -> dict | None:
         namespace, identity = _identity(namespace), _identity(identity)
-        if kind not in {"MANUAL_NONCE", "TYPED_SIGNING"}:
+        if kind not in {"MANUAL_NONCE", "TYPED_SIGNING", "WIRE_DISPATCH"}:
             raise ProductionClaimError("unsupported claim kind")
         try:
             async with self._connection() as connection:
+                terminal_table = "wire_terminals" if kind == "WIRE_DISPATCH" else "terminals"
+                terminal_value = "response_sha256" if kind == "WIRE_DISPATCH" else "result_sha256"
                 row = await connection.fetchrow(
-                    "SELECT c.*,t.terminal_status,t.result_sha256 "
+                    f"SELECT c.*,t.terminal_status,t.{terminal_value} AS result_sha256 "
                     "FROM kairos_production_evidence_v1.claims c "
-                    "LEFT JOIN kairos_production_evidence_v1.terminals t "
+                    f"LEFT JOIN kairos_production_evidence_v1.{terminal_table} t "
                     "USING(claim_kind,namespace,identity) "
                     "WHERE claim_kind=$1 AND namespace=$2 AND identity=$3",
                     kind,

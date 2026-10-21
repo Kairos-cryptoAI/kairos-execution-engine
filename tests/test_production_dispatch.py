@@ -1,0 +1,309 @@
+"""Synthetic one-effect dispatcher contract tests; no production endpoint calls."""
+
+import asyncio
+import json
+
+import pytest
+
+from kairos_execution.production_dispatch import (
+    ProductionDispatchError,
+    ProductionEffectDispatcher,
+    ProductionWireRequestV1,
+)
+from kairos_execution.production_readiness import canonical_digest
+from kairos_execution.signing_authorization import signing_effect_id
+from tests.test_managed_signer import NOW, setup_signer
+from tests.test_production_claims import claims_fixture
+
+
+class CurrentState:
+    def __init__(self):
+        self.calls = []
+        self.fail_on = None
+
+    async def verify_effect_async(self, request, binding, *, decision_id, effect_id):
+        self.calls.append((request.request_id, binding.wallet_address, decision_id, effect_id))
+        if self.fail_on == len(self.calls):
+            raise PermissionError("operator disarmed")
+
+
+class SyntheticSignatureVerifier:
+    def verify(self, *, wallet_address, domain, types, message, signature):
+        return (
+            wallet_address == "0x" + "12" * 20
+            and signature == "0x" + "11" * 65
+            and domain["chainId"] == "161803"
+        )
+
+
+@pytest.mark.asyncio
+async def test_wire_claim_and_second_state_check_precede_one_exact_transport_call():
+    # Run the signing helper inside this loop using a fresh fixture (asyncio.run
+    # in wire_fixture is not valid after loop creation, so construct first).
+    signer, signing_request, _, _, _ = setup_signer()
+    claims, db = claims_fixture(context=signing_request.context)
+    signed = await signer.sign_async(signing_request, now=NOW, claims=claims)
+    message = json.loads(signing_request.message_json)
+    decision_id = "decision-synthetic-1"
+    effect_id = signing_effect_id(request=signing_request, message=message, decision_id=decision_id)
+    request = ProductionWireRequestV1(
+        context=signing_request.context,
+        database_uuid=claims.database_uuid,
+        decision_id=decision_id,
+        effect_id=effect_id,
+        effect_type="PLACE_ORDER",
+        method="POST",
+        path="/api/v2/order/limit",
+        body={**message, "signature": signed.signature},
+        signing_request=signing_request,
+        custody_binding=signer.binding,
+        signed=signed,
+    )
+    auth = CurrentState()
+    sends = []
+
+    async def sender(**kwargs):
+        assert len(db.claims) == 2  # typed-signing + distinct WIRE_DISPATCH committed
+        assert len(auth.calls) == 2
+        db.events.append("WIRE_SEND")
+        sends.append(kwargs)
+        return {"id": message["id"], "status": "NEW"}
+
+    dispatcher = ProductionEffectDispatcher(
+        authorization=auth,
+        signature_verifier=SyntheticSignatureVerifier(),
+        claims=claims,
+        database_uuid=claims.database_uuid,
+        context=signing_request.context,
+        clock=lambda: NOW,
+        sender=sender,
+    )
+    result = await dispatcher.dispatch_one(request)
+    assert result["status"] == "NEW"
+    assert len(sends) == 1
+    assert db.events.index("INSERT_CLAIM") < db.events.index("WIRE_SEND")
+    assert db.events[-2:] == ["INSERT_TERMINAL", "COMMIT"]
+    row = await claims.load_claim(
+        kind="WIRE_DISPATCH", namespace="wire:" + canonical_digest(request.context), identity=effect_id
+    )
+    assert row["terminal_status"] == "COMPLETED"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_delivery_never_sends_twice():
+    signer, signing_request, _, _, _ = setup_signer()
+    claims, _ = claims_fixture(context=signing_request.context)
+    signed = await signer.sign_async(signing_request, now=NOW, claims=claims)
+    message = json.loads(signing_request.message_json)
+    decision_id = "decision-synthetic-1"
+    effect_id = signing_effect_id(request=signing_request, message=message, decision_id=decision_id)
+    request = ProductionWireRequestV1(
+        context=signing_request.context,
+        database_uuid=claims.database_uuid,
+        decision_id=decision_id,
+        effect_id=effect_id,
+        effect_type="PLACE_ORDER",
+        method="POST",
+        path="/api/v2/order/limit",
+        body={**message, "signature": signed.signature},
+        signing_request=signing_request,
+        custody_binding=signer.binding,
+        signed=signed,
+    )
+    auth, sends = CurrentState(), []
+
+    async def sender(**kwargs):
+        sends.append(kwargs)
+        return {"id": kwargs["body"]["id"], "status": "NEW"}
+
+    dispatcher = ProductionEffectDispatcher(
+        authorization=auth,
+        signature_verifier=SyntheticSignatureVerifier(),
+        claims=claims,
+        database_uuid=claims.database_uuid,
+        context=request.context,
+        clock=lambda: NOW,
+        sender=sender,
+    )
+    await dispatcher.dispatch_one(request)
+    with pytest.raises(ProductionDispatchError, match="already claimed"):
+        await dispatcher.dispatch_one(request)
+    assert len(sends) == 1
+
+
+@pytest.mark.asyncio
+async def test_changed_wire_body_or_signature_claim_fails_before_wire_admission():
+    signer, signing_request, _, _, _ = setup_signer()
+    claims, db = claims_fixture(context=signing_request.context)
+    signed = await signer.sign_async(signing_request, now=NOW, claims=claims)
+    message = json.loads(signing_request.message_json)
+    decision_id = "decision-synthetic-1"
+    effect_id = signing_effect_id(request=signing_request, message=message, decision_id=decision_id)
+    request = ProductionWireRequestV1(
+        context=signing_request.context,
+        database_uuid=claims.database_uuid,
+        decision_id=decision_id,
+        effect_id=effect_id,
+        effect_type="PLACE_ORDER",
+        method="POST",
+        path="/api/v2/order/limit",
+        body={**message, "signature": signed.signature, "quantity": 101},
+        signing_request=signing_request,
+        custody_binding=signer.binding,
+        signed=signed,
+    )
+    auth, sends = CurrentState(), []
+
+    async def sender(**kwargs):
+        sends.append(kwargs)
+        return {"id": "unexpected", "status": "NEW"}
+
+    dispatcher = ProductionEffectDispatcher(
+        authorization=auth,
+        signature_verifier=SyntheticSignatureVerifier(),
+        claims=claims,
+        database_uuid=claims.database_uuid,
+        context=request.context,
+        clock=lambda: NOW,
+        sender=sender,
+    )
+    with pytest.raises(ProductionDispatchError, match="differs from the exact"):
+        await dispatcher.dispatch_one(request)
+    assert not sends and not auth.calls
+    assert not any(key[0] == "WIRE_DISPATCH" for key in db.claims)
+
+
+@pytest.mark.asyncio
+async def test_independent_signature_failure_refuses_before_durable_wire_claim():
+    signer, signing_request, _, _, _ = setup_signer()
+    claims, db = claims_fixture(context=signing_request.context)
+    signed = await signer.sign_async(signing_request, now=NOW, claims=claims)
+    message = json.loads(signing_request.message_json)
+    decision_id = "decision-synthetic-1"
+    effect_id = signing_effect_id(request=signing_request, message=message, decision_id=decision_id)
+    request = ProductionWireRequestV1(
+        context=signing_request.context,
+        database_uuid=claims.database_uuid,
+        decision_id=decision_id,
+        effect_id=effect_id,
+        effect_type="PLACE_ORDER",
+        method="POST",
+        path="/api/v2/order/limit",
+        body={**message, "signature": signed.signature},
+        signing_request=signing_request,
+        custody_binding=signer.binding,
+        signed=signed,
+    )
+
+    class RejectingVerifier(SyntheticSignatureVerifier):
+        def verify(self, **kwargs):
+            return False
+
+    auth, sends = CurrentState(), []
+
+    async def sender(**kwargs):
+        sends.append(kwargs)
+        return {"id": "unexpected", "status": "NEW"}
+
+    dispatcher = ProductionEffectDispatcher(
+        authorization=auth,
+        signature_verifier=RejectingVerifier(),
+        claims=claims,
+        database_uuid=claims.database_uuid,
+        context=request.context,
+        clock=lambda: NOW,
+        sender=sender,
+    )
+    with pytest.raises(ProductionDispatchError, match="independent wire-bound"):
+        await dispatcher.dispatch_one(request)
+    assert not sends and not auth.calls
+    assert not any(key[0] == "WIRE_DISPATCH" for key in db.claims)
+
+
+@pytest.mark.asyncio
+async def test_disarm_between_claim_and_transport_marks_unresolved_without_send():
+    signer, signing_request, _, _, _ = setup_signer()
+    claims, db = claims_fixture(context=signing_request.context)
+    signed = await signer.sign_async(signing_request, now=NOW, claims=claims)
+    message = json.loads(signing_request.message_json)
+    decision_id = "decision-synthetic-1"
+    effect_id = signing_effect_id(request=signing_request, message=message, decision_id=decision_id)
+    request = ProductionWireRequestV1(
+        context=signing_request.context,
+        database_uuid=claims.database_uuid,
+        decision_id=decision_id,
+        effect_id=effect_id,
+        effect_type="PLACE_ORDER",
+        method="POST",
+        path="/api/v2/order/limit",
+        body={**message, "signature": signed.signature},
+        signing_request=signing_request,
+        custody_binding=signer.binding,
+        signed=signed,
+    )
+    auth, sends = CurrentState(), []
+    auth.fail_on = 2
+
+    async def sender(**kwargs):
+        sends.append(kwargs)
+        return {"id": "ok", "status": "NEW"}
+
+    dispatcher = ProductionEffectDispatcher(
+        authorization=auth,
+        signature_verifier=SyntheticSignatureVerifier(),
+        claims=claims,
+        database_uuid=claims.database_uuid,
+        context=request.context,
+        clock=lambda: NOW,
+        sender=sender,
+    )
+    with pytest.raises(ProductionDispatchError, match="not retryable"):
+        await dispatcher.dispatch_one(request)
+    assert sends == []
+    row = await claims.load_claim(
+        kind="WIRE_DISPATCH", namespace="wire:" + canonical_digest(request.context), identity=effect_id
+    )
+    assert row["terminal_status"] == "UNRESOLVED"
+
+
+@pytest.mark.asyncio
+async def test_transport_cancellation_is_terminal_unresolved_and_never_retried():
+    signer, signing_request, _, _, _ = setup_signer()
+    claims, _ = claims_fixture(context=signing_request.context)
+    signed = await signer.sign_async(signing_request, now=NOW, claims=claims)
+    message = json.loads(signing_request.message_json)
+    decision_id = "decision-synthetic-1"
+    effect_id = signing_effect_id(request=signing_request, message=message, decision_id=decision_id)
+    request = ProductionWireRequestV1(
+        context=signing_request.context,
+        database_uuid=claims.database_uuid,
+        decision_id=decision_id,
+        effect_id=effect_id,
+        effect_type="PLACE_ORDER",
+        method="POST",
+        path="/api/v2/order/limit",
+        body={**message, "signature": signed.signature},
+        signing_request=signing_request,
+        custody_binding=signer.binding,
+        signed=signed,
+    )
+    auth, sends = CurrentState(), []
+
+    async def sender(**kwargs):
+        sends.append(kwargs)
+        raise asyncio.CancelledError
+
+    dispatcher = ProductionEffectDispatcher(
+        authorization=auth,
+        signature_verifier=SyntheticSignatureVerifier(),
+        claims=claims,
+        database_uuid=claims.database_uuid,
+        context=request.context,
+        clock=lambda: NOW,
+        sender=sender,
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await dispatcher.dispatch_one(request)
+    with pytest.raises(ProductionDispatchError, match="already claimed"):
+        await dispatcher.dispatch_one(request)
+    assert len(sends) == 1

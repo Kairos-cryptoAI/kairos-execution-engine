@@ -154,14 +154,15 @@ async def test_native_isolated_claims_races_restart_unknown_and_role_boundary(tm
         pytest.fail("isolated native connection unavailable", pytrace=False)
     try:
         database_uuid = UUID(settings["DATABASE_UUID"])
-        await provision_isolated_schema(
-            owner,
-            expected_database=settings["DATABASE"],
-            database_uuid=database_uuid,
-            policy_namespace=settings["POLICY_NAMESPACE"],
-            owner_role=settings["OWNER_ROLE"],
-            runtime_role=settings["RUNTIME_ROLE"],
-        )
+        if await owner.fetchval("SELECT to_regnamespace($1)", SCHEMA) is None:
+            await provision_isolated_schema(
+                owner,
+                expected_database=settings["DATABASE"],
+                database_uuid=database_uuid,
+                policy_namespace=settings["POLICY_NAMESPACE"],
+                owner_role=settings["OWNER_ROLE"],
+                runtime_role=settings["RUNTIME_ROLE"],
+            )
         scope = signed_gate_fixture()[3]
         kwargs = dict(
             expected_database=settings["DATABASE"],
@@ -171,6 +172,8 @@ async def test_native_isolated_claims_races_restart_unknown_and_role_boundary(tm
             context=scope,
         )
         store = PostgresProductionClaims(pool, **kwargs)
+        async with pool.acquire() as connection:
+            await store.inspect(connection)
         claim = dict(
             custody_reference="fixture:custody", request_id="concurrent-once", request_sha256="a" * 64
         )
@@ -196,6 +199,14 @@ async def test_native_isolated_claims_races_restart_unknown_and_role_boundary(tm
         await restarted.finish_signing_async(**claim, terminal_status="UNRESOLVED", result_sha256=None)
         with pytest.raises(ProductionClaimError, match="conflict"):
             await restarted.finish_signing_async(**claim, terminal_status="COMPLETED", result_sha256="b" * 64)
+        wire_claim = dict(namespace="wire:" + "f" * 64, effect_id="1" * 64, request_sha256="2" * 64)
+        assert await restarted.claim_wire_once_async(**wire_claim)
+        await restarted.finish_wire_async(**wire_claim, terminal_status="COMPLETED", response_sha256="3" * 64)
+        wire_row = await restarted.load_claim(
+            kind="WIRE_DISPATCH", namespace=wire_claim["namespace"], identity=wire_claim["effect_id"]
+        )
+        assert wire_row["terminal_status"] == "COMPLETED" and wire_row["result_sha256"] == "3" * 64
+        assert await restarted.claim_wire_once_async(**wire_claim) is False
         nonce = dict(owner_identity="fixture:owner", nonce="one-use", request_sha256="c" * 64)
         assert await restarted.consume_once_async(**nonce)
         assert await restarted.consume_once_async(**nonce) is False
@@ -206,10 +217,19 @@ async def test_native_isolated_claims_races_restart_unknown_and_role_boundary(tm
                 await runtime.execute(f"DELETE FROM {SCHEMA}.claims")
             with pytest.raises(asyncpg.InsufficientPrivilegeError):
                 await runtime.execute(f"TRUNCATE {SCHEMA}.claims CASCADE")
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                await runtime.execute(f"DELETE FROM {SCHEMA}.wire_terminals")
             with pytest.raises(asyncpg.ForeignKeyViolationError):
                 await runtime.execute(
                     f"INSERT INTO {SCHEMA}.terminals VALUES('TYPED_SIGNING','fixture:custody',"
                     "'unbound-terminal',$1,'COMPLETED',$2,DEFAULT) ON CONFLICT DO NOTHING",
+                    "b" * 64,
+                    "d" * 64,
+                )
+            with pytest.raises(asyncpg.ForeignKeyViolationError):
+                await runtime.execute(
+                    f"INSERT INTO {SCHEMA}.wire_terminals VALUES('WIRE_DISPATCH','fixture:wire',"
+                    "'unbound-terminal',$1,'COMPLETED',$2,DEFAULT)",
                     "b" * 64,
                     "d" * 64,
                 )
