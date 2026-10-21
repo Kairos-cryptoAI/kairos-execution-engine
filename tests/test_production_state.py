@@ -14,6 +14,7 @@ from kairos_execution.production_state import (
     AsyncPostgresProductionSigningStateSource,
     ProductionStateError,
     _payload,
+    _sql_diagnostic,
     _validate_snapshot_clock,
     provision_production_state_schema,
 )
@@ -103,3 +104,13 @@ def test_database_snapshot_clock_is_compared_to_post_io_time():
             checked_at=started - timedelta(milliseconds=1),
             max_age=timedelta(seconds=5),
         )
+
+
+def test_database_write_diagnostic_uses_only_whitelisted_sqlstate_tokens():
+    assert _sql_diagnostic("P0001", "operator ARM lacks its exact signed owner request") == (
+        "P0001/operator_owner_arm_link"
+    )
+    assert _sql_diagnostic("23505", "duplicate key value includes secret-like text") == (
+        "23505/unique_constraint"
+    )
+    assert _sql_diagnostic("not-a-state", "private database detail") == "database_error"

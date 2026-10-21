@@ -48,6 +48,27 @@ SCHEMA = "kairos_production_state_v1"
 _ROLE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,62}\Z")
 _ID_PATTERN = re.compile(r"[A-Za-z0-9_.:-]{1,160}\Z")
 _DIGEST_PATTERN = re.compile(r"[a-f0-9]{64}\Z")
+_SQLSTATE_PATTERN = re.compile(r"[0-9A-Z]{5}\Z")
+_SQLSTATE_CODES = {
+    "P0001": "trigger_rejection",
+    "23502": "not_null_constraint",
+    "23503": "foreign_key_constraint",
+    "23505": "unique_constraint",
+    "23514": "check_constraint",
+    "42501": "privilege_denied",
+}
+_SQL_GUARD_REASONS = {
+    "operator observation must precede database clock": "operator_clock",
+    "operator history must start DISARMED": "operator_initial_state",
+    "operator observation time must increase": "operator_time_order",
+    "operator command changed without a new revision": "operator_revision_content",
+    "operator rearm requires a fresh signed owner arm": "operator_arm_transition",
+    "operator rearm cannot reuse a prior owner nonce": "operator_nonce_reuse",
+    "operator ARM lacks its exact signed owner request": "operator_owner_arm_link",
+    "operator command revision/lineage is not contiguous": "operator_revision_lineage",
+    "exposure observation must precede database clock": "exposure_clock",
+    "exposure observation time must increase": "exposure_time_order",
+}
 
 DDL = """
 CREATE SCHEMA kairos_production_state_v1;
@@ -240,6 +261,14 @@ _WRITER_SELECT_TABLES = {
 
 class ProductionStateError(PermissionError):
     """Sanitized source identity, state or persistence error; never includes a DSN."""
+
+
+def _sql_diagnostic(sqlstate: object, message: object) -> str:
+    """Return a fixed diagnostic token; never reflect PostgreSQL text or values."""
+    if type(sqlstate) is not str or _SQLSTATE_PATTERN.fullmatch(sqlstate) is None:
+        return "database_error"
+    reason = _SQL_GUARD_REASONS.get(message) if type(message) is str else None
+    return f"{sqlstate}/{reason or _SQLSTATE_CODES.get(sqlstate, 'database_error')}"
 
 
 def _role(value: str) -> str:
@@ -461,6 +490,9 @@ class _StateDB:
                         return await callback(connection)
         except ProductionStateError:
             raise
+        except asyncpg.PostgresError as exc:
+            diagnostic = _sql_diagnostic(exc.sqlstate, exc.message)
+            raise ProductionStateError(f"production state append rejected [{diagnostic}]") from None
         except Exception:
             raise ProductionStateError(
                 "production state append outcome unavailable; do not retry blindly"
