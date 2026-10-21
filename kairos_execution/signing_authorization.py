@@ -2,8 +2,7 @@
 
 This module deliberately does not provide a database adapter or production
 composition. The current shipped operator-control repository is PAPER/DEV-only,
-The production-claim repository has an async claim loader, but this synchronous
-signer verifier has no compatible deployed read adapter. A deployment must supply
+The production-claim repository has an async claim loader. A deployment must supply
 an independently reviewed source that reads those authoritative stores; tests
 here use synthetic data and are not production acceptance evidence.
 """
@@ -15,7 +14,7 @@ import json
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Literal, Protocol
+from typing import Literal, Protocol, runtime_checkable
 from uuid import UUID
 
 from pydantic import Field, field_validator
@@ -141,11 +140,21 @@ class ProductionSigningEvidenceV1(StrictRecord):
     _utc = field_validator("resolved_at")(_aware)
 
 
+@runtime_checkable
 class ProductionSigningStateSource(Protocol):
     def resolve_signing_evidence(
         self, *, request: ManagedSigningRequestV1, binding: CustodyBindingV1, now: datetime
     ) -> ProductionSigningEvidenceV1:
         """Read a consistent, authoritative snapshot; errors must fail closed."""
+        ...
+
+
+@runtime_checkable
+class AsyncProductionSigningStateSource(Protocol):
+    async def resolve_signing_evidence_async(
+        self, *, request: ManagedSigningRequestV1, binding: CustodyBindingV1, now: datetime
+    ) -> ProductionSigningEvidenceV1:
+        """Read one consistent snapshot with bounded, nonblocking database I/O."""
         ...
 
 
@@ -175,7 +184,7 @@ class ProductionSigningAuthorizationVerifier:
     def __init__(
         self,
         *,
-        source: ProductionSigningStateSource,
+        source: ProductionSigningStateSource | AsyncProductionSigningStateSource,
         preconditions: PreconditionsV1,
         owner_key: OwnerArmKeyV1,
         expected_owner_key_sha256: str,
@@ -222,6 +231,51 @@ class ProductionSigningAuthorizationVerifier:
     def verify_request_at(
         self, request: ManagedSigningRequestV1, binding: CustodyBindingV1, *, now: datetime
     ) -> None:
+        request, binding = self._validate_scope(request, binding, now=now)
+        try:
+            if not isinstance(self._source, ProductionSigningStateSource):
+                raise ManagedSigningError("async state source requires async authorization")
+            evidence = ProductionSigningEvidenceV1.model_validate(
+                self._source.resolve_signing_evidence(request=request, binding=binding, now=now)
+            )
+        except Exception:
+            raise ManagedSigningError(
+                "owner arm or authoritative authorization state is unavailable"
+            ) from None
+        self._verify_evidence(request, binding, evidence, now=now)
+
+    async def verify_request_async(self, request: ManagedSigningRequestV1, binding: CustodyBindingV1) -> None:
+        """Read native async state under the signer's single end-to-end deadline.
+
+        Recheck the clock after I/O: neither a slow read nor an expired lease may
+        authorize using the time captured before the database call.
+        """
+        try:
+            now = self._clock()
+            request, binding = self._validate_scope(request, binding, now=now)
+            if isinstance(self._source, AsyncProductionSigningStateSource):
+                evidence = await self._source.resolve_signing_evidence_async(
+                    request=request, binding=binding, now=now
+                )
+            elif isinstance(self._source, ProductionSigningStateSource):
+                evidence = self._source.resolve_signing_evidence(request=request, binding=binding, now=now)
+            else:
+                raise ManagedSigningError("authoritative authorization state is absent")
+            checked_at = self._clock()
+            if checked_at < now:
+                raise ManagedSigningError("authorization clock moved backwards")
+            request, binding = self._validate_scope(request, binding, now=checked_at)
+            self._verify_evidence(
+                request, binding, ProductionSigningEvidenceV1.model_validate(evidence), now=checked_at
+            )
+        except ManagedSigningError:
+            raise
+        except Exception:
+            raise ManagedSigningError("independent signing authorization failed") from None
+
+    def _validate_scope(
+        self, request: ManagedSigningRequestV1, binding: CustodyBindingV1, *, now: datetime
+    ) -> tuple[ManagedSigningRequestV1, CustodyBindingV1]:
         _aware(now)
         request = ManagedSigningRequestV1.model_validate(request)
         binding = CustodyBindingV1.model_validate(binding)
@@ -234,10 +288,17 @@ class ProductionSigningAuthorizationVerifier:
             raise ManagedSigningError("custody receipt or reviewed schema binding differs")
         if not now < request.expires_at <= now + timedelta(seconds=30):
             raise ManagedSigningError("signing request is expired or exceeds the deadline bound")
+        return request, binding
+
+    def _verify_evidence(
+        self,
+        request: ManagedSigningRequestV1,
+        binding: CustodyBindingV1,
+        evidence: ProductionSigningEvidenceV1,
+        *,
+        now: datetime,
+    ) -> None:
         try:
-            evidence = ProductionSigningEvidenceV1.model_validate(
-                self._source.resolve_signing_evidence(request=request, binding=binding, now=now)
-            )
             is_exit = request.operation in {"Position close order", "New take-profit/stop-loss"}
             claim_time = evidence.owner_nonce_claim.claimed_at if is_exit else now
             arm, arm_digest = _verify_owner_signed_arm(

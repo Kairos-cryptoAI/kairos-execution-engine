@@ -40,6 +40,12 @@ are not changed or silently adopted into this profile.
   still-ARMED entry latch or an entry-notional cap. Its state-source protocol is
   **not** a shipped PROD database reader: synthetic evaluator tests do not close
   service composition or authorize signing on the real account.
+- Native asynchronous authorization reads run inside the signer's same bounded
+  deadline, before the durable signing claim. The verifier rechecks the clock
+  and all leases after the read. Async-only state sources cannot be used through
+  the synchronous signing API. Cancellation before authorization creates no
+  signing claim and never reaches the key worker; this is not permission to
+  repeat a later ambiguous signing or exchange dispatch.
 - `ExecutionLifecycleScope` extracts existing durable account/event/effect
   identities without making PAPER configurable as PROD. `PaperExecutionEngine`
   still constructs the exact internal DEV canary policy and rejects LIVE/PROD.

@@ -13,7 +13,7 @@ import hashlib
 import json
 import re
 from datetime import datetime, timedelta
-from typing import Annotated, Literal, Protocol
+from typing import Annotated, Literal, Protocol, runtime_checkable
 
 from pydantic import Field, field_validator
 
@@ -114,6 +114,7 @@ class AsyncSigningClaimStore(Protocol):
     ) -> None: ...
 
 
+@runtime_checkable
 class SigningAuthorizationVerifier(Protocol):
     def verify_request(self, request: ManagedSigningRequestV1, binding: CustodyBindingV1) -> None:
         """Resolve manual request, current operator/risk authorization and exact limits.
@@ -121,6 +122,13 @@ class SigningAuthorizationVerifier(Protocol):
         A digest string alone is not authorization. Raise on absent, stale,
         revoked, unresolved or scope/geometry-mismatched underlying evidence.
         """
+        ...
+
+
+@runtime_checkable
+class AsyncSigningAuthorizationVerifier(Protocol):
+    async def verify_request_async(self, request: ManagedSigningRequestV1, binding: CustodyBindingV1) -> None:
+        """Resolve authoritative state without blocking the event loop."""
         ...
 
 
@@ -201,7 +209,7 @@ class ManagedSignerBoundary:
         backend: ManagedCustodyBackend,
         verifier: SignatureVerifier,
         claims: SigningClaimStore,
-        authorization: SigningAuthorizationVerifier,
+        authorization: SigningAuthorizationVerifier | AsyncSigningAuthorizationVerifier,
     ) -> None:
         self.binding = binding
         self._backend = backend
@@ -209,7 +217,7 @@ class ManagedSignerBoundary:
         self._claims = claims
         self._authorization = authorization
 
-    def _prepare(
+    def _prepare_fields(
         self, request: ManagedSigningRequestV1, now: datetime
     ) -> tuple[ManagedSigningRequestV1, CustodyBindingV1, dict, dict, str]:
         _aware(now)
@@ -225,10 +233,6 @@ class ManagedSignerBoundary:
         if not now < request.expires_at <= now + timedelta(seconds=30):
             raise ManagedSigningError("signing deadline is expired or exceeds the fixed bound")
         types, message = _typed_message(request, binding)
-        try:
-            self._authorization.verify_request(request, binding)
-        except Exception:
-            raise ManagedSigningError("independent signing authorization failed") from None
         canonical = json.dumps(
             {**request.model_dump(mode="json"), "message_json": json.dumps(message, sort_keys=True)},
             sort_keys=True,
@@ -236,6 +240,18 @@ class ManagedSignerBoundary:
         ).encode()
         digest = hashlib.sha256(canonical).hexdigest()
         return request, binding, types, message, digest
+
+    def _prepare(
+        self, request: ManagedSigningRequestV1, now: datetime
+    ) -> tuple[ManagedSigningRequestV1, CustodyBindingV1, dict, dict, str]:
+        prepared = self._prepare_fields(request, now)
+        try:
+            if not isinstance(self._authorization, SigningAuthorizationVerifier):
+                raise ManagedSigningError("async authorization requires sign_async")
+            self._authorization.verify_request(prepared[0], prepared[1])
+        except Exception:
+            raise ManagedSigningError("independent signing authorization failed") from None
+        return prepared
 
     def sign(self, request: ManagedSigningRequestV1, *, now: datetime) -> SignedTypedDataV1:
         request, binding, types, message, digest = self._prepare(request, now)
@@ -298,7 +314,7 @@ class ManagedSignerBoundary:
         """
         loop = asyncio.get_running_loop()
         started = loop.time()
-        request, binding, types, message, digest = self._prepare(request, now)
+        request, binding, types, message, digest = self._prepare_fields(request, now)
         deadline = started + min(30.0, (request.expires_at - now).total_seconds())
         try:
             # ONE deadline includes authorization preparation, durable claim,
@@ -306,6 +322,19 @@ class ManagedSignerBoundary:
             # checks also reject a callback that suppresses cancellation or
             # returns synchronously after its deadline.
             async with asyncio.timeout_at(deadline):
+                if loop.time() >= deadline:
+                    raise TimeoutError
+                try:
+                    if isinstance(self._authorization, AsyncSigningAuthorizationVerifier):
+                        await self._authorization.verify_request_async(request, binding)
+                    elif isinstance(self._authorization, SigningAuthorizationVerifier):
+                        # Compatibility for pure in-memory policy evaluators.
+                        # Database-backed authorization must use the async API.
+                        self._authorization.verify_request(request, binding)
+                    else:
+                        raise ManagedSigningError("independent signing authorization is absent")
+                except Exception:
+                    raise ManagedSigningError("independent signing authorization failed") from None
                 if loop.time() >= deadline:
                     raise TimeoutError
                 try:
