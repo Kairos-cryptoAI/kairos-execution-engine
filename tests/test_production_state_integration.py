@@ -473,6 +473,7 @@ async def test_native_async_production_source_reads_exact_scoped_state():
         server_now = await pools["operator"].fetchval("SELECT clock_timestamp()")
         disarmed_at = max(
             armed.observed_at + timedelta(milliseconds=1),
+            race_observed_at + timedelta(milliseconds=1),
             server_now - timedelta(milliseconds=500),
         )
         disarmed_again = armed.model_copy(
