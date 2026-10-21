@@ -176,6 +176,48 @@ async def test_changed_wire_body_or_signature_claim_fails_before_wire_admission(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("altered", [True, 1.0, "1"])
+async def test_wire_json_numeric_type_substitution_is_rejected_before_authorization(altered):
+    signer, signing_request, _, _, _ = setup_signer()
+    claims, db = claims_fixture(context=signing_request.context)
+    signed = await signer.sign_async(signing_request, now=NOW, claims=claims)
+    message = json.loads(signing_request.message_json)
+    decision_id = "decision-synthetic-1"
+    request = ProductionWireRequestV1(
+        context=signing_request.context,
+        database_uuid=claims.database_uuid,
+        decision_id=decision_id,
+        effect_id=signing_effect_id(request=signing_request, message=message, decision_id=decision_id),
+        effect_type="PLACE_ORDER",
+        method="POST",
+        path="/api/v2/order/limit",
+        body={**message, "signature": signed.signature, "leverage": altered},
+        signing_request=signing_request,
+        custody_binding=signer.binding,
+        signed=signed,
+    )
+    auth, sends = CurrentState(), []
+
+    async def sender(**kwargs):
+        sends.append(kwargs)
+        return {"status": "unexpected"}
+
+    dispatcher = ProductionEffectDispatcher(
+        authorization=auth,
+        signature_verifier=SyntheticSignatureVerifier(),
+        claims=claims,
+        database_uuid=claims.database_uuid,
+        context=request.context,
+        clock=lambda: NOW,
+        sender=sender,
+    )
+    with pytest.raises(ProductionDispatchError, match="differs from the exact"):
+        await dispatcher.dispatch_one(request)
+    assert not sends and not auth.calls
+    assert not any(key[0] == "WIRE_DISPATCH" for key in db.claims)
+
+
+@pytest.mark.asyncio
 async def test_independent_signature_failure_refuses_before_durable_wire_claim():
     signer, signing_request, _, _, _ = setup_signer()
     claims, db = claims_fixture(context=signing_request.context)
@@ -439,9 +481,7 @@ async def test_wall_clock_rollback_and_zero_database_uuid_fail_closed():
 async def test_sender_deadline_returns_no_late_success_and_refuses_replay():
     signer, signing_request, _, _, _ = setup_signer()
     claims, _ = claims_fixture(context=signing_request.context)
-    signing_request = signing_request.model_copy(
-        update={"expires_at": NOW + timedelta(milliseconds=250)}
-    )
+    signing_request = signing_request.model_copy(update={"expires_at": NOW + timedelta(milliseconds=250)})
     signed = await signer.sign_async(signing_request, now=NOW, claims=claims)
     message = json.loads(signing_request.message_json)
     decision_id = "decision-sender-timeout"
@@ -486,9 +526,7 @@ async def test_sender_deadline_returns_no_late_success_and_refuses_replay():
 async def test_terminal_timeout_does_not_wait_for_late_ack_or_allow_replay():
     signer, signing_request, _, _, _ = setup_signer()
     claims, _ = claims_fixture(context=signing_request.context)
-    signing_request = signing_request.model_copy(
-        update={"expires_at": NOW + timedelta(milliseconds=250)}
-    )
+    signing_request = signing_request.model_copy(update={"expires_at": NOW + timedelta(milliseconds=250)})
     signed = await signer.sign_async(signing_request, now=NOW, claims=claims)
     message = json.loads(signing_request.message_json)
     decision_id = "decision-terminal-timeout"

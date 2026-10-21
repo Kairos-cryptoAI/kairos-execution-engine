@@ -197,7 +197,7 @@ def _validate_effect(request: ProductionWireRequestV1) -> dict[str, Any]:
     ).encode()
     if hashlib.sha256(canonical).hexdigest() != request.signed.request_sha256:
         raise ProductionDispatchError("managed signature belongs to a different signing request")
-    if request.body != {**message, "signature": signature}:
+    if _canonical_bytes(request.body) != _canonical_bytes({**message, "signature": signature}):
         raise ProductionDispatchError("wire body differs from the exact independently signed message")
     return message
 
