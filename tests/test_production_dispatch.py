@@ -481,7 +481,7 @@ async def test_wall_clock_rollback_and_zero_database_uuid_fail_closed():
 async def test_sender_deadline_returns_no_late_success_and_refuses_replay():
     signer, signing_request, _, _, _ = setup_signer()
     claims, _ = claims_fixture(context=signing_request.context)
-    signing_request = signing_request.model_copy(update={"expires_at": NOW + timedelta(milliseconds=250)})
+    signing_request = signing_request.model_copy(update={"expires_at": NOW + timedelta(seconds=2)})
     signed = await signer.sign_async(signing_request, now=NOW, claims=claims)
     message = json.loads(signing_request.message_json)
     decision_id = "decision-sender-timeout"
@@ -500,9 +500,11 @@ async def test_sender_deadline_returns_no_late_success_and_refuses_replay():
         signed=signed,
     )
     calls = []
+    sender_entered = asyncio.Event()
 
     async def slow_sender(**kwargs):
         calls.append(kwargs)
+        sender_entered.set()
         await asyncio.sleep(5)
         return {"status": "LATE"}
 
@@ -515,8 +517,13 @@ async def test_sender_deadline_returns_no_late_success_and_refuses_replay():
         clock=lambda: NOW,
         sender=slow_sender,
     )
+    started = asyncio.get_running_loop().time()
     with pytest.raises(ProductionDispatchError):
         await dispatcher.dispatch_one(request)
+    elapsed = asyncio.get_running_loop().time() - started
+    assert sender_entered.is_set()
+    assert elapsed < 3.0
+    assert len(calls) == 1
     with pytest.raises(ProductionDispatchError, match="already claimed"):
         await dispatcher.dispatch_one(request)
     assert len(calls) == 1
@@ -526,7 +533,7 @@ async def test_sender_deadline_returns_no_late_success_and_refuses_replay():
 async def test_terminal_timeout_does_not_wait_for_late_ack_or_allow_replay():
     signer, signing_request, _, _, _ = setup_signer()
     claims, _ = claims_fixture(context=signing_request.context)
-    signing_request = signing_request.model_copy(update={"expires_at": NOW + timedelta(milliseconds=250)})
+    signing_request = signing_request.model_copy(update={"expires_at": NOW + timedelta(seconds=2)})
     signed = await signer.sign_async(signing_request, now=NOW, claims=claims)
     message = json.loads(signing_request.message_json)
     decision_id = "decision-terminal-timeout"
@@ -545,11 +552,15 @@ async def test_terminal_timeout_does_not_wait_for_late_ack_or_allow_replay():
         signed=signed,
     )
     allow_terminal_ack = asyncio.Event()
+    terminal_started = asyncio.Event()
+    terminal_completed = asyncio.Event()
     original_finish = claims.finish_wire_async
 
     async def delayed_finish(**kwargs):
+        terminal_started.set()
         await allow_terminal_ack.wait()
         await original_finish(**kwargs)
+        terminal_completed.set()
 
     claims.finish_wire_async = delayed_finish
     sends = []
@@ -567,10 +578,15 @@ async def test_terminal_timeout_does_not_wait_for_late_ack_or_allow_replay():
         clock=lambda: NOW,
         sender=sender,
     )
+    started = asyncio.get_running_loop().time()
     with pytest.raises(ProductionDispatchError, match="deadline elapsed"):
         await dispatcher.dispatch_one(request)
+    elapsed = asyncio.get_running_loop().time() - started
+    assert terminal_started.is_set()
+    assert len(sends) == 1
+    assert elapsed < 3.0
     allow_terminal_ack.set()
-    await asyncio.sleep(0.05)
+    await asyncio.wait_for(terminal_completed.wait(), timeout=1.0)
     row = await claims.load_claim(
         kind="WIRE_DISPATCH", namespace="wire:" + canonical_digest(request.context), identity=effect_id
     )
