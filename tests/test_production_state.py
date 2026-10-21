@@ -4,7 +4,7 @@ These tests use synthetic records only; native database acceptance lives in the
 opt-in isolated PostgreSQL integration test.
 """
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import pytest
@@ -14,6 +14,7 @@ from kairos_execution.production_state import (
     AsyncPostgresProductionSigningStateSource,
     ProductionStateError,
     _payload,
+    _validate_snapshot_clock,
     provision_production_state_schema,
 )
 from tests.test_signing_authorization import fixture
@@ -81,4 +82,24 @@ def test_source_rejects_longer_than_five_second_freshness_contract():
             runtime_role="state_reader",
             context=binding.context,
             max_snapshot_age=timedelta(seconds=6),
+        )
+
+
+def test_database_snapshot_clock_is_compared_to_post_io_time():
+    started = datetime(2026, 10, 21, 12, 0, 0, tzinfo=UTC)
+    # A real database resolution must naturally be later than the request's
+    # call-start timestamp. The source permits that when post-I/O time advances.
+    _validate_snapshot_clock(
+        started_at=started,
+        resolved_at=started + timedelta(milliseconds=40),
+        checked_at=started + timedelta(milliseconds=60),
+        max_age=timedelta(seconds=5),
+    )
+
+    with pytest.raises(ProductionStateError, match="clock moved backwards"):
+        _validate_snapshot_clock(
+            started_at=started,
+            resolved_at=started,
+            checked_at=started - timedelta(milliseconds=1),
+            max_age=timedelta(seconds=5),
         )

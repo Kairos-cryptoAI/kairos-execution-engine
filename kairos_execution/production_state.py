@@ -15,7 +15,7 @@ import asyncio
 import hashlib
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -265,6 +265,19 @@ def _payload(model: Any) -> tuple[dict[str, Any], str]:
     data = model.model_dump(mode="json")
     encoded = json.dumps(data, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
     return data, hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_snapshot_clock(
+    *, started_at: datetime, resolved_at: datetime, checked_at: datetime, max_age: timedelta
+) -> None:
+    """Compare DB time to a fresh post-I/O local clock, not request start time."""
+    values = (started_at, resolved_at, checked_at)
+    if any(value.tzinfo is None or value.utcoffset() != timedelta(0) for value in values):
+        raise ProductionStateError("production snapshot clocks must be explicit UTC timestamps")
+    if checked_at < started_at:
+        raise ProductionStateError("production authorization clock moved backwards")
+    if resolved_at > checked_at or checked_at - resolved_at > max_age:
+        raise ProductionStateError("production signing state snapshot is stale or future-dated")
 
 
 async def _check_role_isolated(
@@ -637,6 +650,7 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
         runtime_role: str,
         context: ProductionContextV1,
         max_snapshot_age: timedelta = timedelta(seconds=5),
+        clock_probe: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         if not timedelta(0) < max_snapshot_age <= timedelta(seconds=5):
             raise ValueError("production state freshness may not exceed five seconds")
@@ -651,6 +665,7 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
         )
         self.runtime_role = _role(runtime_role)
         self.max_snapshot_age = max_snapshot_age
+        self._clock_probe = clock_probe
 
     async def resolve_signing_evidence_async(
         self, *, request: ManagedSigningRequestV1, binding: CustodyBindingV1, now: datetime
@@ -696,8 +711,13 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
                             exit_operation=exit_operation,
                             now=now,
                         )
-            if evidence.resolved_at > now or now - evidence.resolved_at > self.max_snapshot_age:
-                raise ProductionStateError("production signing state snapshot is stale or future-dated")
+            checked_at = self._clock_probe()
+            _validate_snapshot_clock(
+                started_at=now,
+                resolved_at=evidence.resolved_at,
+                checked_at=checked_at,
+                max_age=self.max_snapshot_age,
+            )
             return evidence
         except (ProductionStateError, ProductionClaimError):
             raise
@@ -799,7 +819,11 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
                 raise ProductionStateError("latest operator observation is ambiguous")
             operator_data = self._verified_payload(operator_row, LiveOperatorStateV1, "operator observation")
             operator = LiveOperatorStateV1.model_validate(operator_data)
-            if operator.context != self.context or operator.version != operator_row["version"]:
+            if (
+                operator.context != self.context
+                or operator.version != operator_row["version"]
+                or operator.observed_at != operator_row["observed_at"]
+            ):
                 raise ProductionStateError("operator observation scope/version mismatch")
 
         risk_row = await connection.fetchrow(
@@ -809,7 +833,12 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
         )
         risk_data = self._verified_payload(risk_row, RiskGeometryV1, "risk decision")
         risk = RiskGeometryV1.model_validate(risk_data)
-        if risk.context != self.context or risk.signing_request_id != request.request_id:
+        if (
+            risk.context != self.context
+            or risk.signing_request_id != request.request_id
+            or risk.observed_at != risk_row["observed_at"]
+            or risk.valid_until != risk_row["valid_until"]
+        ):
             raise ProductionStateError("risk decision scope/request mismatch")
         if risk.decision_id != risk_row["decision_id"]:
             raise ProductionStateError("risk decision identity mismatch")
@@ -841,7 +870,12 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
                     exposure_row, ExposureSnapshotV1, "exposure observation"
                 )
                 exposure = ExposureSnapshotV1.model_validate(exposure_data)
-                if exposure.context != self.context or exposure.instrument != instrument:
+                if (
+                    exposure.context != self.context
+                    or exposure.instrument != instrument
+                    or exposure.observed_at != exposure_row["observed_at"]
+                    or exposure.valid_until != exposure_row["valid_until"]
+                ):
                     raise ProductionStateError("exposure observation scope/instrument mismatch")
 
         times = [owner_claim.claimed_at, risk.observed_at]

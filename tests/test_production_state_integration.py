@@ -29,6 +29,7 @@ from kairos_execution.production_state import (
     PostgresExposureStateWriter,
     PostgresOperatorStateWriter,
     PostgresRiskStateWriter,
+    ProductionStateError,
     provision_production_state_schema,
 )
 from tests.test_signing_authorization import fixture
@@ -249,6 +250,38 @@ async def test_native_async_production_source_reads_exact_scoped_state():
             namespace=binding.custody_reference,
             identity=missing_risk.request_id,
         ) is None
+
+        # Once that exact nonce has armed and later disarmed, PostgreSQL itself
+        # refuses to re-arm it; a new signed/consumed owner command is required.
+        server_now = await pools["operator"].fetchval("SELECT clock_timestamp()")
+        disarmed_at = max(
+            armed.observed_at + timedelta(milliseconds=1),
+            server_now - timedelta(milliseconds=500),
+        )
+        disarmed_again = armed.model_copy(
+            update={
+                "version": 3,
+                "state": "DISARMED",
+                "arm_nonce": None,
+                "arm_request_sha256": None,
+                "observed_at": disarmed_at,
+                "changed_at": disarmed_at,
+                "expires_at": None,
+                "command_sha256": "e" * 64,
+                "previous_command_sha256": armed.command_sha256,
+            }
+        )
+        await operator_writer.append_operator_observation_async(disarmed_again)
+        reused_arm = armed.model_copy(
+            update={
+                "version": 4,
+                "observed_at": disarmed_at + timedelta(milliseconds=100),
+                "changed_at": disarmed_at + timedelta(milliseconds=100),
+                "previous_command_sha256": disarmed_again.command_sha256,
+            }
+        )
+        with pytest.raises(ProductionStateError):
+            await operator_writer.append_operator_observation_async(reused_arm)
 
         # Separate writer roles are real DB boundaries, not labels on an object.
         async with pools["risk"].acquire() as connection:
