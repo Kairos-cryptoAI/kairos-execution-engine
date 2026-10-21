@@ -245,11 +245,14 @@ async def test_native_async_production_source_reads_exact_scoped_state():
         with pytest.raises(ManagedSigningError, match="independent signing authorization failed"):
             await signer.sign_async(missing_risk, now=datetime.now(UTC), claims=claims)
         assert backend.calls == 0
-        assert await claims.load_claim(
-            kind="TYPED_SIGNING",
-            namespace=binding.custody_reference,
-            identity=missing_risk.request_id,
-        ) is None
+        assert (
+            await claims.load_claim(
+                kind="TYPED_SIGNING",
+                namespace=binding.custody_reference,
+                identity=missing_risk.request_id,
+            )
+            is None
+        )
 
         # Once that exact nonce has armed and later disarmed, PostgreSQL itself
         # refuses to re-arm it; a new signed/consumed owner command is required.

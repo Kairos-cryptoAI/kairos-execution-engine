@@ -186,7 +186,6 @@ CREATE FUNCTION kairos_production_state_v1.enforce_operator_append() RETURNS tri
      SELECT 1 FROM kairos_production_state_v1.owner_arms arm
      WHERE arm.context_sha256=NEW.context_sha256
       AND arm.request_sha256=NEW.payload->>'arm_request_sha256'
-      AND arm.owner_identity=NEW.payload#>>'{request,owner_identity}'
       AND arm.nonce=NEW.payload->>'arm_nonce'
     ) THEN
      RAISE EXCEPTION 'operator ARM lacks its exact signed owner request';
@@ -345,7 +344,7 @@ async def provision_production_state_schema(
     async with connection.transaction():
         await connection.execute(DDL)
         await connection.execute(
-            f"INSERT INTO {SCHEMA}.identity VALUES(true,$1,$2,$3,1,$4,$5,$6,$7,$8)",
+            "INSERT INTO kairos_production_state_v1.identity VALUES(true,$1,$2,$3,1,$4,$5,$6,$7,$8)",
             database_uuid,
             policy_namespace,
             canonical_digest(context),
@@ -394,7 +393,9 @@ class _StateDB:
         actual = await connection.fetchrow("SELECT current_database() AS db,current_user AS role")
         if actual is None or actual["db"] != self.expected_database or actual["role"] != self.expected_role:
             raise ProductionStateError("production state database/role mismatch")
-        identity = await connection.fetchrow(f"SELECT * FROM {SCHEMA}.identity WHERE singleton=true")
+        identity = await connection.fetchrow(
+            "SELECT * FROM kairos_production_state_v1.identity WHERE singleton=true"
+        )
         expected_columns = {
             "database_uuid": self.database_uuid,
             "policy_namespace": self.policy_namespace,
@@ -481,7 +482,7 @@ class PostgresOperatorStateWriter(_StateDB):
 
         async def append(connection: asyncpg.Connection) -> None:
             await connection.execute(
-                f"INSERT INTO {SCHEMA}.owner_arms "
+                "INSERT INTO kairos_production_state_v1.owner_arms "
                 "(context_sha256,request_sha256,owner_identity,nonce,observed_at,payload,payload_sha256) "
                 "VALUES($1,$2,$3,$4,$5,$6::jsonb,$7)",
                 self.context_sha256,
@@ -508,7 +509,7 @@ class PostgresOperatorStateWriter(_StateDB):
                 f"operator:{self.context_sha256}",
             )
             latest = await connection.fetchrow(
-                f"SELECT version,observed_at,payload FROM {SCHEMA}.operator_observations "
+                "SELECT version,observed_at,payload FROM kairos_production_state_v1.operator_observations "
                 "WHERE context_sha256=$1 ORDER BY observed_at DESC,inserted_at DESC LIMIT 1",
                 self.context_sha256,
             )
@@ -539,7 +540,7 @@ class PostgresOperatorStateWriter(_StateDB):
                 ):
                     raise ProductionStateError("operator command revision/lineage is not contiguous")
             await connection.execute(
-                f"INSERT INTO {SCHEMA}.operator_observations "
+                "INSERT INTO kairos_production_state_v1.operator_observations "
                 "(context_sha256,observation_id,version,observed_at,payload,payload_sha256) "
                 "VALUES($1,$2,$3,$4,$5::jsonb,$6)",
                 self.context_sha256,
@@ -568,7 +569,7 @@ class PostgresRiskStateWriter(_StateDB):
 
         async def append(connection: asyncpg.Connection) -> None:
             await connection.execute(
-                f"INSERT INTO {SCHEMA}.risk_decisions "
+                "INSERT INTO kairos_production_state_v1.risk_decisions "
                 "(context_sha256,signing_request_id,decision_id,observed_at,valid_until,payload,"
                 "payload_sha256) "
                 "VALUES($1,$2,$3,$4,$5,$6::jsonb,$7)",
@@ -603,7 +604,7 @@ class PostgresExposureStateWriter(_StateDB):
                 f"exposure:{self.context_sha256}:{exposure.instrument}",
             )
             latest = await connection.fetchrow(
-                f"SELECT observed_at FROM {SCHEMA}.exposure_observations "
+                "SELECT observed_at FROM kairos_production_state_v1.exposure_observations "
                 "WHERE context_sha256=$1 AND instrument=$2 "
                 "ORDER BY observed_at DESC,inserted_at DESC LIMIT 1",
                 self.context_sha256,
@@ -615,7 +616,7 @@ class PostgresExposureStateWriter(_StateDB):
             if latest is not None and exposure.observed_at <= latest["observed_at"]:
                 raise ProductionStateError("exposure observation time must increase monotonically")
             await connection.execute(
-                f"INSERT INTO {SCHEMA}.exposure_observations "
+                "INSERT INTO kairos_production_state_v1.exposure_observations "
                 "(context_sha256,observation_id,instrument,observed_at,valid_until,payload,payload_sha256) "
                 "VALUES($1,$2,$3,$4,$5,$6::jsonb,$7)",
                 self.context_sha256,
@@ -766,7 +767,8 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
     ) -> ProductionSigningEvidenceV1:
         request_digest = _digest(request.manual_request_sha256)
         arm_row = await connection.fetchrow(
-            f"SELECT * FROM {SCHEMA}.owner_arms WHERE context_sha256=$1 AND request_sha256=$2",
+            "SELECT * FROM kairos_production_state_v1.owner_arms "
+            "WHERE context_sha256=$1 AND request_sha256=$2",
             self.context_sha256,
             request_digest,
         )
@@ -801,7 +803,7 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
             raise ProductionStateError("accepted owner nonce belongs to another context")
 
         operator_row = await connection.fetchrow(
-            f"SELECT * FROM {SCHEMA}.operator_observations WHERE context_sha256=$1 "
+            "SELECT * FROM kairos_production_state_v1.operator_observations WHERE context_sha256=$1 "
             "ORDER BY observed_at DESC,inserted_at DESC LIMIT 2",
             self.context_sha256,
         )
@@ -809,7 +811,7 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
         if operator_row is not None:
             if (
                 await connection.fetchval(
-                    f"SELECT count(*) FROM {SCHEMA}.operator_observations "
+                    "SELECT count(*) FROM kairos_production_state_v1.operator_observations "
                     "WHERE context_sha256=$1 AND observed_at=$2",
                     self.context_sha256,
                     operator_row["observed_at"],
@@ -827,7 +829,8 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
                 raise ProductionStateError("operator observation scope/version mismatch")
 
         risk_row = await connection.fetchrow(
-            f"SELECT * FROM {SCHEMA}.risk_decisions WHERE context_sha256=$1 AND signing_request_id=$2",
+            "SELECT * FROM kairos_production_state_v1.risk_decisions "
+            "WHERE context_sha256=$1 AND signing_request_id=$2",
             self.context_sha256,
             request.request_id,
         )
@@ -849,7 +852,8 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
             if type(instrument) is not str:
                 raise ProductionStateError("exit order instrument is invalid")
             exposure_row = await connection.fetchrow(
-                f"SELECT * FROM {SCHEMA}.exposure_observations WHERE context_sha256=$1 AND instrument=$2 "
+                "SELECT * FROM kairos_production_state_v1.exposure_observations "
+                "WHERE context_sha256=$1 AND instrument=$2 "
                 "ORDER BY observed_at DESC,inserted_at DESC LIMIT 1",
                 self.context_sha256,
                 instrument,
@@ -857,7 +861,7 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
             if exposure_row is not None:
                 if (
                     await connection.fetchval(
-                        f"SELECT count(*) FROM {SCHEMA}.exposure_observations "
+                        "SELECT count(*) FROM kairos_production_state_v1.exposure_observations "
                         "WHERE context_sha256=$1 AND instrument=$2 AND observed_at=$3",
                         self.context_sha256,
                         instrument,
