@@ -23,7 +23,7 @@ EXPOSURE_WRITER_ROLE = "kairos_exposure_writer_ci"
 OWNER_PASSWORD = "claims-owner-ci-public-test-only"
 RUNTIME_PASSWORD = "claims-runtime-ci-public-test-only"
 OPERATOR_WRITER_PASSWORD = "operator-writer-ci-public-test-only"
-RISK_WRITER_PASSWORD = "risk-writer-ci-public-test-only"
+RISK_WRITER_PASSWORD = "risk_writer_ci_public_test_only"
 EXPOSURE_WRITER_PASSWORD = "exposure-writer-ci-public-test-only"
 ADMIN_DSN = "postgresql://kairos:kairos_test@localhost:5432/kairos_execution_test_000000000001"
 
