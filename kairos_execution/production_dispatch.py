@@ -220,7 +220,7 @@ class ProductionEffectDispatcher:
         clock: Callable[[], datetime] | None = None,
         sender: Callable[..., Awaitable[dict[str, Any]]],
     ) -> None:
-        if not isinstance(database_uuid, UUID):
+        if not isinstance(database_uuid, UUID) or database_uuid.int == 0:
             raise ValueError("an explicit isolated production database UUID is required")
         self.authorization = authorization
         self.signature_verifier = signature_verifier
@@ -236,12 +236,49 @@ class ProductionEffectDispatcher:
 
     async def dispatch_one(self, request: ProductionWireRequestV1) -> dict[str, Any]:
         request = ProductionWireRequestV1.model_validate(request)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        initial_now = self.clock()
+        _aware(initial_now)
+        expiry = request.signing_request.expires_at
+        remaining = (expiry - initial_now).total_seconds()
+        if remaining <= 0:
+            raise ProductionDispatchError("wire request expired before durable admission")
+        if remaining > 30:
+            raise ProductionDispatchError("wire request expiry exceeds the 30-second dispatch bound")
+        deadline = started + min(remaining, 30.0)
+        try:
+            async with asyncio.timeout_at(deadline):
+                return await self._dispatch_one_bounded(request, initial_now, deadline)
+        except TimeoutError:
+            raise ProductionDispatchError(
+                "wire dispatch deadline elapsed; outcome may be unresolved; do not retry"
+            ) from None
+
+    async def _dispatch_one_bounded(
+        self,
+        request: ProductionWireRequestV1,
+        initial_now: datetime,
+        deadline: float,
+    ) -> dict[str, Any]:
         if request.context != self.context or request.database_uuid != self.database_uuid:
             raise ProductionDispatchError("wire request differs from the pinned production scope")
         _validate_effect(request)
-        now = self.clock()
-        _aware(now)
-        if now >= request.signing_request.expires_at:
+
+        wall_high_water = initial_now
+
+        def fresh_time() -> datetime:
+            nonlocal wall_high_water
+            now = self.clock()
+            _aware(now)
+            if now < wall_high_water:
+                raise ProductionDispatchError("wall clock moved backwards during wire dispatch")
+            wall_high_water = now
+            if now >= request.signing_request.expires_at or asyncio.get_running_loop().time() >= deadline:
+                raise ProductionDispatchError("wire request expired during bounded dispatch")
+            return now
+
+        if initial_now >= request.signing_request.expires_at:
             raise ProductionDispatchError("wire request expired before durable admission")
 
         body = json.loads(_canonical_bytes(request.body))
@@ -270,6 +307,7 @@ class ProductionEffectDispatcher:
             )
         except Exception:
             raise ProductionDispatchError("durable signing evidence is unavailable") from None
+        fresh_time()
         if (
             signing_claim is None
             or signing_claim.get("request_sha256") != request.signed.request_sha256
@@ -280,7 +318,8 @@ class ProductionEffectDispatcher:
             raise ProductionDispatchError("signature has no exact completed durable signing claim")
         types, typed_message = _typed_message(request.signing_request, request.custody_binding)
         try:
-            verified = self.signature_verifier.verify(
+            verified = await asyncio.to_thread(
+                self.signature_verifier.verify,
                 wallet_address=request.custody_binding.wallet_address,
                 domain=build_domain(request.custody_binding.chain_id),
                 types=types,
@@ -289,6 +328,7 @@ class ProductionEffectDispatcher:
             )
         except Exception:
             verified = False
+        fresh_time()
         if verified is not True:
             raise ProductionDispatchError("managed signature failed independent wire-bound verification")
 
@@ -301,8 +341,7 @@ class ProductionEffectDispatcher:
             )
         except Exception:
             raise ProductionDispatchError("authoritative wire-time state check failed") from None
-        if self.clock() >= request.signing_request.expires_at:
-            raise ProductionDispatchError("wire request expired during state validation")
+        fresh_time()
         try:
             claimed = await self.claims.claim_wire_once_async(
                 namespace=namespace,
@@ -311,6 +350,7 @@ class ProductionEffectDispatcher:
             )
         except Exception:
             raise ProductionDispatchError("wire claim outcome is unresolved; do not retry") from None
+        fresh_time()
         if claimed is not True:
             raise ProductionDispatchError("wire effect is already claimed or unresolved")
 
@@ -323,9 +363,7 @@ class ProductionEffectDispatcher:
                 decision_id=request.decision_id,
                 effect_id=request.effect_id,
             )
-            now = self.clock()
-            if now >= request.signing_request.expires_at:
-                raise ProductionDispatchError("wire request expired before transport dispatch")
+            fresh_time()
             token = _WireToken(
                 seal=_WIRE_SEAL,
                 method=request.method,
@@ -337,29 +375,33 @@ class ProductionEffectDispatcher:
                 method=request.method,
                 path=request.path,
                 body_sha256=body_digest,
-                now=self.clock(),
+                now=fresh_time(),
             )
         except asyncio.CancelledError:
-            await self._finish_shielded(namespace, request, request_sha256, "UNRESOLVED", None)
+            await self._finish_shielded(namespace, request, request_sha256, "UNRESOLVED", None, deadline)
             raise
         except Exception:
-            await self._finish_shielded(namespace, request, request_sha256, "UNRESOLVED", None)
+            await self._finish_shielded(namespace, request, request_sha256, "UNRESOLVED", None, deadline)
             raise ProductionDispatchError(
                 "wire-time authorization failed; durable claim is not retryable"
             ) from None
 
         try:
             response = await self.sender(method=request.method, path=request.path, body=body)
+            fresh_time()
             if not isinstance(response, dict):
                 raise ValueError("transport returned a malformed response")
             response_digest = _sha256(_canonical_bytes(response))
         except asyncio.CancelledError:
-            await self._finish_shielded(namespace, request, request_sha256, "UNRESOLVED", None)
+            await self._finish_shielded(namespace, request, request_sha256, "UNRESOLVED", None, deadline)
             raise
         except Exception:
-            await self._finish_shielded(namespace, request, request_sha256, "UNRESOLVED", None)
+            await self._finish_shielded(namespace, request, request_sha256, "UNRESOLVED", None, deadline)
             raise ProductionDispatchError("wire outcome is unresolved; do not retry") from None
-        await self._finish_shielded(namespace, request, request_sha256, "COMPLETED", response_digest)
+        fresh_time()
+        await self._finish_shielded(
+            namespace, request, request_sha256, "COMPLETED", response_digest, deadline
+        )
         return response
 
     async def _finish_shielded(
@@ -369,6 +411,7 @@ class ProductionEffectDispatcher:
         request_sha256: str,
         status: Literal["COMPLETED", "UNRESOLVED"],
         response_sha256: str | None,
+        deadline: float,
     ) -> None:
         task = asyncio.create_task(
             self.claims.finish_wire_async(
@@ -380,13 +423,13 @@ class ProductionEffectDispatcher:
             )
         )
         try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            # The terminal writer continues despite caller cancellation.
-            try:
+            async with asyncio.timeout_at(deadline):
                 await asyncio.shield(task)
-            except Exception:
-                pass
+        except asyncio.CancelledError:
+            # The terminal writer may finish in the background, but this
+            # caller never waits beyond the one shared monotonic deadline.
             raise
+        except TimeoutError:
+            raise ProductionDispatchError("wire terminal outcome unresolved; do not retry") from None
         except Exception:
             raise ProductionDispatchError("wire terminal outcome unresolved; do not retry") from None

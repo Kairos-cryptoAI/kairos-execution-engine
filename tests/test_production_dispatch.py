@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+from datetime import timedelta
+from uuid import UUID
 
 import pytest
 
@@ -307,3 +309,127 @@ async def test_transport_cancellation_is_terminal_unresolved_and_never_retried()
     with pytest.raises(ProductionDispatchError, match="already claimed"):
         await dispatcher.dispatch_one(request)
     assert len(sends) == 1
+
+
+@pytest.mark.asyncio
+async def test_dispatch_deadline_covers_durable_reads_and_caps_signing_expiry():
+    signer, signing_request, _, _, _ = setup_signer()
+    claims, db = claims_fixture(context=signing_request.context)
+    signed = await signer.sign_async(signing_request, now=NOW, claims=claims)
+    message = json.loads(signing_request.message_json)
+    decision_id = "decision-deadline"
+    effect_id = signing_effect_id(request=signing_request, message=message, decision_id=decision_id)
+    request = ProductionWireRequestV1(
+        context=signing_request.context,
+        database_uuid=claims.database_uuid,
+        decision_id=decision_id,
+        effect_id=effect_id,
+        effect_type="PLACE_ORDER",
+        method="POST",
+        path="/api/v2/order/limit",
+        body={**message, "signature": signed.signature},
+        signing_request=signing_request.model_copy(update={"expires_at": NOW + timedelta(seconds=60)}),
+        custody_binding=signer.binding,
+        signed=signed,
+    )
+    dispatcher = ProductionEffectDispatcher(
+        authorization=CurrentState(),
+        signature_verifier=SyntheticSignatureVerifier(),
+        claims=claims,
+        database_uuid=claims.database_uuid,
+        context=request.context,
+        clock=lambda: NOW,
+        sender=lambda **kwargs: asyncio.sleep(0, result={"status": "NEW"}),
+    )
+    with pytest.raises(ProductionDispatchError, match="30-second"):
+        await dispatcher.dispatch_one(request)
+
+    signer2, signing_request2, _, _, _ = setup_signer()
+    claims2, db2 = claims_fixture(context=signing_request2.context)
+    short_signing_request = signing_request2.model_copy(
+        update={"expires_at": NOW + timedelta(milliseconds=200)}
+    )
+    short_signed = await signer2.sign_async(short_signing_request, now=NOW, claims=claims2)
+    short_message = json.loads(short_signing_request.message_json)
+    short_effect_id = signing_effect_id(
+        request=short_signing_request, message=short_message, decision_id=decision_id
+    )
+    short_request = ProductionWireRequestV1(
+        context=short_signing_request.context,
+        database_uuid=claims2.database_uuid,
+        decision_id=decision_id,
+        effect_id=short_effect_id,
+        effect_type="PLACE_ORDER",
+        method="POST",
+        path="/api/v2/order/limit",
+        body={**short_message, "signature": short_signed.signature},
+        signing_request=short_signing_request,
+        custody_binding=signer2.binding,
+        signed=short_signed,
+    )
+    dispatcher2 = ProductionEffectDispatcher(
+        authorization=CurrentState(),
+        signature_verifier=SyntheticSignatureVerifier(),
+        claims=claims2,
+        database_uuid=claims2.database_uuid,
+        context=short_request.context,
+        clock=lambda: NOW,
+        sender=lambda **kwargs: asyncio.sleep(0, result={"status": "NEW"}),
+    )
+    original_load = claims2.load_claim
+
+    async def slow_load(**kwargs):
+        await asyncio.sleep(1)
+        return await original_load(**kwargs)
+
+    claims2.load_claim = slow_load
+    with pytest.raises(ProductionDispatchError, match="deadline elapsed"):
+        await dispatcher2.dispatch_one(short_request)
+    assert not any(key[0] == "WIRE_DISPATCH" for key in db2.claims)
+
+
+@pytest.mark.asyncio
+async def test_wall_clock_rollback_and_zero_database_uuid_fail_closed():
+    signer, signing_request, _, _, _ = setup_signer()
+    claims, db = claims_fixture(context=signing_request.context)
+    signed = await signer.sign_async(signing_request, now=NOW, claims=claims)
+    message = json.loads(signing_request.message_json)
+    decision_id = "decision-clock"
+    effect_id = signing_effect_id(request=signing_request, message=message, decision_id=decision_id)
+    request = ProductionWireRequestV1(
+        context=signing_request.context,
+        database_uuid=claims.database_uuid,
+        decision_id=decision_id,
+        effect_id=effect_id,
+        effect_type="PLACE_ORDER",
+        method="POST",
+        path="/api/v2/order/limit",
+        body={**message, "signature": signed.signature},
+        signing_request=signing_request,
+        custody_binding=signer.binding,
+        signed=signed,
+    )
+    ticks = iter((NOW, NOW - timedelta(seconds=1)))
+    dispatcher = ProductionEffectDispatcher(
+        authorization=CurrentState(),
+        signature_verifier=SyntheticSignatureVerifier(),
+        claims=claims,
+        database_uuid=claims.database_uuid,
+        context=request.context,
+        clock=lambda: next(ticks),
+        sender=lambda **kwargs: asyncio.sleep(0, result={"status": "NEW"}),
+    )
+    with pytest.raises(ProductionDispatchError, match="moved backwards"):
+        await dispatcher.dispatch_one(request)
+    assert not any(key[0] == "WIRE_DISPATCH" for key in db.claims)
+
+    with pytest.raises(ValueError, match="database UUID"):
+        ProductionEffectDispatcher(
+            authorization=CurrentState(),
+            signature_verifier=SyntheticSignatureVerifier(),
+            claims=claims,
+            database_uuid=UUID(int=0),
+            context=request.context,
+            clock=lambda: NOW,
+            sender=lambda **kwargs: asyncio.sleep(0, result={"status": "NEW"}),
+        )
