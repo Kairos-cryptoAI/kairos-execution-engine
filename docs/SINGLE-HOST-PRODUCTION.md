@@ -32,6 +32,14 @@ are not changed or silently adopted into this profile.
   authorization and deadline boundary. A worker timeout, failed decrypt, process
   loss or missing terminal acknowledgment does not permit retry. A returned
   signature is excluded from normal record serialization.
+- `ProductionSigningAuthorizationVerifier` now evaluates exact owner-signature
+  and accepted-nonce identity, request/order/effect geometry, current operator
+  state, fixed 0.25% / 1% risk ceilings and explicit owner limits. Signing must
+  finish inside the risk lease and, for exits, the exposure lease. Reducing
+  exits use authenticated historical arm lineage and current exposure, not a
+  still-ARMED entry latch or an entry-notional cap. Its state-source protocol is
+  **not** a shipped PROD database reader: synthetic evaluator tests do not close
+  service composition or authorize signing on the real account.
 - `ExecutionLifecycleScope` extracts existing durable account/event/effect
   identities without making PAPER configurable as PROD. `PaperExecutionEngine`
   still constructs the exact internal DEV canary policy and rejects LIVE/PROD.
@@ -58,8 +66,9 @@ fresh isolated test database; no primary database or legacy queue is involved.
 
 ## Explicitly not completed by these components
 
-The service does not yet compose a production lifecycle executor, concrete
-current operator/risk signing authorization and a capability issuer. Settings
+The service does not yet compose a production lifecycle executor, authoritative
+PROD operator/risk state readers and a capability issuer. The signing policy
+evaluator is implemented but not deployed as an authorization source. Settings
 and factory still reject LIVE. A signed readiness record or presence of keys
 must not be converted into a permissive boolean or the old low-level capability.
 
