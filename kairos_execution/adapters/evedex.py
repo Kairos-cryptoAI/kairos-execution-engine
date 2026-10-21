@@ -189,7 +189,10 @@ class EvedexAdapter(ExchangeAdapter):
             resp.raise_for_status()
             return await resp.json()
 
-    async def _get(self, path: str, *, params: dict[str, int] | None = None) -> Any:
+    async def _get(self, path: str) -> Any:
+        return await self._get_with_params(path, params=None)
+
+    async def _get_with_params(self, path: str, *, params: dict[str, int] | None) -> Any:
         await self._bucket.acquire()
         session = await self._session_get()  # pragma: no cover - network
         async with session.get(f"{self.base}{path}", params=params) as resp:  # pragma: no cover
@@ -231,7 +234,7 @@ class EvedexAdapter(ExchangeAdapter):
                 offset = 0
                 page_count = 0
                 while expected_count is None or offset < expected_count:
-                    payload = await self._get(
+                    payload = await self._get_with_params(
                         "/api/order",
                         params={"version": 2, "limit": ORDER_HISTORY_PAGE_SIZE, "offset": offset},
                     )

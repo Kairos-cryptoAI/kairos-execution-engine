@@ -45,15 +45,14 @@ async def test_order_history_uses_documented_bounded_pagination_and_account_bind
         100: {"list": [_order("00384:ABCDEF0123456789ABCDEF0123")], "count": 101},
     }
 
-    async def get(path, *, params=None):
-        if path == "/api/user/me":
-            return {"exchangeId": 23}
+    async def get_page(path, *, params=None):
         assert path == "/api/order"
         assert params["version"] == 2
         assert params["limit"] == 100
         return pages[params["offset"]]
 
-    adapter._get = AsyncMock(side_effect=get)
+    adapter._get = AsyncMock(return_value={"exchangeId": 23})
+    adapter._get_with_params = AsyncMock(side_effect=get_page)
     result = await adapter.fetch_order_history()
 
     assert result.exchange_account_id == "23"
@@ -62,24 +61,22 @@ async def test_order_history_uses_documented_bounded_pagination_and_account_bind
     assert len(result.orders) == 101
     assert result.orders[0].status.value == "PARTIALLY_FILLED"
     assert result.authoritative_reconciliation is False
-    assert [call.args[0] for call in adapter._get.await_args_list] == [
-        "/api/user/me",
+    assert [call.args[0] for call in adapter._get_with_params.await_args_list] == [
         "/api/order",
         "/api/order",
     ]
-    assert [call.kwargs["params"]["offset"] for call in adapter._get.await_args_list[1:]] == [0, 100]
+    assert [call.kwargs["params"]["offset"] for call in adapter._get_with_params.await_args_list] == [0, 100]
 
 
 @pytest.mark.asyncio
 async def test_order_history_rejects_duplicate_pages_from_nonadvancing_server():
     adapter = _adapter()
 
-    async def get(path, *, params=None):
-        if path == "/api/user/me":
-            return {"exchangeId": 23}
+    async def get_page(path, *, params=None):
         return {"list": [_order()], "count": 2}
 
-    adapter._get = AsyncMock(side_effect=get)
+    adapter._get = AsyncMock(return_value={"exchangeId": 23})
+    adapter._get_with_params = AsyncMock(side_effect=get_page)
     with pytest.raises(ValueError, match="duplicate IDs"):
         await adapter.fetch_order_history()
 
@@ -94,12 +91,11 @@ async def test_order_history_rejects_partial_page_and_count_drift():
         ]
     )
 
-    async def get(path, *, params=None):
-        if path == "/api/user/me":
-            return {"exchangeId": 23}
+    async def get_page(path, *, params=None):
         return next(responses)
 
-    adapter._get = AsyncMock(side_effect=get)
+    adapter._get = AsyncMock(return_value={"exchangeId": 23})
+    adapter._get_with_params = AsyncMock(side_effect=get_page)
     with pytest.raises(ValueError, match="empty"):
         await adapter.fetch_order_history()
 
@@ -112,11 +108,10 @@ async def test_order_history_rejects_partial_page_and_count_drift():
     )
 
     async def drift(path, *, params=None):
-        if path == "/api/user/me":
-            return {"exchangeId": 23}
         return next(responses)
 
-    adapter._get = AsyncMock(side_effect=drift)
+    adapter._get = AsyncMock(return_value={"exchangeId": 23})
+    adapter._get_with_params = AsyncMock(side_effect=drift)
     with pytest.raises(ValueError, match="count changed"):
         await adapter.fetch_order_history()
 
@@ -126,18 +121,20 @@ async def test_order_history_refuses_unbounded_count_and_wrong_account_rows():
     adapter = _adapter()
 
     async def over_limit(path, *, params=None):
-        return {"exchangeId": 23} if path == "/api/user/me" else {"list": [], "count": 10_001}
+        return {"list": [], "count": 10_001}
 
-    adapter._get = AsyncMock(side_effect=over_limit)
+    adapter._get = AsyncMock(return_value={"exchangeId": 23})
+    adapter._get_with_params = AsyncMock(side_effect=over_limit)
     with pytest.raises(ValueError, match="record bound"):
         await adapter.fetch_order_history()
 
     adapter = _adapter()
 
     async def wrong_account(path, *, params=None):
-        return {"exchangeId": 23} if path == "/api/user/me" else {"list": [_order(user="24")], "count": 1}
+        return {"list": [_order(user="24")], "count": 1}
 
-    adapter._get = AsyncMock(side_effect=wrong_account)
+    adapter._get = AsyncMock(return_value={"exchangeId": 23})
+    adapter._get_with_params = AsyncMock(side_effect=wrong_account)
     with pytest.raises(ValueError, match="authenticated account"):
         await adapter.fetch_order_history()
 
@@ -145,12 +142,8 @@ async def test_order_history_refuses_unbounded_count_and_wrong_account_rows():
 @pytest.mark.asyncio
 async def test_order_history_preserves_documented_terminal_statuses_and_rejects_bad_quantities():
     adapter = _adapter()
-    adapter._get = AsyncMock(
-        side_effect=[
-            {"exchangeId": 23},
-            {"list": [_order()], "count": 1},
-        ]
-    )
+    adapter._get = AsyncMock(return_value={"exchangeId": 23})
+    adapter._get_with_params = AsyncMock(return_value={"list": [_order()], "count": 1})
     first = await adapter.fetch_order_history()
     assert first.orders[0].status.value == "PARTIALLY_FILLED"
 
@@ -162,19 +155,22 @@ async def test_order_history_preserves_documented_terminal_statuses_and_rejects_
             "unFilledQuantity": "0.25",
             "filledAvgPrice": "0",
         }
-        adapter._get = AsyncMock(side_effect=[{"exchangeId": 23}, {"list": [terminal_order], "count": 1}])
+        adapter._get = AsyncMock(return_value={"exchangeId": 23})
+        adapter._get_with_params = AsyncMock(return_value={"list": [terminal_order], "count": 1})
         result = await adapter.fetch_order_history()
         assert result.orders[0].status.value == status
 
     adapter = _adapter()
     malformed_order = {**_order(), "unFilledQuantity": "0.3"}
-    adapter._get = AsyncMock(side_effect=[{"exchangeId": 23}, {"list": [malformed_order], "count": 1}])
+    adapter._get = AsyncMock(return_value={"exchangeId": 23})
+    adapter._get_with_params = AsyncMock(return_value={"list": [malformed_order], "count": 1})
     with pytest.raises(ValueError, match="inconsistent requested"):
         await adapter.fetch_order_history()
 
     adapter = _adapter()
     missing_average = {**_order(), "filledAvgPrice": "0"}
-    adapter._get = AsyncMock(side_effect=[{"exchangeId": 23}, {"list": [missing_average], "count": 1}])
+    adapter._get = AsyncMock(return_value={"exchangeId": 23})
+    adapter._get_with_params = AsyncMock(return_value={"list": [missing_average], "count": 1})
     with pytest.raises(ValueError, match="no positive average"):
         await adapter.fetch_order_history()
 
@@ -184,7 +180,8 @@ async def test_order_history_rejects_stale_nonadvancing_clock():
     adapter = _adapter()
     times = iter([NOW, datetime(2026, 10, 21, 11, 59, tzinfo=UTC)])
     adapter._clock = lambda: next(times)
-    adapter._get = AsyncMock(side_effect=[{"exchangeId": 23}, {"list": [_order()], "count": 1}])
+    adapter._get = AsyncMock(return_value={"exchangeId": 23})
+    adapter._get_with_params = AsyncMock(return_value={"list": [_order()], "count": 1})
     with pytest.raises(ValueError, match="clock moved backwards"):
         await adapter.fetch_order_history()
 
@@ -207,7 +204,8 @@ async def test_order_history_and_fills_require_fast_bounded_completion(monkeypat
 @pytest.mark.asyncio
 async def test_order_history_api_error_is_propagated_without_partial_read():
     adapter = _adapter()
-    adapter._get = AsyncMock(side_effect=[{"exchangeId": 23}, RuntimeError("synthetic HTTP 503")])
+    adapter._get = AsyncMock(return_value={"exchangeId": 23})
+    adapter._get_with_params = AsyncMock(side_effect=RuntimeError("synthetic HTTP 503"))
     with pytest.raises(RuntimeError, match="synthetic HTTP 503"):
         await adapter.fetch_order_history()
 
@@ -242,7 +240,7 @@ async def test_get_uses_existing_authenticated_http_session_and_documented_query
 
     monkeypatch.setattr(evedex.aiohttp, "ClientSession", FakeSession)
     adapter._bucket.acquire = AsyncMock()
-    payload = await adapter._get(
+    payload = await adapter._get_with_params(
         "/api/order",
         params={"version": 2, "limit": 100, "offset": 0},
     )
