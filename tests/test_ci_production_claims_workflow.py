@@ -79,7 +79,7 @@ class ClaimsWorkflowRegressionTests(unittest.TestCase):
             first["KAIROS_PRODUCTION_STATE_TEST_OPERATOR_WRITER_DSN"],
         )
         self.assertIn(
-            "risk-writer-ci-public-test-only",
+            "risk_writer_ci_public_test_only",
             first["KAIROS_PRODUCTION_STATE_TEST_RISK_WRITER_DSN"],
         )
         self.assertIn(
