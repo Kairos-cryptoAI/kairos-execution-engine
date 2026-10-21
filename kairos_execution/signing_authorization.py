@@ -66,7 +66,12 @@ class LiveOperatorStateV1(StrictRecord):
     command_sha256: Digest
     previous_command_sha256: Digest
 
-    _utc = field_validator("observed_at", "changed_at", "expires_at")(_aware)
+    _utc = field_validator("observed_at", "changed_at")(_aware)
+
+    @field_validator("expires_at")
+    @classmethod
+    def optional_expiry(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else _aware(value)
 
 
 class RiskGeometryV1(StrictRecord):

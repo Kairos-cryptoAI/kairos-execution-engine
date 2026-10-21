@@ -219,6 +219,23 @@ def test_exact_signed_owner_arm_claim_operator_and_risk_geometry_are_required():
     verifier.verify_request_at(request, binding, now=now)
 
 
+@pytest.mark.parametrize("state", ["DISARMED", "KILLED"])
+def test_inactive_operator_record_accepts_no_arm_or_expiry_and_refuses_entry(state):
+    verifier, request, binding, evidence, now = fixture()
+    operator = LiveOperatorStateV1.model_validate(
+        {
+            **evidence.operator.model_dump(),
+            "state": state,
+            "arm_nonce": None,
+            "arm_request_sha256": None,
+            "expires_at": None,
+        }
+    )
+    verifier._source.evidence = evidence.model_copy(update={"operator": operator})
+    with pytest.raises(ManagedSigningError, match="not armed"):
+        verifier.verify_request_at(request, binding, now=now)
+
+
 def test_unchanged_operator_command_allows_a_fresh_current_snapshot():
     verifier, request, binding, evidence, now = fixture()
     operator = evidence.operator.model_copy(update={"changed_at": now - timedelta(hours=1)})
