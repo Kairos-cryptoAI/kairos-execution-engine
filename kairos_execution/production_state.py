@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import json
 import re
+import traceback
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -57,6 +58,15 @@ _SQLSTATE_CODES = {
     "23514": "check_constraint",
     "42501": "privilege_denied",
 }
+_PYTHON_ERROR_CODES = {
+    "AttributeError": "python_attribute_error",
+    "TypeError": "python_type_error",
+    "ValueError": "python_value_error",
+    "TimeoutError": "python_timeout",
+}
+_PYTHON_DIAGNOSTIC_MODULES = frozenset(
+    {"production_state.py", "production_readiness.py", "signing_authorization.py"}
+)
 _SQL_GUARD_REASONS = {
     "operator observation must precede database clock": "operator_clock",
     "operator history must start DISARMED": "operator_initial_state",
@@ -269,6 +279,23 @@ def _sql_diagnostic(sqlstate: object, message: object) -> str:
         return "database_error"
     reason = _SQL_GUARD_REASONS.get(message) if type(message) is str else None
     return f"{sqlstate}/{reason or _SQLSTATE_CODES.get(sqlstate, 'database_error')}"
+
+
+def _python_diagnostic(exc: Exception) -> str:
+    """Return a fixed error class and allowlisted source basename/line only."""
+    code = _PYTHON_ERROR_CODES.get(type(exc).__name__, "unexpected_error")
+    frame = next(
+        (
+            item
+            for item in reversed(traceback.extract_tb(exc.__traceback__))
+            if item.filename.rsplit("/", 1)[-1].rsplit("\\", 1)[-1] in _PYTHON_DIAGNOSTIC_MODULES
+        ),
+        None,
+    )
+    if frame is None:
+        return code
+    filename = frame.filename.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    return f"{code}/{filename}:{frame.lineno}"
 
 
 def _role(value: str) -> str:
@@ -493,9 +520,10 @@ class _StateDB:
         except asyncpg.PostgresError as exc:
             diagnostic = _sql_diagnostic(exc.sqlstate, exc.message)
             raise ProductionStateError(f"production state append rejected [{diagnostic}]") from None
-        except Exception:
+        except Exception as exc:
+            safe_code = _python_diagnostic(exc)
             raise ProductionStateError(
-                "production state append outcome unavailable; do not retry blindly"
+                f"production state append outcome unavailable [{safe_code}]; do not retry blindly"
             ) from None
 
 

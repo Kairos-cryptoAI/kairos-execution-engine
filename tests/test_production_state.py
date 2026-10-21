@@ -14,6 +14,7 @@ from kairos_execution.production_state import (
     AsyncPostgresProductionSigningStateSource,
     ProductionStateError,
     _payload,
+    _python_diagnostic,
     _sql_diagnostic,
     _validate_snapshot_clock,
     provision_production_state_schema,
@@ -114,3 +115,10 @@ def test_database_write_diagnostic_uses_only_whitelisted_sqlstate_tokens():
         "23505/unique_constraint"
     )
     assert _sql_diagnostic("not-a-state", "private database detail") == "database_error"
+
+
+def test_non_database_diagnostic_never_returns_exception_text():
+    try:
+        raise ValueError("synthetic private detail")
+    except ValueError as exc:
+        assert _python_diagnostic(exc) == "python_value_error"
