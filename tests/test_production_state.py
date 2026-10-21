@@ -4,6 +4,7 @@ These tests use synthetic records only; native database acceptance lives in the
 opt-in isolated PostgreSQL integration test.
 """
 
+import json
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
@@ -13,6 +14,7 @@ from kairos_execution.production_readiness import ProductionContextV1
 from kairos_execution.production_state import (
     AsyncPostgresProductionSigningStateSource,
     ProductionStateError,
+    _parse_json_model,
     _payload,
     _python_diagnostic,
     _sql_diagnostic,
@@ -122,3 +124,17 @@ def test_non_database_diagnostic_never_returns_exception_text():
         raise ValueError("synthetic private detail")
     except ValueError as exc:
         assert _python_diagnostic(exc) == "python_value_error"
+
+
+def test_database_json_payload_uses_strict_json_mode_for_timestamps():
+    _, _, _, evidence, _ = fixture(operation="Position close order")
+    records = (
+        ("owner arm", evidence.owner_arm),
+        ("risk decision", evidence.risk),
+        ("exposure snapshot", evidence.exposure),
+        ("operator observation", evidence.operator),
+    )
+    for label, record in records:
+        encoded = json.dumps(record.model_dump(mode="json"), separators=(",", ":"))
+        restored = _parse_json_model(encoded, type(record), label)
+        assert restored == record

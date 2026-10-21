@@ -322,6 +322,19 @@ def _payload(model: Any) -> tuple[dict[str, Any], str]:
     return data, hashlib.sha256(encoded).hexdigest()
 
 
+def _parse_json_model(payload: Any, model_type: Any, label: str) -> Any:
+    if isinstance(payload, str):
+        encoded = payload
+    elif isinstance(payload, dict):
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    else:
+        raise ProductionStateError(f"stored {label} payload is not JSON")
+    try:
+        return model_type.model_validate_json(encoded)
+    except Exception:
+        raise ProductionStateError(f"stored {label} payload is invalid") from None
+
+
 def _validate_snapshot_clock(
     *, started_at: datetime, resolved_at: datetime, checked_at: datetime, max_age: timedelta
 ) -> None:
@@ -580,10 +593,7 @@ class PostgresOperatorStateWriter(_StateDB):
                 if state.state != "DISARMED":
                     raise ProductionStateError("operator history must start with an explicit DISARMED state")
             else:
-                prior_payload = latest["payload"]
-                if isinstance(prior_payload, str):
-                    prior_payload = json.loads(prior_payload)
-                prior = LiveOperatorStateV1.model_validate(prior_payload)
+                prior = _parse_json_model(latest["payload"], LiveOperatorStateV1, "operator observation")
                 if state.observed_at <= prior.observed_at:
                     raise ProductionStateError("operator observation time must increase monotonically")
                 if state.version == prior.version:
@@ -833,7 +843,7 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
             request_digest,
         )
         arm_data = self._verified_payload(arm_row, SignedManualArmRequestV1, "owner arm")
-        owner_arm = SignedManualArmRequestV1.model_validate(arm_data)
+        owner_arm = arm_data
         if owner_arm.request.context != self.context or canonical_digest(owner_arm.request) != request_digest:
             raise ProductionStateError("stored owner arm context/request binding mismatch")
         if (
@@ -880,7 +890,7 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
             ):
                 raise ProductionStateError("latest operator observation is ambiguous")
             operator_data = self._verified_payload(operator_row, LiveOperatorStateV1, "operator observation")
-            operator = LiveOperatorStateV1.model_validate(operator_data)
+            operator = operator_data
             if (
                 operator.context != self.context
                 or operator.version != operator_row["version"]
@@ -895,7 +905,7 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
             request.request_id,
         )
         risk_data = self._verified_payload(risk_row, RiskGeometryV1, "risk decision")
-        risk = RiskGeometryV1.model_validate(risk_data)
+        risk = risk_data
         if (
             risk.context != self.context
             or risk.signing_request_id != request.request_id
@@ -933,7 +943,7 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
                 exposure_data = self._verified_payload(
                     exposure_row, ExposureSnapshotV1, "exposure observation"
                 )
-                exposure = ExposureSnapshotV1.model_validate(exposure_data)
+                exposure = exposure_data
                 if (
                     exposure.context != self.context
                     or exposure.instrument != instrument
@@ -962,16 +972,11 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
         )
 
     @staticmethod
-    def _verified_payload(row: asyncpg.Record | None, model_type: Any, label: str) -> dict[str, Any]:
+    def _verified_payload(row: asyncpg.Record | None, model_type: Any, label: str) -> Any:
         if row is None:
             raise ProductionStateError(f"authoritative {label} is absent")
-        payload = row["payload"]
-        if isinstance(payload, str):
-            payload = json.loads(payload)
-        if not isinstance(payload, dict):
-            raise ProductionStateError(f"authoritative {label} payload is invalid")
-        model = model_type.model_validate(payload)
+        model = _parse_json_model(row["payload"], model_type, label)
         _, digest = _payload(model)
         if not _DIGEST_PATTERN.fullmatch(row["payload_sha256"]) or digest != row["payload_sha256"]:
             raise ProductionStateError(f"authoritative {label} payload integrity mismatch")
-        return model.model_dump(mode="json")
+        return model
