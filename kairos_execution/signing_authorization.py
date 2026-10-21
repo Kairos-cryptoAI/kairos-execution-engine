@@ -245,6 +245,24 @@ class ProductionSigningAuthorizationVerifier:
         self._verify_evidence(request, binding, evidence, now=now)
 
     async def verify_request_async(self, request: ManagedSigningRequestV1, binding: CustodyBindingV1) -> None:
+        await self._resolve_verify_async(request, binding)
+
+    async def verify_effect_async(
+        self,
+        request: ManagedSigningRequestV1,
+        binding: CustodyBindingV1,
+        *,
+        decision_id: str,
+        effect_id: str,
+    ) -> None:
+        """Bind a wire envelope to the freshly resolved authoritative decision."""
+        evidence = await self._resolve_verify_async(request, binding)
+        if evidence.risk.decision_id != decision_id or evidence.risk.effect_id != effect_id:
+            raise ManagedSigningError("wire effect differs from the authoritative risk decision")
+
+    async def _resolve_verify_async(
+        self, request: ManagedSigningRequestV1, binding: CustodyBindingV1
+    ) -> ProductionSigningEvidenceV1:
         """Read native async state under the signer's single end-to-end deadline.
 
         Recheck the clock after I/O: neither a slow read nor an expired lease may
@@ -265,9 +283,9 @@ class ProductionSigningAuthorizationVerifier:
             if checked_at < now:
                 raise ManagedSigningError("authorization clock moved backwards")
             request, binding = self._validate_scope(request, binding, now=checked_at)
-            self._verify_evidence(
-                request, binding, ProductionSigningEvidenceV1.model_validate(evidence), now=checked_at
-            )
+            evidence = ProductionSigningEvidenceV1.model_validate(evidence)
+            self._verify_evidence(request, binding, evidence, now=checked_at)
+            return evidence
         except ManagedSigningError:
             raise
         except Exception:
@@ -429,7 +447,17 @@ class ProductionSigningAuthorizationVerifier:
         if exposure.instrument != message["instrument"]:
             raise ManagedSigningError("exit instrument differs from authoritative exposure")
         exit_side = "SELL" if exposure.position_side == "BUY" else "BUY"
-        if risk.side != exit_side or (message.get("side") is not None and message["side"] != exit_side):
+        # EVEDEX TP/SL identifies the position being protected. It is not an
+        # additive BUY/SELL order: using the close-order side here would protect
+        # the opposite position. A direct close still requires the reducing side.
+        required_side = (
+            exposure.position_side if request.operation == "New take-profit/stop-loss" else exit_side
+        )
+        if risk.side != required_side or (
+            message.get("side") is not None and message["side"] != required_side
+        ):
+            if request.operation == "New take-profit/stop-loss":
+                raise ManagedSigningError("protection side differs from the protected position side")
             raise ManagedSigningError("exit side is not the reducing side for authoritative exposure")
         quantity = message["quantity"]
         if quantity <= 0 or quantity > exposure.remaining_quantity:

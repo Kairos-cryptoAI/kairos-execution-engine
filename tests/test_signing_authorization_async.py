@@ -67,6 +67,22 @@ async def test_async_source_error_is_sanitized():
 
 
 @pytest.mark.asyncio
+async def test_wire_effect_must_resolve_the_exact_current_risk_identity():
+    verifier, request, binding, evidence, now = fixture()
+    verifier._source = AsyncSource(evidence)
+    verifier._clock = lambda: now
+    await verifier.verify_effect_async(
+        request, binding, decision_id=evidence.risk.decision_id, effect_id=evidence.risk.effect_id
+    )
+    for decision_id, effect_id in (
+        ("guessed-decision", evidence.risk.effect_id),
+        (evidence.risk.decision_id, "0" * 64),
+    ):
+        with pytest.raises(ManagedSigningError, match="wire effect differs"):
+            await verifier.verify_effect_async(request, binding, decision_id=decision_id, effect_id=effect_id)
+
+
+@pytest.mark.asyncio
 async def test_signer_awaits_authorization_before_claim_and_does_not_block_loop():
     signer, request, backend, _, _ = setup_signer()
     claims, db = claims_fixture(context=request.context)

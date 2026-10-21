@@ -123,7 +123,7 @@ def fixture(operation="New limit order"):
         geometry = {
             "instrument": "BTCUSD",
             "type": "stop-loss",
-            "side": "SELL",
+            "side": "BUY",
             "quantity": 3,
             "price": 9000,
             "order": PARENT_ID,
@@ -169,7 +169,7 @@ def fixture(operation="New limit order"):
             client_order_id=geometry.get("id"),
             operation=operation,
             instrument="BTCUSD",
-            side="SELL" if operation != "New limit order" else "BUY",
+            side=geometry.get("side", "SELL"),
             quantity=geometry.get("quantity", 100),
             cash_quantity=None,
             price=geometry.get("limitPrice", geometry.get("price")),
@@ -318,6 +318,29 @@ def test_protective_exit_is_independent_of_entry_arm_but_bounded_by_exposure():
         verifier.verify_request_at(request, binding, now=now)
 
 
+@pytest.mark.parametrize("position_side", ["BUY", "SELL"])
+def test_protection_side_is_the_position_side_not_the_closing_order_side(position_side):
+    verifier, request, binding, evidence, now = fixture("New take-profit/stop-loss")
+    message = json.loads(request.message_json)
+    message["side"] = position_side
+    request = request.model_copy(update={"message_json": json.dumps(message)})
+    risk = evidence.risk.model_copy(
+        update={
+            "side": position_side,
+            "effect_id": signing_effect_id(
+                request=request, message=message, decision_id=evidence.risk.decision_id
+            ),
+        }
+    )
+    exposure = evidence.exposure.model_copy(update={"position_side": position_side})
+    verifier._source.evidence = evidence.model_copy(update={"risk": risk, "exposure": exposure})
+    verifier.verify_request_at(request, binding, now=now)
+    exposure = exposure.model_copy(update={"position_side": "SELL" if position_side == "BUY" else "BUY"})
+    verifier._source.evidence = evidence.model_copy(update={"risk": risk, "exposure": exposure})
+    with pytest.raises(ManagedSigningError, match="protected position side"):
+        verifier.verify_request_at(request, binding, now=now)
+
+
 def test_exit_signing_deadline_must_not_outlive_exposure_lease():
     verifier, request, binding, evidence, now = fixture("New take-profit/stop-loss")
     exposure = evidence.exposure.model_copy(
@@ -347,7 +370,7 @@ def test_position_close_is_independent_of_arm_and_requires_reducing_risk_side():
         verifier.verify_request_at(request, binding, now=now)
 
 
-def test_protective_exit_refuses_wrong_parent_or_additive_side():
+def test_protective_exit_refuses_wrong_parent_or_wrong_protected_position_side():
     verifier, request, binding, evidence, now = fixture("New take-profit/stop-loss")
     wrong_parent = evidence.model_copy(
         update={"exposure": evidence.exposure.model_copy(update={"parent_order_id": "other-parent"})}
@@ -360,7 +383,7 @@ def test_protective_exit_refuses_wrong_parent_or_additive_side():
         update={"exposure": evidence.exposure.model_copy(update={"position_side": "SELL"})}
     )
     verifier._source.evidence = wrong_side
-    with pytest.raises(ManagedSigningError, match="reducing side"):
+    with pytest.raises(ManagedSigningError, match="protected position side"):
         verifier.verify_request_at(request, binding, now=now)
 
 
