@@ -44,16 +44,31 @@ class SyntheticStateSource:
 
     def __init__(self, evidence):
         self.evidence = evidence
+        self.reservations = []
 
     def resolve_signing_evidence(self, *, request, binding, now):
         return self.evidence
 
+    async def reserve_entry_async(self, **kwargs):
+        # Synthetic verifier tests only; the native source owns durable gates.
+        del kwargs
 
-def fixture(operation="New limit order"):
+    def reserve_entry(self, **kwargs):
+        # Synthetic verifier tests only; the native source owns durable gates.
+        self.reservations.append(kwargs)
+
+
+def fixture(
+    operation="New limit order",
+    *,
+    remote_account_id="prod-account",
+    adaptive_system_id="adaptive-v1",
+    nonce="owner-nonce-1",
+):
     now = datetime.now(UTC).replace(microsecond=0)
     context = ProductionContextV1(
-        remote_account_id="prod-account",
-        adaptive_system_id="adaptive-v1",
+        remote_account_id=remote_account_id,
+        adaptive_system_id=adaptive_system_id,
         frozen_policy_sha256="b" * 64,
         source_set_sha256="c" * 64,
     )
@@ -79,7 +94,7 @@ def fixture(operation="New limit order"):
     arm = ManualArmRequestV1(
         context=context,
         preconditions_sha256=canonical_digest(preconditions),
-        nonce="owner-nonce-1",
+        nonce=nonce,
         owner_identity="owner",
         created_at=now - timedelta(seconds=1),
         expires_at=now + timedelta(minutes=5),
@@ -217,6 +232,20 @@ def fixture(operation="New limit order"):
 def test_exact_signed_owner_arm_claim_operator_and_risk_geometry_are_required():
     verifier, request, binding, _, now = fixture()
     verifier.verify_request_at(request, binding, now=now)
+    assert len(verifier._source.reservations) == 1
+
+
+def test_sync_entry_refuses_source_without_durable_reservation_before_signing():
+    verifier, request, binding, evidence, now = fixture()
+
+    class ReadOnlySource:
+        def resolve_signing_evidence(self, *, request, binding, now):
+            del request, binding, now
+            return evidence
+
+    verifier._source = ReadOnlySource()
+    with pytest.raises(ManagedSigningError, match="reservation source is absent"):
+        verifier.verify_request_at(request, binding, now=now)
 
 
 @pytest.mark.parametrize("state", ["DISARMED", "KILLED"])

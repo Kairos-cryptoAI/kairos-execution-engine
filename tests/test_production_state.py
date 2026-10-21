@@ -12,8 +12,11 @@ import pytest
 
 from kairos_execution.production_readiness import ProductionContextV1
 from kairos_execution.production_state import (
+    SCHEMA_VERSION,
     AsyncPostgresProductionSigningStateSource,
     ProductionStateError,
+    _account_scope_sha256,
+    _entry_notional_usd,
     _parse_json_model,
     _payload,
     _python_diagnostic,
@@ -73,6 +76,34 @@ def test_production_context_payload_digest_is_deterministic():
     second = _payload(context.model_copy())
     assert first == second
     assert len(first[1]) == 64
+
+
+def test_reservation_scope_spans_policy_contexts_but_separates_accounts():
+    context = ProductionContextV1(
+        remote_account_id="synthetic-account",
+        adaptive_system_id="synthetic-adaptive-a",
+        frozen_policy_sha256="b" * 64,
+        source_set_sha256="c" * 64,
+    )
+    same_account_other_policy = context.model_copy(
+        update={"adaptive_system_id": "synthetic-adaptive-b", "frozen_policy_sha256": "d" * 64}
+    )
+    other_account = context.model_copy(update={"remote_account_id": "synthetic-account-2"})
+    assert _account_scope_sha256(context) == _account_scope_sha256(same_account_other_policy)
+    assert _account_scope_sha256(context) != _account_scope_sha256(other_account)
+    assert SCHEMA_VERSION == 2
+
+
+def test_reservation_notional_is_exact_decimal_and_rejects_boolean_or_float_amounts():
+    assert _entry_notional_usd({"quantity": 10**8, "limitPrice": 2 * 10**8}) == 2
+    assert _entry_notional_usd({"cashQuantity": 275_000_000}) == 2.75
+    for malformed in (
+        {"quantity": True, "limitPrice": 10**8},
+        {"quantity": 10**8, "price": 1.5},
+        {"cashQuantity": True},
+    ):
+        with pytest.raises(ProductionStateError):
+            _entry_notional_usd(malformed)
 
 
 def test_source_rejects_longer_than_five_second_freshness_contract():

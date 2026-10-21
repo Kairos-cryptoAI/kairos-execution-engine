@@ -21,6 +21,11 @@ class AsyncSource:
         await asyncio.sleep(0)
         return self.evidence
 
+    async def reserve_entry_async(self, **kwargs):
+        # Synthetic policy tests only; native persistence coverage exercises
+        # the transaction-backed reservation implementation.
+        del kwargs
+
 
 @pytest.mark.asyncio
 async def test_async_policy_uses_native_source_and_retains_exact_policy():

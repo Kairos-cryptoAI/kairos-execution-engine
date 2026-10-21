@@ -1,12 +1,14 @@
-"""Async read-only production signing evidence source and role-scoped appenders.
+"""Async production signing evidence source, durable reservations and appenders.
 
 This module is a persistence boundary, not a LIVE enablement switch. Provisioning
 is explicit and owner-only. Runtime reads require the exact isolated evidence
 database and claims identity; upstream writers use separate PostgreSQL roles
-for operator/owner-arm, risk and exposure records.
-Risk decisions remain unqualified until an independent risk service atomically
-reserves account-scoped pending risk/notional; this store does not compute or
-invent those totals.
+for operator/owner-arm, risk and exposure records. Entry signing now commits an
+exact-decimal account-scoped risk/notional reservation before any signing claim
+or custody callback. Reservations are immutable and are never released by
+expiry or local outcomes; only a future authoritative venue reconciler may add
+that lifecycle. One isolated production-state database is required per venue
+account so policy/system contexts share the same account reservation ledger.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import re
 import traceback
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -46,6 +49,7 @@ from .signing_authorization import (
 )
 
 SCHEMA = "kairos_production_state_v1"
+SCHEMA_VERSION = 2
 _ROLE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,62}\Z")
 _ID_PATTERN = re.compile(r"[A-Za-z0-9_.:-]{1,160}\Z")
 _DIGEST_PATTERN = re.compile(r"[a-f0-9]{64}\Z")
@@ -86,8 +90,8 @@ REVOKE ALL ON SCHEMA kairos_production_state_v1 FROM PUBLIC;
 CREATE TABLE kairos_production_state_v1.identity (
  singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
  database_uuid uuid NOT NULL, policy_namespace text NOT NULL,
- context_sha256 text NOT NULL CHECK(context_sha256 ~ '^[a-f0-9]{64}$'),
- schema_version integer NOT NULL CHECK(schema_version=1),
+ account_sha256 text NOT NULL CHECK(account_sha256 ~ '^[a-f0-9]{64}$'),
+ schema_version integer NOT NULL CHECK(schema_version=2),
  owner_role name NOT NULL, runtime_role name NOT NULL,
  operator_writer_role name NOT NULL, risk_writer_role name NOT NULL,
  exposure_writer_role name NOT NULL
@@ -137,6 +141,41 @@ CREATE TABLE kairos_production_state_v1.risk_decisions (
  CHECK((payload->>'observed_at')::timestamptz=observed_at),
  CHECK((payload->>'valid_until')::timestamptz=valid_until)
 );
+-- Entry reservations are irrevocable in this schema version. There is no
+-- release path until a separately reviewed venue reconciliation can bind an
+-- authoritative terminal outcome to this exact effect. Unknown outcomes
+-- therefore remain in every subsequent account-cap calculation.
+CREATE TABLE kairos_production_state_v1.risk_reservations (
+ context_sha256 text NOT NULL CHECK(context_sha256 ~ '^[a-f0-9]{64}$'),
+ account_sha256 text NOT NULL CHECK(account_sha256 ~ '^[a-f0-9]{64}$'),
+ effect_id text NOT NULL CHECK(effect_id ~ '^[a-f0-9]{64}$'),
+ signing_request_id text NOT NULL CHECK(length(signing_request_id) BETWEEN 1 AND 160),
+ decision_id text NOT NULL CHECK(length(decision_id) BETWEEN 1 AND 160),
+ owner_arm_sha256 text NOT NULL CHECK(owner_arm_sha256 ~ '^[a-f0-9]{64}$'),
+ observed_at timestamptz NOT NULL,
+ risk_usd numeric NOT NULL CHECK(risk_usd > 0 AND risk_usd < 'Infinity'::numeric),
+ notional_usd numeric NOT NULL CHECK(notional_usd > 0 AND notional_usd < 'Infinity'::numeric),
+ account_equity_usd numeric NOT NULL CHECK(
+  account_equity_usd > 0 AND account_equity_usd < 'Infinity'::numeric),
+ daily_realized_loss_usd numeric NOT NULL CHECK(
+  daily_realized_loss_usd >= 0 AND daily_realized_loss_usd < 'Infinity'::numeric),
+ aggregate_open_risk_usd numeric NOT NULL CHECK(
+  aggregate_open_risk_usd >= 0 AND aggregate_open_risk_usd < 'Infinity'::numeric),
+ aggregate_open_notional_usd numeric NOT NULL CHECK(
+  aggregate_open_notional_usd >= 0 AND aggregate_open_notional_usd < 'Infinity'::numeric),
+ dollar_cap numeric NOT NULL CHECK(dollar_cap > 0 AND dollar_cap < 'Infinity'::numeric),
+ daily_stop_loss_usd numeric NOT NULL CHECK(
+  daily_stop_loss_usd > 0 AND daily_stop_loss_usd < 'Infinity'::numeric),
+ evidence_sha256 text NOT NULL CHECK(evidence_sha256 ~ '^[a-f0-9]{64}$'),
+ request_sha256 text NOT NULL CHECK(request_sha256 ~ '^[a-f0-9]{64}$'),
+ reserved_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+ PRIMARY KEY(account_sha256,effect_id),
+ UNIQUE(account_sha256,signing_request_id),
+ FOREIGN KEY(context_sha256,signing_request_id)
+  REFERENCES kairos_production_state_v1.risk_decisions(context_sha256,signing_request_id)
+);
+CREATE INDEX risk_reservations_account_totals
+ ON kairos_production_state_v1.risk_reservations(account_sha256,context_sha256);
 CREATE TABLE kairos_production_state_v1.exposure_observations (
  context_sha256 text NOT NULL CHECK(context_sha256 ~ '^[a-f0-9]{64}$'),
  observation_id uuid NOT NULL,
@@ -167,6 +206,88 @@ CREATE TRIGGER operator_observations_immutable BEFORE UPDATE OR DELETE
  FOR EACH ROW EXECUTE FUNCTION kairos_production_state_v1.reject_mutation();
 CREATE TRIGGER risk_decisions_immutable BEFORE UPDATE OR DELETE ON kairos_production_state_v1.risk_decisions
  FOR EACH ROW EXECUTE FUNCTION kairos_production_state_v1.reject_mutation();
+CREATE TRIGGER risk_reservations_immutable BEFORE UPDATE OR DELETE
+ ON kairos_production_state_v1.risk_reservations
+ FOR EACH ROW EXECUTE FUNCTION kairos_production_state_v1.reject_mutation();
+CREATE FUNCTION kairos_production_state_v1.enforce_risk_reservation() RETURNS trigger
+ LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+ DECLARE account_scope text; risk_row record; arm_payload jsonb; arm_cap numeric; arm_daily numeric;
+  prior record; base_risk numeric; base_notional numeric; daily_loss numeric;
+  account_equity numeric; dollar_limit numeric; daily_limit numeric; expected_notional numeric;
+  now_at timestamptz;
+ BEGIN
+  PERFORM pg_advisory_xact_lock(hashtextextended('risk-reservation:'||NEW.account_sha256,0));
+  SELECT identity.account_sha256 INTO account_scope
+   FROM kairos_production_state_v1.identity identity WHERE singleton=true;
+  IF account_scope IS NULL OR account_scope<>NEW.account_sha256 THEN
+   RAISE EXCEPTION 'reservation account scope mismatch';
+  END IF;
+  now_at := clock_timestamp();
+  SELECT decision_id,observed_at,valid_until,payload_sha256,payload INTO risk_row
+   FROM kairos_production_state_v1.risk_decisions
+   WHERE context_sha256=NEW.context_sha256 AND signing_request_id=NEW.signing_request_id;
+  IF risk_row IS NULL OR risk_row.decision_id<>NEW.decision_id
+   OR risk_row.observed_at<>NEW.observed_at OR risk_row.payload_sha256<>NEW.evidence_sha256
+   OR risk_row.payload->>'effect_id'<>NEW.effect_id
+   OR (risk_row.payload->>'worst_case_loss_usd')::numeric<>NEW.risk_usd
+   OR (risk_row.payload->>'account_equity_usd')::numeric<>NEW.account_equity_usd
+   OR (risk_row.payload->>'daily_realized_loss_usd')::numeric<>NEW.daily_realized_loss_usd
+   OR (risk_row.payload->>'aggregate_open_risk_usd')::numeric<>NEW.aggregate_open_risk_usd
+   OR (risk_row.payload->>'aggregate_open_notional_usd')::numeric<>NEW.aggregate_open_notional_usd
+   OR (risk_row.payload->>'leverage')::integer<>1
+   OR risk_row.payload->>'approved' IS DISTINCT FROM 'true' THEN
+   RAISE EXCEPTION 'reservation differs from exact risk decision';
+  END IF;
+  IF risk_row.payload->>'cash_quantity' IS NOT NULL THEN
+   expected_notional := (risk_row.payload->>'cash_quantity')::numeric/100000000;
+  ELSE
+   IF risk_row.payload->>'price' IS NULL THEN
+    RAISE EXCEPTION 'risk decision lacks exact entry price';
+   END IF;
+   expected_notional := (risk_row.payload->>'quantity')::numeric
+    *(risk_row.payload->>'price')::numeric/10000000000000000;
+  END IF;
+  IF expected_notional<>NEW.notional_usd OR risk_row.valid_until<=now_at
+   OR risk_row.observed_at>=now_at
+   OR now_at-risk_row.observed_at>interval '5 seconds' THEN
+   RAISE EXCEPTION 'reservation notional or evidence lease is invalid';
+  END IF;
+  SELECT payload INTO arm_payload FROM kairos_production_state_v1.owner_arms
+   WHERE context_sha256=NEW.context_sha256 AND request_sha256=NEW.owner_arm_sha256;
+  IF arm_payload IS NULL THEN RAISE EXCEPTION 'reservation owner arm is absent'; END IF;
+  arm_cap := (arm_payload->'request'->>'dollar_cap')::numeric;
+  arm_daily := (arm_payload->'request'->>'daily_stop_loss_usd')::numeric;
+  IF arm_cap<>NEW.dollar_cap OR arm_daily<>NEW.daily_stop_loss_usd
+   OR (arm_payload->'request'->>'expires_at')::timestamptz<=now_at THEN
+   RAISE EXCEPTION 'reservation owner limits changed or expired';
+  END IF;
+  SELECT coalesce(sum(risk_usd),0) AS risk_usd,
+   coalesce(sum(notional_usd),0) AS notional_usd,
+   max(aggregate_open_risk_usd) AS base_risk,
+   max(aggregate_open_notional_usd) AS base_notional,
+   max(daily_realized_loss_usd) AS daily_realized,
+   min(account_equity_usd) AS account_equity,
+   min(dollar_cap) AS dollar_cap,
+   min(daily_stop_loss_usd) AS daily_stop
+   INTO prior FROM kairos_production_state_v1.risk_reservations
+   WHERE account_sha256=NEW.account_sha256;
+  base_risk := greatest(NEW.aggregate_open_risk_usd,coalesce(prior.base_risk,0));
+  base_notional := greatest(NEW.aggregate_open_notional_usd,coalesce(prior.base_notional,0));
+  daily_loss := greatest(NEW.daily_realized_loss_usd,coalesce(prior.daily_realized,0));
+  account_equity := least(NEW.account_equity_usd,coalesce(prior.account_equity,NEW.account_equity_usd));
+  dollar_limit := least(NEW.dollar_cap,coalesce(prior.dollar_cap,NEW.dollar_cap));
+  daily_limit := least(NEW.daily_stop_loss_usd,coalesce(prior.daily_stop,NEW.daily_stop_loss_usd));
+  IF NEW.risk_usd>dollar_limit OR NEW.risk_usd>account_equity*0.0025
+   OR base_risk+prior.risk_usd+NEW.risk_usd>account_equity*0.01
+   OR daily_loss+prior.risk_usd+NEW.risk_usd>daily_limit
+   OR base_notional+prior.notional_usd+NEW.notional_usd>dollar_limit THEN
+   RAISE EXCEPTION 'account risk reservation exceeds cap';
+  END IF;
+  RETURN NEW;
+ END $$;
+CREATE TRIGGER risk_reservation_guard BEFORE INSERT
+ ON kairos_production_state_v1.risk_reservations
+ FOR EACH ROW EXECUTE FUNCTION kairos_production_state_v1.enforce_risk_reservation();
 CREATE TRIGGER exposure_observations_immutable BEFORE UPDATE OR DELETE
  ON kairos_production_state_v1.exposure_observations
  FOR EACH ROW EXECUTE FUNCTION kairos_production_state_v1.reject_mutation();
@@ -256,7 +377,14 @@ REVOKE ALL ON ALL TABLES IN SCHEMA kairos_production_state_v1 FROM PUBLIC;
 REVOKE ALL ON ALL FUNCTIONS IN SCHEMA kairos_production_state_v1 FROM PUBLIC;
 """
 
-_TABLES = ("identity", "owner_arms", "operator_observations", "risk_decisions", "exposure_observations")
+_TABLES = (
+    "identity",
+    "owner_arms",
+    "operator_observations",
+    "risk_decisions",
+    "risk_reservations",
+    "exposure_observations",
+)
 _WRITER_TABLES = {
     "operator_writer_role": frozenset({"owner_arms", "operator_observations"}),
     "risk_writer_role": frozenset({"risk_decisions"}),
@@ -314,6 +442,48 @@ def _digest(value: str) -> str:
     if type(value) is not str or _DIGEST_PATTERN.fullmatch(value) is None:
         raise ProductionStateError("invalid production state digest")
     return value
+
+
+def _account_scope_sha256(context: ProductionContextV1) -> str:
+    """Identify an account across instruments and policy/system revisions."""
+    payload = {
+        "environment": context.environment,
+        "exchange": context.exchange,
+        "remote_account_id": context.remote_account_id,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _account_reservation_lock(context: ProductionContextV1) -> str:
+    return "risk-reservation:" + _account_scope_sha256(context)
+
+
+def _decimal_text(value: Decimal) -> str:
+    if not isinstance(value, Decimal) or not value.is_finite():
+        raise ProductionStateError("risk reservation amount must be an exact finite decimal")
+    return format(value, "f")
+
+
+def _canonical_json_digest(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _entry_notional_usd(message: dict[str, Any]) -> Decimal:
+    if "cashQuantity" in message:
+        amount = message["cashQuantity"]
+        if type(amount) is not int or amount <= 0:
+            raise ProductionStateError("entry cash notional is not an exact positive integer")
+        return Decimal(amount) / Decimal(10**8)
+    quantity = message.get("quantity")
+    price = message.get("limitPrice", message.get("price"))
+    if type(quantity) is not int or quantity <= 0 or type(price) is not int or price <= 0:
+        raise ProductionStateError("entry quantity/price notional is not exact")
+    notional = Decimal(quantity) * Decimal(price) / Decimal(10**16)
+    if notional <= 0 or not notional.is_finite():
+        raise ProductionStateError("entry notional is outside the exact positive range")
+    return notional
 
 
 def _payload(model: Any) -> tuple[dict[str, Any], str]:
@@ -413,10 +583,11 @@ async def provision_production_state_schema(
     async with connection.transaction():
         await connection.execute(DDL)
         await connection.execute(
-            "INSERT INTO kairos_production_state_v1.identity VALUES(true,$1,$2,$3,1,$4,$5,$6,$7,$8)",
+            "INSERT INTO kairos_production_state_v1.identity VALUES(true,$1,$2,$3,$4,$5,$6,$7,$8,$9)",
             database_uuid,
             policy_namespace,
-            canonical_digest(context),
+            _account_scope_sha256(context),
+            SCHEMA_VERSION,
             owner_role,
             runtime_role,
             operator_writer_role,
@@ -433,6 +604,7 @@ async def provision_production_state_schema(
             await connection.execute(f'GRANT SELECT ON {select_names} TO "{writer}"')
             table_names = ",".join(f"{SCHEMA}.{table}" for table in sorted(table_set))
             await connection.execute(f'GRANT INSERT ON {table_names} TO "{writer}"')
+        await connection.execute(f'GRANT INSERT ON {SCHEMA}.risk_reservations TO "{roles["runtime_role"]}"')
 
 
 class _StateDB:
@@ -468,8 +640,8 @@ class _StateDB:
         expected_columns = {
             "database_uuid": self.database_uuid,
             "policy_namespace": self.policy_namespace,
-            "context_sha256": self.context_sha256,
-            "schema_version": 1,
+            "account_sha256": _account_scope_sha256(self.context),
+            "schema_version": SCHEMA_VERSION,
             self.role_field: self.expected_role,
         }
         if identity is None or any(identity[key] != value for key, value in expected_columns.items()):
@@ -486,7 +658,11 @@ class _StateDB:
         if schema_owner != owner:
             raise ProductionStateError("production state schema ownership mismatch")
 
-        allowed_tables = _WRITER_TABLES.get(self.role_field, frozenset())
+        allowed_tables = (
+            frozenset({"risk_reservations"})
+            if self.role_field == "runtime_role"
+            else _WRITER_TABLES.get(self.role_field, frozenset())
+        )
         for table in _TABLES:
             name = f"{SCHEMA}.{table}"
             table_owner = await connection.fetchval(
@@ -554,6 +730,12 @@ class PostgresOperatorStateWriter(_StateDB):
         request_sha = canonical_digest(signed_arm.request)
 
         async def append(connection: asyncpg.Connection) -> None:
+            # Owner-arm changes and reservations serialize for the same
+            # account. Operator transitions acquire this lock as well.
+            await connection.fetchval(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                _account_reservation_lock(self.context),
+            )
             await connection.execute(
                 "INSERT INTO kairos_production_state_v1.owner_arms "
                 "(context_sha256,request_sha256,owner_identity,nonce,observed_at,payload,payload_sha256) "
@@ -577,6 +759,10 @@ class PostgresOperatorStateWriter(_StateDB):
         observation_id = uuid4()
 
         async def append(connection: asyncpg.Connection) -> None:
+            await connection.fetchval(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                _account_reservation_lock(self.context),
+            )
             await connection.fetchval(
                 "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
                 f"operator:{self.context_sha256}",
@@ -638,6 +824,10 @@ class PostgresRiskStateWriter(_StateDB):
         data, payload_sha = _payload(risk)
 
         async def append(connection: asyncpg.Connection) -> None:
+            await connection.fetchval(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                _account_reservation_lock(self.context),
+            )
             await connection.execute(
                 "INSERT INTO kairos_production_state_v1.risk_decisions "
                 "(context_sha256,signing_request_id,decision_id,observed_at,valid_until,payload,"
@@ -794,6 +984,269 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
             raise
         except Exception:
             raise ProductionStateError("authoritative production signing state is unavailable") from None
+
+    async def reserve_entry_async(
+        self,
+        *,
+        request: ManagedSigningRequestV1,
+        binding: CustodyBindingV1,
+        evidence: ProductionSigningEvidenceV1,
+    ) -> None:
+        """Commit one account-scoped entry reservation before signing.
+
+        Reservations are immutable and deliberately have no release API in
+        this version. A signed/unknown order therefore continues consuming
+        capacity until a later schema adds bound authoritative reconciliation.
+        """
+        try:
+            request = ManagedSigningRequestV1.model_validate(request)
+            binding = CustodyBindingV1.model_validate(binding)
+            evidence = ProductionSigningEvidenceV1.model_validate(evidence)
+            if request.operation in {"Position close order", "New take-profit/stop-loss"}:
+                return
+            if request.context != self.context or binding.context != self.context:
+                raise ProductionStateError("risk reservation context differs from source scope")
+            risk = evidence.risk
+            arm = evidence.owner_arm.request
+            if (
+                evidence.operator is None
+                or risk.context != self.context
+                or risk.signing_request_id != request.request_id
+                or request.manual_request_sha256 != canonical_digest(arm)
+                or arm.context != self.context
+            ):
+                raise ProductionStateError("risk reservation lacks the exact verified entry lineage")
+            message = _typed_message(request, binding)[1]
+            notional = _entry_notional_usd(message)
+            risk_amount = risk.worst_case_loss_usd
+            if not risk_amount.is_finite() or risk_amount <= 0:
+                raise ProductionStateError("risk reservation loss must be finite and positive")
+            context_digest = self.context_sha256
+            account_digest = _account_scope_sha256(self.context)
+            _, evidence_digest = _payload(risk)
+            request_digest = _canonical_json_digest(
+                {
+                    "request": request.model_dump(mode="json"),
+                    "binding": binding.model_dump(mode="json"),
+                    "risk_evidence_sha256": evidence_digest,
+                    "owner_arm_sha256": canonical_digest(arm),
+                    "effect_id": risk.effect_id,
+                }
+            )
+            claims = PostgresProductionClaims(
+                self.pool,
+                expected_database=self.expected_database,
+                database_uuid=self.database_uuid,
+                policy_namespace=self.policy_namespace,
+                runtime_role=self.runtime_role,
+                context=self.context,
+            )
+
+            async def reserve(connection: asyncpg.Connection) -> None:
+                await claims.inspect(connection)
+                # The same account key serializes risk-decision insertion,
+                # operator command changes and competing entry reservations.
+                await connection.fetchval(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                    _account_reservation_lock(self.context),
+                )
+                await connection.fetchval(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                    f"operator:{context_digest}",
+                )
+                db_now = (await connection.fetchval("SELECT clock_timestamp()")).astimezone(UTC)
+                if (
+                    risk.observed_at > db_now
+                    or db_now - risk.observed_at > self.max_snapshot_age
+                    or risk.valid_until <= db_now
+                    or risk.valid_until - risk.observed_at > timedelta(seconds=30)
+                    or not arm.created_at <= db_now < arm.expires_at
+                ):
+                    raise ProductionStateError("risk or owner limit evidence expired before reservation")
+
+                risk_row = await connection.fetchrow(
+                    "SELECT decision_id,observed_at,payload_sha256 FROM "
+                    "kairos_production_state_v1.risk_decisions "
+                    "WHERE context_sha256=$1 AND signing_request_id=$2",
+                    context_digest,
+                    request.request_id,
+                )
+                if (
+                    risk_row is None
+                    or risk_row["decision_id"] != risk.decision_id
+                    or risk_row["observed_at"] != risk.observed_at
+                    or risk_row["payload_sha256"] != evidence_digest
+                ):
+                    raise ProductionStateError("risk reservation is not bound to its persisted decision")
+
+                arm_digest = canonical_digest(arm)
+                arm_row = await connection.fetchrow(
+                    "SELECT payload_sha256 FROM kairos_production_state_v1.owner_arms "
+                    "WHERE context_sha256=$1 AND request_sha256=$2 AND owner_identity=$3 AND nonce=$4",
+                    context_digest,
+                    arm_digest,
+                    arm.owner_identity,
+                    arm.nonce,
+                )
+                _, arm_payload_digest = _payload(evidence.owner_arm)
+                nonce_row = await connection.fetchrow(
+                    "SELECT request_sha256,context_sha256 FROM kairos_production_evidence_v1.claims "
+                    "WHERE claim_kind='MANUAL_NONCE' AND namespace=$1 AND identity=$2",
+                    arm.owner_identity,
+                    arm.nonce,
+                )
+                if (
+                    arm_row is None
+                    or arm_row["payload_sha256"] != arm_payload_digest
+                    or nonce_row is None
+                    or nonce_row["request_sha256"] != arm_digest
+                    or nonce_row["context_sha256"] != context_digest
+                ):
+                    raise ProductionStateError("risk reservation lacks the accepted exact owner arm")
+
+                operator_row = await connection.fetchrow(
+                    "SELECT payload,payload_sha256 FROM kairos_production_state_v1.operator_observations "
+                    "WHERE context_sha256=$1 ORDER BY observed_at DESC,inserted_at DESC LIMIT 1",
+                    context_digest,
+                )
+                if operator_row is None:
+                    raise ProductionStateError("risk reservation lacks current operator state")
+                operator = _parse_json_model(
+                    operator_row["payload"], LiveOperatorStateV1, "operator observation"
+                )
+                _, operator_digest = _payload(operator)
+                if (
+                    operator_digest != operator_row["payload_sha256"]
+                    or operator != evidence.operator
+                    or operator.state != "ARMED"
+                    or operator.arm_nonce != arm.nonce
+                    or operator.arm_request_sha256 != arm_digest
+                    or operator.expires_at is None
+                    or operator.expires_at <= db_now
+                ):
+                    raise ProductionStateError("current operator command changed before reservation")
+
+                existing = await connection.fetchrow(
+                    "SELECT * FROM kairos_production_state_v1.risk_reservations "
+                    "WHERE account_sha256=$1 AND effect_id=$2",
+                    account_digest,
+                    risk.effect_id,
+                )
+                if existing is not None:
+                    if (
+                        existing["context_sha256"] != context_digest
+                        or existing["owner_arm_sha256"] != arm_digest
+                        or existing["account_sha256"] != account_digest
+                        or existing["signing_request_id"] != request.request_id
+                        or existing["decision_id"] != risk.decision_id
+                        or existing["risk_usd"] != risk_amount
+                        or existing["notional_usd"] != notional
+                        or existing["account_equity_usd"] != risk.account_equity_usd
+                        or existing["daily_realized_loss_usd"] != risk.daily_realized_loss_usd
+                        or existing["aggregate_open_risk_usd"] != risk.aggregate_open_risk_usd
+                        or existing["aggregate_open_notional_usd"] != risk.aggregate_open_notional_usd
+                        or existing["dollar_cap"] != arm.dollar_cap
+                        or existing["daily_stop_loss_usd"] != arm.daily_stop_loss_usd
+                        or existing["evidence_sha256"] != evidence_digest
+                        or existing["request_sha256"] != request_digest
+                    ):
+                        raise ProductionStateError("risk reservation effect identity was rebound")
+                    return
+                prior_request = await connection.fetchval(
+                    "SELECT 1 FROM kairos_production_state_v1.risk_reservations "
+                    "WHERE account_sha256=$1 AND signing_request_id=$2",
+                    account_digest,
+                    request.request_id,
+                )
+                if prior_request is not None:
+                    raise ProductionStateError("signing request already reserves a different effect")
+
+                totals = await connection.fetchrow(
+                    "SELECT coalesce(sum(risk_usd),0) AS risk_usd, "
+                    "coalesce(sum(notional_usd),0) AS notional_usd, "
+                    "max(aggregate_open_risk_usd) AS base_risk, "
+                    "max(aggregate_open_notional_usd) AS base_notional, "
+                    "max(daily_realized_loss_usd) AS daily_realized, "
+                    "min(account_equity_usd) AS account_equity, "
+                    "min(dollar_cap) AS dollar_cap, "
+                    "min(daily_stop_loss_usd) AS daily_stop "
+                    "FROM kairos_production_state_v1.risk_reservations WHERE account_sha256=$1",
+                    account_digest,
+                )
+                reserved_risk = Decimal(totals["risk_usd"])
+                reserved_notional = Decimal(totals["notional_usd"])
+                base_risk = max(
+                    risk.aggregate_open_risk_usd,
+                    Decimal(totals["base_risk"] or 0),
+                )
+                base_notional = max(
+                    risk.aggregate_open_notional_usd,
+                    Decimal(totals["base_notional"] or 0),
+                )
+                daily_realized = max(
+                    risk.daily_realized_loss_usd,
+                    Decimal(totals["daily_realized"] or 0),
+                )
+                account_equity = min(
+                    risk.account_equity_usd,
+                    Decimal(totals["account_equity"] or risk.account_equity_usd),
+                )
+                dollar_limit = min(
+                    arm.dollar_cap,
+                    Decimal(totals["dollar_cap"] or arm.dollar_cap),
+                )
+                daily_limit = min(
+                    arm.daily_stop_loss_usd,
+                    Decimal(totals["daily_stop"] or arm.daily_stop_loss_usd),
+                )
+                next_risk = base_risk + reserved_risk + risk_amount
+                next_notional = base_notional + reserved_notional + notional
+                next_daily_loss = daily_realized + reserved_risk + risk_amount
+                if (
+                    risk.leverage != 1
+                    or risk_amount > dollar_limit
+                    or risk_amount > account_equity * Decimal("0.0025")
+                    or next_risk > account_equity * Decimal("0.01")
+                    or next_daily_loss > daily_limit
+                    or next_notional > dollar_limit
+                ):
+                    raise ProductionStateError(
+                        "account risk reservation exceeds the current exact-decimal cap"
+                    )
+                await connection.execute(
+                    "INSERT INTO kairos_production_state_v1.risk_reservations "
+                    "(context_sha256,account_sha256,effect_id,signing_request_id,decision_id,"
+                    "owner_arm_sha256,observed_at,risk_usd,notional_usd,account_equity_usd,"
+                    "daily_realized_loss_usd,aggregate_open_risk_usd,aggregate_open_notional_usd,"
+                    "dollar_cap,daily_stop_loss_usd,evidence_sha256,request_sha256) "
+                    "VALUES($1,$2,$3,$4,$5,$6,$7,$8::numeric,$9::numeric,$10::numeric,$11::numeric,"
+                    "$12::numeric,$13::numeric,$14::numeric,$15::numeric,$16,$17)",
+                    context_digest,
+                    account_digest,
+                    risk.effect_id,
+                    request.request_id,
+                    risk.decision_id,
+                    arm_digest,
+                    risk.observed_at,
+                    _decimal_text(risk_amount),
+                    _decimal_text(notional),
+                    _decimal_text(risk.account_equity_usd),
+                    _decimal_text(risk.daily_realized_loss_usd),
+                    _decimal_text(risk.aggregate_open_risk_usd),
+                    _decimal_text(risk.aggregate_open_notional_usd),
+                    _decimal_text(arm.dollar_cap),
+                    _decimal_text(arm.daily_stop_loss_usd),
+                    evidence_digest,
+                    request_digest,
+                )
+
+            await self._write(reserve)
+        except ProductionStateError:
+            raise
+        except Exception:
+            raise ProductionStateError(
+                "account risk reservation outcome unresolved; do not retry blindly"
+            ) from None
 
     async def _inspect_writer_contract(
         self, connection: asyncpg.Connection, identity: asyncpg.Record

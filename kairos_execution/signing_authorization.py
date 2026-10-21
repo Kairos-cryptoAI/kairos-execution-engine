@@ -163,6 +163,32 @@ class AsyncProductionSigningStateSource(Protocol):
         ...
 
 
+@runtime_checkable
+class AsyncProductionRiskReservationSource(Protocol):
+    async def reserve_entry_async(
+        self,
+        *,
+        request: ManagedSigningRequestV1,
+        binding: CustodyBindingV1,
+        evidence: ProductionSigningEvidenceV1,
+    ) -> None:
+        """Durably reserve exact account risk before any signing claim/callback."""
+        ...
+
+
+@runtime_checkable
+class ProductionRiskReservationSource(Protocol):
+    def reserve_entry(
+        self,
+        *,
+        request: ManagedSigningRequestV1,
+        binding: CustodyBindingV1,
+        evidence: ProductionSigningEvidenceV1,
+    ) -> None:
+        """Durably reserve exact account risk before any signing claim/callback."""
+        ...
+
+
 def signing_effect_id(*, request: ManagedSigningRequestV1, message: dict, decision_id: str) -> str:
     """Deterministic risk/effect identity bound to the request and full wire geometry."""
     payload = {
@@ -182,8 +208,9 @@ class ProductionSigningAuthorizationVerifier:
 
     The source is a security boundary, not a trusted boolean provider: it must
     resolve real deployed records in a consistent read and authenticate their
-    command/audit lineage. No such PROD source exists in the current shipped
-    persistence contracts, so this class is not deployable authority by itself.
+    command/audit lineage. Async entry signing additionally requires its source
+    to commit an account-risk reservation before the managed signer may claim
+    the request. This remains an opt-in boundary, not a LIVE factory.
     """
 
     def __init__(
@@ -248,9 +275,18 @@ class ProductionSigningAuthorizationVerifier:
                 "owner arm or authoritative authorization state is unavailable"
             ) from None
         self._verify_evidence(request, binding, evidence, now=now)
+        if request.operation not in {"Position close order", "New take-profit/stop-loss"}:
+            if not isinstance(self._source, ProductionRiskReservationSource):
+                raise ManagedSigningError("durable account risk reservation source is absent")
+            self._source.reserve_entry(request=request, binding=binding, evidence=evidence)
+            after_reservation = self._clock()
+            if after_reservation < now:
+                raise ManagedSigningError("authorization clock moved backwards")
+            request, binding = self._validate_scope(request, binding, now=after_reservation)
+            self._verify_evidence(request, binding, evidence, now=after_reservation)
 
     async def verify_request_async(self, request: ManagedSigningRequestV1, binding: CustodyBindingV1) -> None:
-        await self._resolve_verify_async(request, binding)
+        await self._resolve_verify_async(request, binding, reserve_entry=True)
 
     async def verify_effect_async(
         self,
@@ -266,7 +302,11 @@ class ProductionSigningAuthorizationVerifier:
             raise ManagedSigningError("wire effect differs from the authoritative risk decision")
 
     async def _resolve_verify_async(
-        self, request: ManagedSigningRequestV1, binding: CustodyBindingV1
+        self,
+        request: ManagedSigningRequestV1,
+        binding: CustodyBindingV1,
+        *,
+        reserve_entry: bool = False,
     ) -> ProductionSigningEvidenceV1:
         """Read native async state under the signer's single end-to-end deadline.
 
@@ -290,6 +330,22 @@ class ProductionSigningAuthorizationVerifier:
             request, binding = self._validate_scope(request, binding, now=checked_at)
             evidence = ProductionSigningEvidenceV1.model_validate(evidence)
             self._verify_evidence(request, binding, evidence, now=checked_at)
+            if reserve_entry and request.operation not in {
+                "Position close order",
+                "New take-profit/stop-loss",
+            }:
+                if not isinstance(self._source, AsyncProductionRiskReservationSource):
+                    raise ManagedSigningError("durable account risk reservation source is absent")
+                await self._source.reserve_entry_async(
+                    request=request,
+                    binding=binding,
+                    evidence=evidence,
+                )
+                after_reservation = self._clock()
+                if after_reservation < checked_at:
+                    raise ManagedSigningError("authorization clock moved backwards")
+                request, binding = self._validate_scope(request, binding, now=after_reservation)
+                self._verify_evidence(request, binding, evidence, now=after_reservation)
             return evidence
         except ManagedSigningError:
             raise
