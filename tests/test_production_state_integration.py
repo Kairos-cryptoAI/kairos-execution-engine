@@ -233,10 +233,20 @@ async def test_native_async_production_source_reads_exact_scoped_state():
         # request in the same database/account context and accepted owner arm.
         entry_verifier, entry_request, entry_binding, entry_expected, _ = fixture()
         entry_request = entry_request.model_copy(
-            update={"expires_at": datetime.now(UTC) + timedelta(seconds=20)}
+            update={
+                "request_id": request.request_id + "-entry",
+                "expires_at": datetime.now(UTC) + timedelta(seconds=20),
+            }
         )
+        entry_decision_id = entry_expected.risk.decision_id + "-entry"
+        entry_geometry = json.loads(entry_request.message_json)
         entry_risk = entry_expected.risk.model_copy(
             update={
+                "signing_request_id": entry_request.request_id,
+                "decision_id": entry_decision_id,
+                "effect_id": signing_effect_id(
+                    request=entry_request, message=entry_geometry, decision_id=entry_decision_id
+                ),
                 "observed_at": datetime.now(UTC) - timedelta(milliseconds=200),
                 "valid_until": datetime.now(UTC) + timedelta(seconds=20),
             }
