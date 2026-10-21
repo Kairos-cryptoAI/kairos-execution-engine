@@ -14,8 +14,11 @@ from __future__ import annotations
 import asyncio
 import math
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any
+from urllib.parse import quote
 
 from kairos_core.contracts import AccountSnapshot, ExecutionReport, OrderIntent, PositionSnapshot
 from kairos_core.enums import OrderSide, OrderStatus, OrderType, TimeInForce
@@ -39,6 +42,71 @@ except Exception:  # pragma: no cover
     aiohttp = None  # type: ignore
 
 MIN_NOTIONAL_USD = 5.0
+ORDER_HISTORY_PAGE_SIZE = 100
+ORDER_HISTORY_MAX_RECORDS = 10_000
+ORDER_HISTORY_MAX_SECONDS = 30.0
+
+
+class EvedexHistoryOrderStatus(StrEnum):
+    NEW = "NEW"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    FILLED = "FILLED"
+    CANCELLED = "CANCELLED"
+    REJECTED = "REJECTED"
+    EXPIRED = "EXPIRED"
+    REPLACED = "REPLACED"
+
+
+@dataclass(frozen=True, slots=True)
+class EvedexOrderHistoryRecordV1:
+    """Validated order-history row; status is evidence, not reservation-release authority."""
+
+    order_id: str
+    user_id: str
+    instrument: str
+    side: str
+    order_type: str
+    status: EvedexHistoryOrderStatus
+    quantity: float
+    unfilled_quantity: float
+    filled_average_price: float
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class EvedexOrderHistoryReadV1:
+    """Bounded authenticated read; captured_at is local retrieval time, not server freshness."""
+
+    exchange_account_id: str
+    captured_at: datetime
+    orders: tuple[EvedexOrderHistoryRecordV1, ...]
+    page_count: int
+    reported_count: int
+    authoritative_reconciliation: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class EvedexOrderFillV1:
+    execution_id: str
+    order_id: str
+    instrument: str
+    side: str
+    quantity: float
+    price: float
+    created_at: datetime
+    maker_taker_flag: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class EvedexOrderFillsReadV1:
+    """Validated per-order fills read; fills alone never prove an order is terminal."""
+
+    exchange_account_id: str
+    order_id: str
+    captured_at: datetime
+    fills: tuple[EvedexOrderFillV1, ...]
+    authoritative_reconciliation: bool = False
 
 
 class EvedexAdapter(ExchangeAdapter):
@@ -121,10 +189,10 @@ class EvedexAdapter(ExchangeAdapter):
             resp.raise_for_status()
             return await resp.json()
 
-    async def _get(self, path: str) -> Any:
+    async def _get(self, path: str, *, params: dict[str, int] | None = None) -> Any:
         await self._bucket.acquire()
         session = await self._session_get()  # pragma: no cover - network
-        async with session.get(f"{self.base}{path}") as resp:  # pragma: no cover
+        async with session.get(f"{self.base}{path}", params=params) as resp:  # pragma: no cover
             resp.raise_for_status()
             return await resp.json()
 
@@ -144,6 +212,253 @@ class EvedexAdapter(ExchangeAdapter):
                 self._live_authorization,
                 operation=operation,
             )
+
+    async def fetch_order_history(self) -> EvedexOrderHistoryReadV1:
+        """Read complete bounded history for the JWT-bound account; never a release signal."""
+        if self.dry_run:
+            raise RuntimeError("EVEDEX order history is unavailable in dry-run mode")
+        if not isinstance(self.jwt, str) or not self.jwt.strip():
+            raise RuntimeError("EVEDEX authenticated order reads require the configured account JWT")
+        started_at = self._read_clock("order-history start")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + ORDER_HISTORY_MAX_SECONDS
+        try:
+            async with asyncio.timeout_at(deadline):
+                account_id = await self._authenticated_exchange_account_id()
+                records: list[EvedexOrderHistoryRecordV1] = []
+                seen_ids: set[str] = set()
+                expected_count: int | None = None
+                offset = 0
+                page_count = 0
+                while expected_count is None or offset < expected_count:
+                    payload = await self._get(
+                        "/api/order",
+                        params={"version": 2, "limit": ORDER_HISTORY_PAGE_SIZE, "offset": offset},
+                    )
+                    if not isinstance(payload, dict):
+                        raise ValueError("EVEDEX order history response is not an object")
+                    count = payload.get("count")
+                    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                        raise ValueError("EVEDEX order history count is invalid")
+                    if count > ORDER_HISTORY_MAX_RECORDS:
+                        raise ValueError("EVEDEX order history exceeds the configured record bound")
+                    if expected_count is None:
+                        expected_count = count
+                    elif count != expected_count:
+                        raise ValueError("EVEDEX order history count changed during pagination")
+                    page = payload.get("list")
+                    if not isinstance(page, list) or len(page) > ORDER_HISTORY_PAGE_SIZE:
+                        raise ValueError("EVEDEX order history page is malformed or over-sized")
+                    if expected_count == 0:
+                        if page:
+                            raise ValueError("EVEDEX returned rows with a zero history count")
+                        page_count = 1
+                        break
+                    remaining = expected_count - offset
+                    if not page or len(page) > remaining:
+                        raise ValueError("EVEDEX order history page is empty or exceeds its reported count")
+                    for item in page:
+                        record = self._normalize_order_history_record(item, account_id=account_id)
+                        if record.order_id in seen_ids:
+                            raise ValueError("EVEDEX order history contains duplicate IDs across pages")
+                        seen_ids.add(record.order_id)
+                        records.append(record)
+                    offset += len(page)
+                    page_count += 1
+                if expected_count is None or len(records) != expected_count:
+                    raise ValueError("EVEDEX order history pagination did not reach the reported count")
+                captured_at = self._read_clock("order-history completion")
+                if captured_at < started_at:
+                    raise ValueError("EVEDEX order history clock moved backwards during the read")
+                return EvedexOrderHistoryReadV1(
+                    exchange_account_id=account_id,
+                    captured_at=captured_at,
+                    orders=tuple(records),
+                    page_count=page_count,
+                    reported_count=expected_count,
+                )
+        except TimeoutError as exc:
+            raise ValueError("EVEDEX order history read timed out before a complete page set") from exc
+
+    async def fetch_order_fills(self, order_id: str) -> EvedexOrderFillsReadV1:
+        """Read authenticated fills for one order; an empty list is not terminal proof."""
+        if self.dry_run:
+            raise RuntimeError("EVEDEX order fills are unavailable in dry-run mode")
+        if not isinstance(self.jwt, str) or not self.jwt.strip():
+            raise RuntimeError("EVEDEX authenticated order reads require the configured account JWT")
+        normalized_id = self._validate_history_order_id(order_id)
+        started_at = self._read_clock("order-fills start")
+        deadline = asyncio.get_running_loop().time() + ORDER_HISTORY_MAX_SECONDS
+        try:
+            async with asyncio.timeout_at(deadline):
+                account_id = await self._authenticated_exchange_account_id()
+                parent_order = await self._get(f"/api/order/{quote(normalized_id, safe='')}")
+                normalized_parent = self._normalize_order_history_record(
+                    parent_order,
+                    account_id=account_id,
+                )
+                if normalized_parent.order_id != normalized_id:
+                    raise ValueError("EVEDEX returned a different order than the requested fill parent")
+                payload = await self._get(f"/api/order/{quote(normalized_id, safe='')}/fill")
+                if not isinstance(payload, list) or len(payload) > ORDER_HISTORY_MAX_RECORDS:
+                    raise ValueError("EVEDEX order fills response is not a bounded array")
+                fills: list[EvedexOrderFillV1] = []
+                seen_execution_ids: set[str] = set()
+                for item in payload:
+                    fill = self._normalize_order_fill(item, order_id=normalized_id)
+                    if fill.instrument != normalized_parent.instrument or fill.side != normalized_parent.side:
+                        raise ValueError("EVEDEX order fill does not match its authenticated parent order")
+                    if fill.execution_id in seen_execution_ids:
+                        raise ValueError("EVEDEX order fills contain duplicate execution IDs")
+                    seen_execution_ids.add(fill.execution_id)
+                    fills.append(fill)
+                captured_at = self._read_clock("order-fills completion")
+                if captured_at < started_at:
+                    raise ValueError("EVEDEX order fills clock moved backwards during the read")
+                return EvedexOrderFillsReadV1(
+                    exchange_account_id=account_id,
+                    order_id=normalized_id,
+                    captured_at=captured_at,
+                    fills=tuple(fills),
+                )
+        except TimeoutError as exc:
+            raise ValueError("EVEDEX order fills read timed out") from exc
+
+    async def _authenticated_exchange_account_id(self) -> str:
+        account = await self._get("/api/user/me")
+        if not isinstance(account, dict):
+            raise ValueError("EVEDEX current-account response is malformed")
+        value = account.get("exchangeId")
+        if isinstance(value, bool) or not isinstance(value, (int, str)):
+            raise ValueError("EVEDEX current-account exchange ID is missing")
+        account_id = str(value)
+        if not account_id.isdigit() or int(account_id) <= 0:
+            raise ValueError("EVEDEX current-account exchange ID is invalid")
+        return account_id
+
+    @classmethod
+    def _normalize_order_history_record(
+        cls,
+        item: Any,
+        *,
+        account_id: str,
+    ) -> EvedexOrderHistoryRecordV1:
+        if not isinstance(item, dict):
+            raise ValueError("EVEDEX order history contains a non-object")
+        order_id = cls._validate_history_order_id(item.get("id"))
+        user_id = item.get("user")
+        if isinstance(user_id, bool) or not isinstance(user_id, (str, int)) or str(user_id) != account_id:
+            raise ValueError("EVEDEX order history row is not bound to the authenticated account")
+        side = cls._required_history_text(item.get("side"), "side").upper()
+        order_type = cls._required_history_text(item.get("type"), "type").upper()
+        if side not in {"BUY", "SELL"}:
+            raise ValueError("EVEDEX order history side is unknown")
+        if order_type not in {"LIMIT", "MARKET", "STOP", "STOP_LIMIT"}:
+            raise ValueError("EVEDEX order history type is unknown")
+        created_at = cls._required_history_datetime(item.get("createdAt"), "createdAt")
+        updated_at = cls._required_history_datetime(item.get("updatedAt"), "updatedAt")
+        if updated_at < created_at:
+            raise ValueError("EVEDEX order history updatedAt precedes createdAt")
+        quantity = cls._required_history_number(item.get("quantity"), "order.quantity")
+        unfilled_quantity = cls._required_history_number(
+            item.get("unFilledQuantity"), "order.unFilledQuantity"
+        )
+        average_price = cls._required_history_number(item.get("filledAvgPrice"), "order.filledAvgPrice")
+        if quantity <= 0 or unfilled_quantity > quantity:
+            raise ValueError("EVEDEX order history has inconsistent requested and unfilled quantities")
+        if quantity > unfilled_quantity and average_price <= 0:
+            raise ValueError("EVEDEX filled order history has no positive average fill price")
+        return EvedexOrderHistoryRecordV1(
+            order_id=order_id,
+            user_id=account_id,
+            instrument=cls._required_history_text(item.get("instrument"), "instrument"),
+            side=side,
+            order_type=order_type,
+            status=cls._history_order_status(item.get("status")),
+            quantity=quantity,
+            unfilled_quantity=unfilled_quantity,
+            filled_average_price=average_price,
+            created_at=created_at,
+            updated_at=updated_at,
+        )
+
+    @classmethod
+    def _normalize_order_fill(cls, item: Any, *, order_id: str) -> EvedexOrderFillV1:
+        if not isinstance(item, dict):
+            raise ValueError("EVEDEX order fills contains a non-object")
+        execution_id = cls._required_history_text(item.get("executionId"), "executionId")
+        if cls._validate_history_order_id(item.get("orderId")) != order_id:
+            raise ValueError("EVEDEX order fill belongs to a different order")
+        side = cls._required_history_text(item.get("side"), "side").upper()
+        if side not in {"BUY", "SELL"}:
+            raise ValueError("EVEDEX order fill side is unknown")
+        maker_taker = item.get("makerTakerFlag")
+        if maker_taker is not None:
+            maker_taker = cls._required_history_text(maker_taker, "makerTakerFlag").upper()
+            if maker_taker not in {"MAKER", "TAKER"}:
+                raise ValueError("EVEDEX order fill liquidity flag is unknown")
+        quantity = cls._required_history_number(item.get("fillQuantity"), "fill.fillQuantity")
+        price = cls._required_history_number(item.get("fillPrice"), "fill.fillPrice")
+        if quantity <= 0 or price <= 0:
+            raise ValueError("EVEDEX order fill quantity and price must be positive")
+        return EvedexOrderFillV1(
+            execution_id=execution_id,
+            order_id=order_id,
+            instrument=cls._required_history_text(item.get("instrument"), "instrument"),
+            side=side,
+            quantity=quantity,
+            price=price,
+            created_at=cls._required_history_datetime(item.get("createdAt"), "fill.createdAt"),
+            maker_taker_flag=maker_taker,
+        )
+
+    @staticmethod
+    def _validate_history_order_id(value: Any) -> str:
+        if not isinstance(value, str) or not value or len(value) > 128:
+            raise ValueError("EVEDEX history order ID is invalid")
+        if any(not char.isascii() or not (char.isalnum() or char in ":_-") for char in value):
+            raise ValueError("EVEDEX history order ID contains unsafe characters")
+        return value
+
+    @staticmethod
+    def _required_history_text(value: Any, field: str) -> str:
+        if not isinstance(value, str) or not value.strip() or len(value) > 256:
+            raise ValueError(f"EVEDEX history {field} is invalid")
+        return value.strip()
+
+    @staticmethod
+    def _required_history_number(value: Any, field: str) -> float:
+        if isinstance(value, bool):
+            raise ValueError(f"EVEDEX history {field} must be numeric")
+        return EvedexAdapter._required_float(value, field)
+
+    @staticmethod
+    def _history_order_status(value: Any) -> EvedexHistoryOrderStatus:
+        normalized = str(value or "").upper()
+        if normalized == "CANCELED":
+            normalized = "CANCELLED"
+        try:
+            return EvedexHistoryOrderStatus(normalized)
+        except ValueError as exc:
+            raise ValueError(f"EVEDEX returned unknown order-history status {value!r}") from exc
+
+    @staticmethod
+    def _required_history_datetime(value: Any, field: str) -> datetime:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"EVEDEX history {field} timestamp is missing")
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError(f"EVEDEX history {field} timestamp is invalid") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError(f"EVEDEX history {field} timestamp must include a timezone")
+        return parsed.astimezone(UTC)
+
+    def _read_clock(self, field: str) -> datetime:
+        value = self._clock()
+        if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(f"EVEDEX {field} clock must be timezone-aware")
+        return value.astimezone(UTC)
 
     # ---- ExchangeAdapter -------------------------------------------------
     async def place_order(self, intent: OrderIntent) -> ExecutionReport:
