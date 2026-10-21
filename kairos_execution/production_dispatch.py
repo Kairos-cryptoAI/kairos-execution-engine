@@ -402,6 +402,7 @@ class ProductionEffectDispatcher:
         await self._finish_shielded(
             namespace, request, request_sha256, "COMPLETED", response_digest, deadline
         )
+        fresh_time()
         return response
 
     async def _finish_shielded(
@@ -413,6 +414,9 @@ class ProductionEffectDispatcher:
         response_sha256: str | None,
         deadline: float,
     ) -> None:
+        loop = asyncio.get_running_loop()
+        if loop.time() >= deadline:
+            raise ProductionDispatchError("wire terminal outcome unresolved; do not retry")
         task = asyncio.create_task(
             self.claims.finish_wire_async(
                 namespace=namespace,
@@ -422,6 +426,15 @@ class ProductionEffectDispatcher:
                 response_sha256=response_sha256,
             )
         )
+
+        def consume_terminal_result(done_task: asyncio.Task[None]) -> None:
+            if not done_task.cancelled():
+                try:
+                    done_task.exception()
+                except BaseException:
+                    pass
+
+        task.add_done_callback(consume_terminal_result)
         try:
             async with asyncio.timeout_at(deadline):
                 await asyncio.shield(task)

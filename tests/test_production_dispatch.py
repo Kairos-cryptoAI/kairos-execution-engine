@@ -433,3 +433,110 @@ async def test_wall_clock_rollback_and_zero_database_uuid_fail_closed():
             clock=lambda: NOW,
             sender=lambda **kwargs: asyncio.sleep(0, result={"status": "NEW"}),
         )
+
+
+@pytest.mark.asyncio
+async def test_sender_deadline_returns_no_late_success_and_refuses_replay():
+    signer, signing_request, _, _, _ = setup_signer()
+    claims, _ = claims_fixture(context=signing_request.context)
+    signing_request = signing_request.model_copy(
+        update={"expires_at": NOW + timedelta(milliseconds=250)}
+    )
+    signed = await signer.sign_async(signing_request, now=NOW, claims=claims)
+    message = json.loads(signing_request.message_json)
+    decision_id = "decision-sender-timeout"
+    effect_id = signing_effect_id(request=signing_request, message=message, decision_id=decision_id)
+    request = ProductionWireRequestV1(
+        context=signing_request.context,
+        database_uuid=claims.database_uuid,
+        decision_id=decision_id,
+        effect_id=effect_id,
+        effect_type="PLACE_ORDER",
+        method="POST",
+        path="/api/v2/order/limit",
+        body={**message, "signature": signed.signature},
+        signing_request=signing_request,
+        custody_binding=signer.binding,
+        signed=signed,
+    )
+    calls = []
+
+    async def slow_sender(**kwargs):
+        calls.append(kwargs)
+        await asyncio.sleep(5)
+        return {"status": "LATE"}
+
+    dispatcher = ProductionEffectDispatcher(
+        authorization=CurrentState(),
+        signature_verifier=SyntheticSignatureVerifier(),
+        claims=claims,
+        database_uuid=claims.database_uuid,
+        context=request.context,
+        clock=lambda: NOW,
+        sender=slow_sender,
+    )
+    with pytest.raises(ProductionDispatchError):
+        await dispatcher.dispatch_one(request)
+    with pytest.raises(ProductionDispatchError, match="already claimed"):
+        await dispatcher.dispatch_one(request)
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_timeout_does_not_wait_for_late_ack_or_allow_replay():
+    signer, signing_request, _, _, _ = setup_signer()
+    claims, _ = claims_fixture(context=signing_request.context)
+    signing_request = signing_request.model_copy(
+        update={"expires_at": NOW + timedelta(milliseconds=250)}
+    )
+    signed = await signer.sign_async(signing_request, now=NOW, claims=claims)
+    message = json.loads(signing_request.message_json)
+    decision_id = "decision-terminal-timeout"
+    effect_id = signing_effect_id(request=signing_request, message=message, decision_id=decision_id)
+    request = ProductionWireRequestV1(
+        context=signing_request.context,
+        database_uuid=claims.database_uuid,
+        decision_id=decision_id,
+        effect_id=effect_id,
+        effect_type="PLACE_ORDER",
+        method="POST",
+        path="/api/v2/order/limit",
+        body={**message, "signature": signed.signature},
+        signing_request=signing_request,
+        custody_binding=signer.binding,
+        signed=signed,
+    )
+    allow_terminal_ack = asyncio.Event()
+    original_finish = claims.finish_wire_async
+
+    async def delayed_finish(**kwargs):
+        await allow_terminal_ack.wait()
+        await original_finish(**kwargs)
+
+    claims.finish_wire_async = delayed_finish
+    sends = []
+
+    async def sender(**kwargs):
+        sends.append(kwargs)
+        return {"status": "NEW"}
+
+    dispatcher = ProductionEffectDispatcher(
+        authorization=CurrentState(),
+        signature_verifier=SyntheticSignatureVerifier(),
+        claims=claims,
+        database_uuid=claims.database_uuid,
+        context=request.context,
+        clock=lambda: NOW,
+        sender=sender,
+    )
+    with pytest.raises(ProductionDispatchError, match="deadline elapsed"):
+        await dispatcher.dispatch_one(request)
+    allow_terminal_ack.set()
+    await asyncio.sleep(0.05)
+    row = await claims.load_claim(
+        kind="WIRE_DISPATCH", namespace="wire:" + canonical_digest(request.context), identity=effect_id
+    )
+    assert row["terminal_status"] == "COMPLETED"
+    with pytest.raises(ProductionDispatchError, match="already claimed"):
+        await dispatcher.dispatch_one(request)
+    assert len(sends) == 1
