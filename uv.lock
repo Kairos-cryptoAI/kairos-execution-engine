@@ -8,6 +8,9 @@ resolution-markers = [
     "python_full_version < '3.12'",
 ]
 
+[manifest]
+overrides = [{ name = "kairos-core", git = "https://github.com/Kairos-cryptoAI/kairos-core.git?rev=ff3af7592cbd47be985d794d8d9903aaa8e5df07" }]
+
 [[package]]
 name = "aiohappyeyeballs"
 version = "2.7.1"
@@ -1243,7 +1246,7 @@ wheels = [
 [[package]]
 name = "kairos-core"
 version = "0.3.0"
-source = { git = "https://github.com/Kairos-cryptoAI/kairos-core.git?rev=d52fd9734a27f76f8e2bdbf053d477b8e04b81c9#d52fd9734a27f76f8e2bdbf053d477b8e04b81c9" }
+source = { git = "https://github.com/Kairos-cryptoAI/kairos-core.git?rev=ff3af7592cbd47be985d794d8d9903aaa8e5df07#ff3af7592cbd47be985d794d8d9903aaa8e5df07" }
 dependencies = [
     { name = "aiohttp" },
     { name = "multidict" },
@@ -1306,7 +1309,7 @@ requires-dist = [
     { name = "coincurve", marker = "extra == 'evedex'", specifier = "==21.0.0" },
     { name = "cryptography", marker = "extra == 'production-evidence'", specifier = "==50.0.0" },
     { name = "eth-account", marker = "extra == 'evedex'", specifier = ">=0.11,<1" },
-    { name = "kairos-core", git = "https://github.com/Kairos-cryptoAI/kairos-core.git?rev=d52fd9734a27f76f8e2bdbf053d477b8e04b81c9" },
+    { name = "kairos-core", git = "https://github.com/Kairos-cryptoAI/kairos-core.git?rev=ff3af7592cbd47be985d794d8d9903aaa8e5df07" },
     { name = "kairos-persistence", git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git?rev=752c984ca276ccbb7fcbd1b60a6c75d95fe6f108" },
     { name = "kairos-quant-scouts", marker = "extra == 'recorder'", git = "https://github.com/Kairos-cryptoAI/kairos-quant-scouts.git?rev=79e71fd5f2c1da7164fd0c9a90b4fffd7a52c65f" },
     { name = "multidict", specifier = ">=6.9.1,<7" },
