@@ -1310,8 +1310,8 @@ requires-dist = [
     { name = "cryptography", marker = "extra == 'production-evidence'", specifier = "==50.0.0" },
     { name = "eth-account", marker = "extra == 'evedex'", specifier = ">=0.11,<1" },
     { name = "kairos-core", git = "https://github.com/Kairos-cryptoAI/kairos-core.git?rev=ff3af7592cbd47be985d794d8d9903aaa8e5df07" },
-    { name = "kairos-persistence", git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git?rev=752c984ca276ccbb7fcbd1b60a6c75d95fe6f108" },
-    { name = "kairos-quant-scouts", marker = "extra == 'recorder'", git = "https://github.com/Kairos-cryptoAI/kairos-quant-scouts.git?rev=79e71fd5f2c1da7164fd0c9a90b4fffd7a52c65f" },
+    { name = "kairos-persistence", git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git?rev=c6773575a09f918b4d495848705b4234f73f3a32" },
+    { name = "kairos-quant-scouts", marker = "extra == 'recorder'", git = "https://github.com/Kairos-cryptoAI/kairos-quant-scouts.git?rev=cbd8e60b05952c4238aa51a13bc4327350b8e643" },
     { name = "multidict", specifier = ">=6.9.1,<7" },
     { name = "pydantic", specifier = ">=2.6,<3" },
     { name = "pydantic-settings", specifier = ">=2.2,<3" },
@@ -1335,7 +1335,7 @@ dev = [
 [[package]]
 name = "kairos-persistence"
 version = "0.1.0"
-source = { git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git?rev=752c984ca276ccbb7fcbd1b60a6c75d95fe6f108#752c984ca276ccbb7fcbd1b60a6c75d95fe6f108" }
+source = { git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git?rev=c6773575a09f918b4d495848705b4234f73f3a32#c6773575a09f918b4d495848705b4234f73f3a32" }
 dependencies = [
     { name = "asyncpg" },
     { name = "fastapi" },
@@ -1348,7 +1348,7 @@ dependencies = [
 [[package]]
 name = "kairos-quant-scouts"
 version = "0.1.0"
-source = { git = "https://github.com/Kairos-cryptoAI/kairos-quant-scouts.git?rev=79e71fd5f2c1da7164fd0c9a90b4fffd7a52c65f#79e71fd5f2c1da7164fd0c9a90b4fffd7a52c65f" }
+source = { git = "https://github.com/Kairos-cryptoAI/kairos-quant-scouts.git?rev=cbd8e60b05952c4238aa51a13bc4327350b8e643#cbd8e60b05952c4238aa51a13bc4327350b8e643" }
 dependencies = [
     { name = "aiohttp" },
     { name = "kairos-core" },
