@@ -288,6 +288,17 @@ class ProductionSigningAuthorizationVerifier:
     async def verify_request_async(self, request: ManagedSigningRequestV1, binding: CustodyBindingV1) -> None:
         await self._resolve_verify_async(request, binding, reserve_entry=True)
 
+    async def inspect_request_async(
+        self, request: ManagedSigningRequestV1, binding: CustodyBindingV1
+    ) -> ProductionSigningEvidenceV1:
+        """Read and validate exact authority without reserving or signing.
+
+        The result is request-scoped evidence, not a capability. Signing and
+        dispatch must independently revalidate current state at their normal
+        durable boundaries; inspection never consumes an owner nonce or claim.
+        """
+        return await self._resolve_verify_async(request, binding, reserve_entry=False)
+
     async def verify_effect_async(
         self,
         request: ManagedSigningRequestV1,
