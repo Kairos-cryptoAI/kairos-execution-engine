@@ -13,6 +13,7 @@ authors = [{ name = "TheLitis" }]
 dependencies = [
     "kairos-core>=0.3,<0.4",
     "kairos-persistence>=0.1,<0.2",
+    "kairos-risk-manager>=0.2,<0.3",
     "aiohttp>=3.14.4,<4",
     # GHSA-54p9-h82j-f925: exclude the vulnerable aiohttp transitive versions.
     "multidict>=6.9.1,<7",
@@ -74,6 +75,7 @@ override-dependencies = [
 [tool.uv.sources]
 kairos-core = { git = "https://github.com/Kairos-cryptoAI/kairos-core.git", rev = "ff3af7592cbd47be985d794d8d9903aaa8e5df07" }
 kairos-persistence = { git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git", rev = "c6773575a09f918b4d495848705b4234f73f3a32" }
+kairos-risk-manager = { git = "https://github.com/Kairos-cryptoAI/kairos-risk-manager.git", rev = "549ffe8e9c865aa554ff62cf085b7c973ab316ea" }
 kairos-quant-scouts = { git = "https://github.com/Kairos-cryptoAI/kairos-quant-scouts.git", rev = "cbd8e60b05952c4238aa51a13bc4327350b8e643" }
 
 [tool.ruff]

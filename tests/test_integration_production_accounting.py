@@ -223,6 +223,63 @@ async def test_fresh_v3_native_accounting_receipts_concurrency_and_loss_floor():
                 )
             )
             await risk_writer.append_risk_decision_async(risk)
+            persisted_before = await owner.fetchrow(
+                "SELECT * FROM kairos_production_state_v1.risk_decisions "
+                "WHERE context_sha256=$1 AND signing_request_id=$2",
+                canonical_digest(context),
+                risk.signing_request_id,
+            )
+            assert persisted_before is not None
+            persisted_before = dict(persisted_before)
+            count_before = await owner.fetchval(
+                "SELECT count(*) FROM kairos_production_state_v1.risk_decisions "
+                "WHERE context_sha256=$1 AND signing_request_id=$2",
+                canonical_digest(context),
+                risk.signing_request_id,
+            )
+            # Exact publication replay is safe under concurrency, but it must
+            # not create another immutable decision row or refresh its lease.
+            await asyncio.gather(
+                risk_writer.append_risk_decision_async(risk),
+                risk_writer.append_risk_decision_async(risk),
+            )
+            persisted_after_replay = await owner.fetchrow(
+                "SELECT * FROM kairos_production_state_v1.risk_decisions "
+                "WHERE context_sha256=$1 AND signing_request_id=$2",
+                canonical_digest(context),
+                risk.signing_request_id,
+            )
+            count_after_replay = await owner.fetchval(
+                "SELECT count(*) FROM kairos_production_state_v1.risk_decisions "
+                "WHERE context_sha256=$1 AND signing_request_id=$2",
+                canonical_digest(context),
+                risk.signing_request_id,
+            )
+            assert persisted_after_replay is not None
+            assert dict(persisted_after_replay) == persisted_before
+            assert count_after_replay == count_before
+
+            # Reusing the same request identity with changed order geometry is
+            # a hard conflict and leaves the original evidence untouched.
+            with pytest.raises(ProductionStateError, match="risk signing-request identity was rebound"):
+                await risk_writer.append_risk_decision_async(
+                    risk.model_copy(update={"quantity": risk.quantity + 1})
+                )
+            persisted_after = await owner.fetchrow(
+                "SELECT * FROM kairos_production_state_v1.risk_decisions "
+                "WHERE context_sha256=$1 AND signing_request_id=$2",
+                canonical_digest(context),
+                risk.signing_request_id,
+            )
+            count_after = await owner.fetchval(
+                "SELECT count(*) FROM kairos_production_state_v1.risk_decisions "
+                "WHERE context_sha256=$1 AND signing_request_id=$2",
+                canonical_digest(context),
+                risk.signing_request_id,
+            )
+            assert persisted_after is not None
+            assert dict(persisted_after) == persisted_before
+            assert count_after == count_before
             evidence = initial.model_copy(update=dict(risk=risk, operator=armed))
             return request, evidence
 

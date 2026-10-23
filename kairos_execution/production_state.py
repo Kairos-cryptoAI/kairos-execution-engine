@@ -504,6 +504,15 @@ _WRITER_SELECT_TABLES = {
 }
 
 
+def _writer_select_tables(role_field: str, state_schema_version: int) -> frozenset[str]:
+    tables = _WRITER_SELECT_TABLES.get(role_field, frozenset())
+    if role_field == "risk_writer_role" and state_schema_version == 3:
+        # Explicit fresh-v3 publication recovery may inspect its own immutable
+        # account Risk records. Retained/default v2 grants remain unchanged.
+        return tables | frozenset({"risk_decisions"})
+    return tables
+
+
 class ProductionStateError(PermissionError):
     """Sanitized source identity, state or persistence error; never includes a DSN."""
 
@@ -709,7 +718,7 @@ async def provision_production_state_schema(
         for writer_field, table_set in _WRITER_TABLES.items():
             writer = roles[writer_field]
             await connection.execute(f'GRANT USAGE ON SCHEMA {SCHEMA} TO "{writer}"')
-            select_tables = _WRITER_SELECT_TABLES[writer_field]
+            select_tables = _writer_select_tables(writer_field, state_schema_version)
             select_names = ",".join(f"{SCHEMA}.{table}" for table in sorted(select_tables))
             await connection.execute(f'GRANT SELECT ON {select_names} TO "{writer}"')
             table_names = ",".join(f"{SCHEMA}.{table}" for table in sorted(table_set))
@@ -787,8 +796,8 @@ class _StateDB:
             has_select = await connection.fetchval(
                 "SELECT has_table_privilege($1,$2,'SELECT')", self.expected_role, name
             )
-            expected_select = self.role_field == "runtime_role" or table in _WRITER_SELECT_TABLES.get(
-                self.role_field, frozenset()
+            expected_select = self.role_field == "runtime_role" or table in _writer_select_tables(
+                self.role_field, self.state_schema_version
             )
             if has_select != expected_select:
                 raise ProductionStateError("production state SELECT privilege mismatch")
@@ -942,6 +951,25 @@ class PostgresRiskStateWriter(_StateDB):
                 "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
                 _account_reservation_lock(self.context),
             )
+            existing = None
+            if self.state_schema_version == 3:
+                existing = await connection.fetchrow(
+                    "SELECT payload,payload_sha256 FROM kairos_production_state_v1.risk_decisions "
+                    "WHERE context_sha256=$1 AND signing_request_id=$2",
+                    self.context_sha256,
+                    risk.signing_request_id,
+                )
+            if existing is not None:
+                # Recover a partial publication without ever rebinding the
+                # immutable request, refreshing its lease or changing policy.
+                stored = _parse_json_model(existing["payload"], RiskGeometryV1, "risk replay")
+                if (
+                    existing["payload_sha256"] != payload_sha
+                    or canonical_digest(stored) != payload_sha
+                    or stored != risk
+                ):
+                    raise ProductionStateError("risk signing-request identity was rebound")
+                return
             await connection.execute(
                 "INSERT INTO kairos_production_state_v1.risk_decisions "
                 "(context_sha256,signing_request_id,decision_id,observed_at,valid_until,payload,"
@@ -1622,7 +1650,7 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
                 has_select = await connection.fetchval(
                     "SELECT has_table_privilege($1,$2,'SELECT')", writer_role, name
                 )
-                expected_select = table in _WRITER_SELECT_TABLES.get(role_field, frozenset())
+                expected_select = table in _writer_select_tables(role_field, self.state_schema_version)
                 if has_select != expected_select:
                     raise ProductionStateError("production state writer SELECT privilege mismatch")
             if await connection.fetchval("SELECT has_schema_privilege($1,$2,'CREATE')", writer_role, SCHEMA):
