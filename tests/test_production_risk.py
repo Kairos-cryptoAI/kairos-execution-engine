@@ -310,6 +310,36 @@ async def test_non_normal_observed_system_mode_refuses_before_persistence():
 
 
 @pytest.mark.asyncio
+async def test_nearly_stale_verified_inputs_cannot_gain_a_fresh_five_second_lease():
+    review, venue, allocation, verifier, writer, bindings, base, *_ = _inputs()
+
+    class NearlyStaleInputsVerifier(SyntheticInputsVerifier):
+        def verify(self, raw_proof, **kwargs):
+            verified = super().verify(raw_proof, **kwargs)
+            return verified.model_copy(update={"observed_at_ms": kwargs["decided_at_ms"] - 4_999})
+
+    evaluator = LiveRiskEvaluator(
+        base.scope,
+        base.evaluator.limits,
+        account_verifiers={SOURCE: verifier},
+        input_verifier=NearlyStaleInputsVerifier(),
+    )
+    publisher = ProductionLiveRiskPublisher(
+        evaluator=evaluator,
+        risk_writer=writer,
+        lifecycle_bindings=bindings,
+        custody_binding=base.custody_binding,
+        database_uuid=DATABASE_UUID,
+        policy_namespace=POLICY_NAMESPACE,
+    )
+
+    with pytest.raises(ProductionLiveRiskError):
+        await _stage(publisher, review, venue, allocation)
+
+    assert not writer.rows and not bindings.rows
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("changed", "message"),
     [

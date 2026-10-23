@@ -348,6 +348,10 @@ The separate opt-in [managed PROD lifecycle](docs/PRODUCTION-LIFECYCLE.md) now
 composes existing decision/effect journals, managed signing/wire claims,
 protection, cancellation, recovery and terminal account evidence. Its fixtures
 are engineering checks, not EVEDEX acceptance; the default LIVE refusal remains.
+The explicit [LIVE Risk/protective path](docs/PRODUCTION-PATH.md) invokes the
+actual entry evaluator and independently stages Risk for each new PREPARED
+protective/closing effect before signing. Current real account/upstream/terminal
+source qualification and owner arming remain mandatory, not defaulted here.
 
 With Redis, consumed IDs, execution reports and completion are committed through
 `kairos-persistence`; Redis is ACKed only after PostgreSQL commits. Configure

@@ -27,7 +27,8 @@ integer quantity, price, side, instrument, and signing-effect digest into
 `RiskGeometryV1`. Equity, daily adverse loss, aggregate open risk/notional, and
 source/account proof digests come from the evaluator's verified-account result;
 they are not guessed or defaulted by this bridge. The risk lease cannot exceed
-five seconds or the Core intent and verified-account evidence windows. Quote,
+five seconds or the Core intent, verified upstream-input observation and
+verified-account evidence windows. Quote,
 book, and reference observations each impose a hard two-second freshness cap,
 in addition to the venue-provided expiry.
 
@@ -48,6 +49,10 @@ needs its own exact risk and exposure evidence; entry approval is never copied
 to exits. Existing KILL/DISARM semantics stop new entries, not already-owned
 risk-reducing exits. This is not evidence of a separately qualified global
 wire cutoff.
+
+The explicit unified caller is documented in [PRODUCTION-PATH.md](PRODUCTION-PATH.md).
+It invokes this publisher and the existing protected FSM, rechecking deadlines
+after asynchronous staging. This standalone publisher remains passive.
 
 ## Current EVEDEX account-source boundary
 

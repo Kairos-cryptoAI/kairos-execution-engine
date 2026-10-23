@@ -225,6 +225,7 @@ class ProductionLiveRiskPublisher:
             (facts["account_as_of_ms"] + int(self._MAX_EVIDENCE_AGE.total_seconds() * 1_000)) / 1_000,
             tz=UTC,
         )
+        inputs_valid_until = datetime.fromtimestamp((facts["inputs_observed_at_ms"] + 5_000) / 1_000, tz=UTC)
         valid_until = min(
             now + self._MAX_EVIDENCE_AGE,
             entry_expiry,
@@ -233,6 +234,7 @@ class ProductionLiveRiskPublisher:
             book_hard_expiry,
             reference_hard_expiry,
             account_valid_until,
+            inputs_valid_until,
             expires_at,
         )
         if expires_at > valid_until:
@@ -240,7 +242,9 @@ class ProductionLiveRiskPublisher:
                 raise ProductionLiveRiskError("signing deadline outlives the two-second quote TTL")
             if expires_at > min(book_hard_expiry, reference_hard_expiry):
                 raise ProductionLiveRiskError("signing deadline outlives the two-second market-data TTL")
-            raise ProductionLiveRiskError("signing deadline outlives Core or verified account evidence")
+            raise ProductionLiveRiskError(
+                "signing deadline outlives Core, verified account, or upstream-input evidence"
+            )
 
         lifecycle_effect_id = self._entry_effect_id(decision.trade_id)
         client_id = client_order_id(
@@ -302,6 +306,7 @@ class ProductionLiveRiskPublisher:
             "strategy_reserved_notional_usd",
             "inputs_source_id",
             "inputs_evidence_sha256",
+            "inputs_observed_at_ms",
         )
         facts = {name: getattr(evaluation, name) for name in fields}
         if (
@@ -312,6 +317,9 @@ class ProductionLiveRiskPublisher:
             or facts["inputs_source_id"] == ""
             or facts["inputs_evidence_sha256"] is None
             or facts["account_as_of_ms"] < 0
+            or isinstance(facts["inputs_observed_at_ms"], bool)
+            or not isinstance(facts["inputs_observed_at_ms"], int)
+            or facts["inputs_observed_at_ms"] < 0
             or any(not Decimal(str(facts[name])).is_finite() for name in fields[4:12])
         ):
             raise ProductionLiveRiskError("LIVE evaluation lacks independently verified account economics")

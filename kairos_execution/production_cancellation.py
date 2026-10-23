@@ -912,14 +912,20 @@ class ProductionCancellationVerifier:
             raise ProductionCancellationError(
                 "authoritative cancellation venue facts are unavailable"
             ) from None
+        # A newly observed venue snapshot may legitimately postdate the clock
+        # captured before durable lineage I/O. Validate against the current
+        # post-capture time, without retiming the source or extending its lease.
+        checked_at = self._now()
+        if checked_at < now:
+            raise ProductionCancellationError("cancellation clock moved backwards during venue capture")
         if (
             venue.source_id != source.source_id
             or venue.context != self.context
             or venue.account_id != self.context.remote_account_id
             or venue.instrument != instrument
-            or venue.observed_at > now
-            or now - venue.observed_at > _MAX_AGE
-            or venue.valid_until <= now
+            or venue.observed_at > checked_at
+            or checked_at - venue.observed_at > _MAX_AGE
+            or venue.valid_until <= checked_at
         ):
             raise ProductionCancellationError("cancellation venue snapshot is stale or out of scope")
         return source, venue

@@ -1880,6 +1880,9 @@ class _EvedexProtectedExecutionEngine:
             marketable_price
         )
 
+    async def _prepare_exit_risk(self, effect_id: str) -> None:
+        """Optional production hook; never invoked for an ambiguous/replayed effect."""
+
     async def _tpsl_effect(
         self,
         trade: TradeRecord,
@@ -1919,6 +1922,7 @@ class _EvedexProtectedExecutionEngine:
             return cached
         if not preparation.created:
             raise PaperExecutionSafetyError(f"prepared {role.value} requires authoritative recovery")
+        await self._prepare_exit_risk(effect_id)
         await self._reserve_mutation(
             effect_id,
             operation="create_tpsl",
@@ -1983,6 +1987,7 @@ class _EvedexProtectedExecutionEngine:
             return cached
         if not preparation.created:
             raise PaperExecutionSafetyError("prepared close requires authoritative recovery")
+        await self._prepare_exit_risk(effect_id)
         await self._reserve_mutation(
             effect_id,
             operation="close_position",

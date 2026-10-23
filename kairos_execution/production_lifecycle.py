@@ -35,7 +35,11 @@ from pydantic import Field, model_validator
 
 from .lifecycle_scope import ExecutionLifecycleScope, LifecycleAdmissionPolicy
 from .managed_signer import CustodyBindingV1
-from .paper_engine import PaperExecutionSafetyError, _EvedexProtectedExecutionEngine
+from .paper_engine import (
+    PaperExecutionResult,
+    PaperExecutionSafetyError,
+    _EvedexProtectedExecutionEngine,
+)
 from .production_accounting import PostgresProductionAccounting
 from .production_lifecycle_binding import ProductionLifecycleBindingV1
 from .production_observation import PROD_EXCHANGE_ORIGIN
@@ -271,6 +275,7 @@ class ProductionLifecycleEngine(_EvedexProtectedExecutionEngine):
         sleeper: Callable[[float], Awaitable[None]] | None = None,
         mutation_budget: ExecutionMutationBudgetRepository | None = None,
         runtime_health: ExecutionRuntimeHealthRepository | None = None,
+        prepared_exit_risk: Any | None = None,
     ) -> None:
         settings = ProductionLifecycleConfigV1.model_validate(settings)
         from .production_lifecycle_adapter import ManagedProductionLifecycleAdapter
@@ -289,6 +294,23 @@ class ProductionLifecycleEngine(_EvedexProtectedExecutionEngine):
             raise ValueError("production lifecycle supports only the managed EVEDEX adapter")
         self.production_settings = settings
         self.production_runtime = runtime
+        if prepared_exit_risk is not None:
+            from .production_path import ProductionPreparedExitRiskStager
+
+            if not isinstance(prepared_exit_risk, ProductionPreparedExitRiskStager):
+                raise TypeError("production exits require the concrete per-effect Risk stager")
+            if clock is None:
+                clock = prepared_exit_risk.clock
+            if (
+                prepared_exit_risk.runtime is not runtime
+                or prepared_exit_risk.publisher.trades is not trades
+                or prepared_exit_risk.publisher.effects is not effects
+                or prepared_exit_risk.publisher.lifecycle_bindings is not adapter.bindings
+                or prepared_exit_risk.clock is not clock
+                or runtime._clock is not clock
+            ):
+                raise ValueError("exit Risk stager differs from the exact lifecycle resources/clock")
+        self.prepared_exit_risk = prepared_exit_risk
         policy = _production_policy(settings)
         super().__init__(
             adapter,
@@ -301,6 +323,38 @@ class ProductionLifecycleEngine(_EvedexProtectedExecutionEngine):
             mutation_budget=mutation_budget,
             runtime_health=runtime_health,
         )
+
+    async def _prepare_exit_risk(self, effect_id: str) -> None:
+        if self.prepared_exit_risk is not None:
+            await self.prepared_exit_risk.stage(effect_id)
+
+    async def _handle_once(self, decision: RiskTradeDecisionV1) -> PaperExecutionResult:
+        # A durable completed/uncertain entry is recovery work, not a new entry
+        # quote request. Requiring the old quote to be fresh would poison delayed
+        # bus redelivery even after an otherwise successful protected lifecycle.
+        self._validate_decision(decision)
+        if decision.approved:
+            trade_id = self._required_text(decision.trade_id, "trade_id")
+            existing = await self.trades.get(trade_id)
+            if existing is not None and existing.state is not TradeState.RECEIVED:
+                if (
+                    existing.environment != self._environment
+                    or existing.account_id != self._lifecycle_scope.account_id
+                    or existing.exchange != self.adapter.name
+                    or not await self.trades.verify_chain(trade_id)
+                    or canonical_digest(self._decision_for_trade(existing)) != canonical_digest(decision)
+                ):
+                    raise PaperExecutionSafetyError("PROD redelivery differs from exact durable decision")
+                if self.recovery_blocked or not await self.trades.entries_allowed(
+                    environment=self._environment,
+                    account_id=self._lifecycle_scope.account_id,
+                    exchange=self.adapter.name,
+                ):
+                    raise PaperExecutionSafetyError("PROD redelivery requires authoritative startup recovery")
+                return PaperExecutionResult(events=tuple(await self._reconcile_redelivery_locked(existing)))
+        # New entries, including a durable RECEIVED pre-mutation gap, retain all
+        # original market freshness, operator, Risk and one-use dispatch gates.
+        return await super()._handle_once(decision)
 
     def _expected_venue_health(self) -> dict[str, Any]:
         return self.production_settings.expected_health.model_dump(mode="python")

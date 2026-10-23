@@ -30,6 +30,7 @@ from kairos_execution.production_exit_risk import (
 )
 from kairos_execution.production_exposure import GAPS
 from kairos_execution.production_history import ProductionHistoryCaptureV1, ProductionHistoryComponentV1
+from kairos_execution.production_lifecycle_binding import build_production_lifecycle_binding
 from kairos_execution.production_lifecycle_store import PostgresLifecycleBindingStore
 from kairos_execution.production_readiness import ProductionContextV1, canonical_digest
 from kairos_execution.production_state import PostgresExposureStateWriter, PostgresRiskStateWriter
@@ -139,6 +140,9 @@ class MemoryBindingStore(PostgresLifecycleBindingStore):
         self.expected_role = "binding_writer"
         self.rows = {}
 
+    async def get(self, lifecycle_effect_id):
+        return self.rows.get(lifecycle_effect_id)
+
     async def put(self, value):
         prior = self.rows.get(value.lifecycle_effect_id)
         if prior is not None and prior != value:
@@ -224,8 +228,9 @@ def _setup(role="TIMEOUT_EXIT", *, state=None, quantity=0.05, filled_quantity=0.
         occurred_at=datetime.fromtimestamp(decision.decided_at_ms / 1_000, tz=UTC),
     )
     close_id = client_order_id(f"{decision.trade_id}:{role}", "evedex", occurred_at=NOW)
-    stop_id = client_order_id(f"{decision.trade_id}:STOP_LOSS", "evedex", occurred_at=NOW)
-    target_id = client_order_id(f"{decision.trade_id}:TAKE_PROFIT", "evedex", occurred_at=NOW)
+    original_at = datetime.fromtimestamp(decision.decided_at_ms / 1_000, tz=UTC)
+    stop_id = client_order_id(f"{decision.trade_id}:STOP_LOSS", "evedex", occurred_at=original_at)
+    target_id = client_order_id(f"{decision.trade_id}:TAKE_PROFIT", "evedex", occurred_at=original_at)
     trade = TradeRecord(
         trade_id=decision.trade_id,
         strategy_intent_id=decision.intent.intent_id,
@@ -332,6 +337,28 @@ def _setup(role="TIMEOUT_EXIT", *, state=None, quantity=0.05, filled_quantity=0.
     risk_writer = MemoryRiskWriter(context)
     exposure_writer = MemoryExposureWriter(context)
     bindings = MemoryBindingStore(context)
+    entry_effect_id = hashlib.sha256(
+        f"prod.v1:{canonical_digest(context)}:{trade.trade_id}:ENTRY:place".encode()
+    ).hexdigest()
+    entry_plan_now = datetime.fromtimestamp(
+        max(decision.decided_at_ms, decision.intent.entry_eligible_ts_ms) / 1_000,
+        tz=UTC,
+    )
+    entry_expiry = datetime.fromtimestamp(
+        min(decision.intent.entry_expires_ts_ms, decision.venue_quality.expires_at_ms) / 1_000,
+        tz=UTC,
+    )
+    bindings.rows[entry_effect_id] = build_production_lifecycle_binding(
+        decision=decision,
+        context=context,
+        custody_binding=custody,
+        role="ENTRY",
+        lifecycle_effect_id=entry_effect_id,
+        client_order_id=entry_id,
+        manual_request_sha256="5" * 64,
+        expires_at=entry_expiry,
+        now=entry_plan_now,
+    )
     verifier = SyntheticExitVerifier()
     publisher = ProductionLiveExitRiskPublisher(
         verifier=verifier,
@@ -358,11 +385,11 @@ def _setup(role="TIMEOUT_EXIT", *, state=None, quantity=0.05, filled_quantity=0.
     )
 
 
-async def _stage(publisher, effect):
+async def _stage(publisher, effect, manual_request_sha256="5" * 64):
     return await publisher.stage_prepared_exit(
         effect_id=effect.effect_key,
         raw_evidence="synthetic-qualified-proof",
-        manual_request_sha256="5" * 64,
+        manual_request_sha256=manual_request_sha256,
         expires_at=NOW + timedelta(seconds=1),
         now=NOW,
     )
@@ -378,6 +405,7 @@ async def test_exact_prepared_exit_stages_independent_per_effect_risk(role):
     receipt = await _stage(publisher, effect)
 
     assert receipt.lifecycle_binding.role == role
+    assert receipt.lifecycle_binding.request.manual_request_sha256 == "5" * 64
     assert receipt.lifecycle_binding.risk_decision_id != decision.decision_id
     assert receipt.risk_geometry.decision_id == receipt.lifecycle_binding.risk_decision_id
     assert receipt.risk_geometry.effect_id == receipt.lifecycle_binding.signing_effect_id
@@ -387,7 +415,29 @@ async def test_exact_prepared_exit_stages_independent_per_effect_risk(role):
     assert receipt.risk_geometry.worst_case_loss_usd < receipt.risk_geometry.account_equity_usd
     assert receipt.risk_geometry.parent_order_id == receipt.exposure.parent_order_id
     assert receipt.risk_geometry.valid_until <= receipt.exposure.valid_until
-    assert len(risks.rows) == len(exposures.rows) == len(bindings.rows) == 1
+    assert len(risks.rows) == len(exposures.rows) == 1
+    assert len(bindings.rows) == 2  # original ENTRY lineage plus this effect
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["STOP_LOSS", "TAKE_PROFIT"])
+@pytest.mark.parametrize("stored_client", [None, "foreign-protect-client"])
+async def test_new_prepared_protection_derives_exact_plan_client_before_confirmation(role, stored_client):
+    publisher, _verifier, trades, _effects, risks, _exposures, _bindings, _decision, trade, effect = _setup(
+        role
+    )
+    prefix = "stop" if role == "STOP_LOSS" else "target"
+    trades.trade = replace(
+        trade, **{f"{prefix}_client_order_id": stored_client, f"{prefix}_exchange_order_id": None}
+    )
+    if stored_client is None:
+        receipt = await _stage(publisher, effect)
+        assert receipt.lifecycle_binding.role == role
+        assert getattr(trades.trade, f"{prefix}_client_order_id") is None
+    else:
+        with pytest.raises(ProductionExitRiskError, match="lineage is invalid"):
+            await _stage(publisher, effect)
+        assert not risks.rows
 
 
 @pytest.mark.asyncio
@@ -423,7 +473,7 @@ async def test_protection_loss_uses_worse_source_entry_and_rejects_overfilled_tr
     trades.trade = replace(trade, filled_quantity=decision.quantity + 0.001)
     with pytest.raises(ProductionExitRiskError, match="durable PREPARED"):
         await _stage(publisher, effect)
-    assert not risks.rows and not exposures.rows and not bindings.rows
+    assert not risks.rows and not exposures.rows and len(bindings.rows) == 1
 
 
 @pytest.mark.asyncio
@@ -436,7 +486,7 @@ async def test_source_facts_with_no_price_loss_or_cost_refuse_instead_of_using_e
     with pytest.raises(ProductionExitRiskError, match="no positive conservative"):
         await _stage(publisher, effects.effect)
 
-    assert not risks.rows and not exposures.rows and not bindings.rows
+    assert not risks.rows and not exposures.rows and len(bindings.rows) == 1
 
 
 @pytest.mark.asyncio
@@ -447,19 +497,58 @@ async def test_unconfigured_returned_source_id_refuses_without_writes():
     with pytest.raises(ProductionExitRiskError, match="not bound to exact effect/exposure"):
         await _stage(publisher, effects.effect)
 
-    assert not risks.rows and not exposures.rows and not bindings.rows
+    assert not risks.rows and not exposures.rows and len(bindings.rows) == 1
 
 
 @pytest.mark.asyncio
 async def test_valid_reduction_does_not_depend_on_expired_entry_window_or_entry_mode():
-    publisher, _verifier, _trades, _effects, risks, exposures, _bindings, decision, _trade, effect = _setup(
+    publisher, _verifier, _trades, _effects, risks, exposures, bindings, decision, _trade, effect = _setup(
         "TIMEOUT_EXIT"
     )
     assert NOW.timestamp() * 1_000 > decision.intent.entry_expires_ts_ms
+    entry_effect_id = hashlib.sha256(
+        f"prod.v1:{canonical_digest(publisher.context)}:{decision.trade_id}:ENTRY:place".encode()
+    ).hexdigest()
+    assert bindings.rows[entry_effect_id].request.expires_at < NOW
 
     await _stage(publisher, effect)
 
     assert risks.rows and exposures.rows
+
+
+@pytest.mark.asyncio
+async def test_missing_foreign_or_rebound_entry_binding_refuses_without_writes():
+    publisher, _verifier, _trades, effects, risks, exposures, bindings, decision, trade, effect = _setup(
+        "TIMEOUT_EXIT"
+    )
+    entry_effect_id = hashlib.sha256(
+        f"prod.v1:{canonical_digest(publisher.context)}:{trade.trade_id}:ENTRY:place".encode()
+    ).hexdigest()
+    original = bindings.rows.pop(entry_effect_id)
+    with pytest.raises(ProductionExitRiskError, match="immutable ENTRY owner binding"):
+        await _stage(publisher, effect)
+    assert not risks.rows and not exposures.rows
+
+    bindings.rows[entry_effect_id] = original.model_copy(update={"trade_id": "9" * 64})
+    with pytest.raises(ProductionExitRiskError, match="immutable ENTRY owner binding"):
+        await _stage(publisher, effect)
+    assert not risks.rows and not exposures.rows
+
+    rebound_request = original.request.model_copy(update={"manual_request_sha256": "6" * 64})
+    bindings.rows[entry_effect_id] = original.model_copy(update={"request": rebound_request})
+    with pytest.raises(ProductionExitRiskError, match="immutable ENTRY owner binding"):
+        await _stage(publisher, effect)
+    assert not risks.rows and not exposures.rows
+
+
+@pytest.mark.asyncio
+async def test_legacy_owner_digest_argument_is_consistency_check_only():
+    publisher, _verifier, _trades, effects, risks, exposures, bindings, *_ = _setup("TIMEOUT_EXIT")
+
+    with pytest.raises(ProductionExitRiskError, match="immutable ENTRY owner binding"):
+        await _stage(publisher, effects.effect, "6" * 64)
+
+    assert not risks.rows and not exposures.rows and len(bindings.rows) == 1
 
 
 @pytest.mark.asyncio
@@ -480,7 +569,7 @@ async def test_mismatched_or_stale_source_evidence_refuses_without_writes(bad_fi
     with pytest.raises(ProductionExitRiskError, match=message):
         await _stage(publisher, effect_repo.effect)
 
-    assert not risks.rows and not exposures.rows and not bindings.rows
+    assert not risks.rows and not exposures.rows and len(bindings.rows) == 1
 
 
 @pytest.mark.asyncio
@@ -490,7 +579,7 @@ async def test_bad_chain_parent_side_role_or_overclose_refuses_before_persistenc
     )
     with pytest.raises(ProductionExitRiskError, match="durable PREPARED"):
         await _stage(publisher, effect)
-    assert not risks.rows and not exposures.rows and not bindings.rows
+    assert not risks.rows and not exposures.rows and len(bindings.rows) == 1
 
     publisher, verifier, trades, effects, risks, exposures, bindings, _decision, _trade, effect = _setup(
         "TIMEOUT_EXIT"
@@ -498,7 +587,7 @@ async def test_bad_chain_parent_side_role_or_overclose_refuses_before_persistenc
     effects.chain_valid = False
     with pytest.raises(ProductionExitRiskError, match="durable PREPARED"):
         await _stage(publisher, effect)
-    assert not risks.rows and not exposures.rows and not bindings.rows
+    assert not risks.rows and not exposures.rows and len(bindings.rows) == 1
 
     publisher, verifier, trades, effects, risks, exposures, bindings, _decision, _trade, effect = _setup(
         "TIMEOUT_EXIT"
@@ -517,7 +606,7 @@ async def test_bad_chain_parent_side_role_or_overclose_refuses_before_persistenc
     )
     with pytest.raises(ProductionExitRiskError, match="not bound to exact effect/exposure"):
         await _stage(publisher, effect)
-    assert not risks.rows and not exposures.rows and not bindings.rows
+    assert not risks.rows and not exposures.rows and len(bindings.rows) == 1
 
 
 def test_pinned_source_refuses_before_any_writer_can_be_called():
@@ -554,4 +643,4 @@ def test_pinned_source_refuses_before_any_writer_can_be_called():
             role="TIMEOUT_EXIT",
             now=NOW,
         )
-    assert GAPS and not risks.rows and not exposures.rows and not bindings.rows
+    assert GAPS and not risks.rows and not exposures.rows and len(bindings.rows) == 1

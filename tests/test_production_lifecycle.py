@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from kairos_core.enums import EvedexProfile
+from kairos_persistence import TradeState
 from pydantic import ValidationError
 
 from kairos_execution.paper_engine import PaperExecutionSafetyError
@@ -52,6 +55,66 @@ def _bare_engine(config=None):
     engine.clock = lambda: datetime.now(UTC)
     engine._operational_telemetry = {}
     return engine
+
+
+def _redelivery_engine(state=TradeState.ACTIVE):
+    engine = _bare_engine()
+    decision = _decision()
+    trade = SimpleNamespace(
+        state=state,
+        trade_id=decision.trade_id,
+        environment=engine._environment,
+        account_id=decision.account_id,
+        exchange="evedex",
+        risk_decision_payload=decision.to_payload(),
+        risk_decision_id=decision.decision_id,
+        strategy_intent_id=decision.intent.intent_id,
+        symbol=decision.intent.symbol,
+    )
+    engine.adapter = SimpleNamespace(name="evedex")
+    engine.trades = SimpleNamespace(
+        get=AsyncMock(return_value=trade),
+        verify_chain=AsyncMock(return_value=True),
+        entries_allowed=AsyncMock(return_value=True),
+    )
+    engine._recovery_blockers = ()
+    engine._reconcile_redelivery_locked = AsyncMock(return_value=[])
+    engine.clock = lambda: datetime.fromtimestamp((decision.venue_quality.expires_at_ms + 1) / 1000, tz=UTC)
+    return engine, decision, trade
+
+
+@pytest.mark.asyncio
+async def test_prod_durable_redelivery_recovers_without_renewing_expired_entry_quote():
+    engine, decision, trade = _redelivery_engine()
+    result = await engine._handle_once(decision)
+    assert result.events == ()
+    engine._reconcile_redelivery_locked.assert_awaited_once_with(trade)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["scope", "chain", "startup"])
+async def test_prod_redelivery_requires_exact_scope_chain_and_startup_recovery(fault):
+    engine, decision, trade = _redelivery_engine()
+    if fault == "scope":
+        trade.environment = "another-environment"
+    elif fault == "chain":
+        engine.trades.verify_chain.return_value = False
+    else:
+        engine._recovery_blockers = ("startup-pending",)
+    with pytest.raises(PaperExecutionSafetyError):
+        await engine._handle_once(decision)
+    engine._reconcile_redelivery_locked.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", [None, TradeState.RECEIVED])
+async def test_prod_new_or_received_trade_keeps_expired_quote_refusal(state):
+    engine, decision, _trade = _redelivery_engine(state)
+    if state is None:
+        engine.trades.get.return_value = None
+    with pytest.raises(PaperExecutionSafetyError, match="expired"):
+        await engine._handle_once(decision)
+    engine._reconcile_redelivery_locked.assert_not_awaited()
 
 
 def test_production_scope_is_context_namespaced_and_account_bound():

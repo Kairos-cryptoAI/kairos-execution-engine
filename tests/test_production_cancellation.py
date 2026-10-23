@@ -127,6 +127,40 @@ def _venue(context, now, *, position="0", orders=(), protections=()):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("clock_delta_ms", "snapshot_delta_ms", "error"),
+    [(200, 200, None), (-1, 0, "backwards"), (200, 1_000, "stale"), (200, -6_000, "stale")],
+)
+async def test_fresh_venue_capture_uses_post_io_time_without_retiming(
+    clock_delta_ms, snapshot_delta_ms, error
+):
+    verifier, _, started_at = _verifier()
+    clock_value = [started_at]
+    verifier.clock = lambda: clock_value[0]
+    snapshot = _venue(verifier.context, started_at + timedelta(milliseconds=snapshot_delta_ms))
+
+    class CapturingSource:
+        source_id = "synthetic"
+
+        async def read_cancellation_snapshot_async(self, **kwargs):
+            clock_value[0] = started_at + timedelta(milliseconds=clock_delta_ms)
+            return snapshot
+
+        def verify_cancellation_snapshot(self, raw, **kwargs):
+            return raw
+
+    source = CapturingSource()
+    verifier.venue_sources = {source.source_id: source}
+    if error is None:
+        _, captured = await verifier._read_venue(instrument="BTCUSD", now=started_at)
+        assert captured == snapshot
+        assert captured.observed_at > started_at
+    else:
+        with pytest.raises(ProductionCancellationError, match=error):
+            await verifier._read_venue(instrument="BTCUSD", now=started_at)
+
+
+@pytest.mark.asyncio
 async def test_entry_cancel_claims_once_rechecks_and_uses_only_exact_cancel_transport():
     verifier, _, _ = _verifier()
 

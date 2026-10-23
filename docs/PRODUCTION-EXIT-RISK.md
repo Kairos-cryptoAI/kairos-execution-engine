@@ -16,6 +16,17 @@ payload. The original decision is always loaded from the trade journal; the API
 accepts no caller-supplied Core decision or approval boolean. It refuses stale,
 changed, unowned, malformed, or over-sized effects.
 
+Exit owner lineage is never selected by the staging caller. The publisher
+resolves the deterministic original ENTRY lifecycle effect from the immutable
+binding store and verifies its context, trade/decision IDs and digest, custody
+receipt, original client ID, request geometry, and canonical rebuild at the
+ENTRY plan's original eligibility time. It copies that plan's
+`manual_request_sha256` into the exit binding. A legacy optional digest argument
+is accepted only as an equality assertion against the stored value. An expired
+ENTRY request remains historical owner lineage and is not renewed; managed
+authorization still requires the accepted nonce and original owner arm, while
+each exit separately requires its own fresh Risk and exposure evidence.
+
 Deployment must inject a source verifier implementing
 `ProductionExitEvidenceVerifier.verify_exit`. Its raw proof must qualify fresh
 account economics and the exact current position, and return

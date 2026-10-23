@@ -237,7 +237,7 @@ class ProductionLiveExitRiskPublisher:
         *,
         effect_id: str,
         raw_evidence: object,
-        manual_request_sha256: str,
+        manual_request_sha256: str | None = None,
         expires_at: datetime,
         now: datetime,
     ) -> ProductionExitRiskStageReceiptV1:
@@ -246,6 +246,11 @@ class ProductionLiveExitRiskPublisher:
         if not now < expires_at <= now + _MAX_AGE:
             raise ProductionExitRiskError("exit request lease must be positive and at most five seconds")
         effect, trade, decision, role = await self._load_exact_prepared(effect_id)
+        original_owner_digest = await self._original_entry_owner_digest(
+            trade=trade,
+            decision=decision,
+            legacy_digest=manual_request_sha256,
+        )
         try:
             verified = self.verifier.verify_exit(
                 raw_evidence,
@@ -309,7 +314,7 @@ class ProductionLiveExitRiskPublisher:
                 role=role,
                 lifecycle_effect_id=effect.effect_key,
                 client_order_id=effect.client_order_id or "",
-                manual_request_sha256=manual_request_sha256,
+                manual_request_sha256=original_owner_digest,
                 expires_at=lease,
                 now=now,
                 parent_order_id=trade.entry_client_order_id,
@@ -365,6 +370,68 @@ class ProductionLiveExitRiskPublisher:
             staged_at=now,
             binding_inserted=inserted,
         )
+
+    async def _original_entry_owner_digest(
+        self,
+        *,
+        trade: TradeRecord,
+        decision: RiskTradeDecisionV1,
+        legacy_digest: str | None,
+    ) -> str:
+        """Resolve immutable owner lineage from the original ENTRY plan.
+
+        An expired ENTRY request is valid historical lineage; rebuild it at its
+        original eligibility time rather than renewing it at exit time.
+        """
+        from .state_machine import client_order_id
+
+        try:
+            namespace = f"prod.v1:{canonical_digest(self.context)}"
+            entry_effect_id = hashlib.sha256(f"{namespace}:{trade.trade_id}:ENTRY:place".encode()).hexdigest()
+            expected_client_id = client_order_id(
+                f"{trade.trade_id}:ENTRY",
+                "evedex",
+                occurred_at=datetime.fromtimestamp(decision.decided_at_ms / 1_000, tz=UTC),
+            )
+            if trade.entry_client_order_id != expected_client_id:
+                raise ValueError("entry parent client ID differs from original decision")
+            candidate = await self.lifecycle_bindings.get(entry_effect_id)
+            if candidate is None:
+                raise ValueError("immutable ENTRY lifecycle plan is absent")
+            candidate = ProductionLifecycleBindingV1.model_validate(candidate)
+            original_plan_now = datetime.fromtimestamp(
+                max(decision.decided_at_ms, decision.intent.entry_eligible_ts_ms) / 1_000,
+                tz=UTC,
+            )
+            rebuilt = build_production_lifecycle_binding(
+                decision=decision,
+                context=self.context,
+                custody_binding=self.custody_binding,
+                role="ENTRY",
+                lifecycle_effect_id=entry_effect_id,
+                client_order_id=expected_client_id,
+                manual_request_sha256=candidate.request.manual_request_sha256,
+                expires_at=candidate.request.expires_at,
+                now=original_plan_now,
+            )
+            if (
+                candidate != rebuilt
+                or candidate.context != self.context
+                or candidate.trade_id != trade.trade_id
+                or candidate.decision_id != decision.decision_id
+                or candidate.decision_sha256 != canonical_digest(decision)
+                or candidate.risk_decision_id != decision.decision_id
+                or candidate.lifecycle_effect_id != entry_effect_id
+                or candidate.request.custody_receipt_sha256 != self.custody_binding.custody_receipt_sha256
+                or candidate.request.manual_request_sha256 != rebuilt.request.manual_request_sha256
+                or (legacy_digest is not None and legacy_digest != candidate.request.manual_request_sha256)
+            ):
+                raise ValueError("immutable ENTRY lifecycle plan differs from original Core geometry")
+            return candidate.request.manual_request_sha256
+        except Exception:
+            raise ProductionExitRiskError(
+                "exact immutable ENTRY owner binding is absent or inconsistent"
+            ) from None
 
     async def _load_exact_prepared(
         self, effect_id: str
@@ -448,6 +515,19 @@ class ProductionLiveExitRiskPublisher:
     ) -> None:
         payload = effect.request_payload
         if role in {"STOP_LOSS", "TAKE_PROFIT"}:
+            from .state_machine import client_order_id
+
+            # The FSM persists the client/server protection association only
+            # after confirmation. A new PREPARED effect must instead match the
+            # exact deterministic plan ID; never invent a confirmed association.
+            expected_client = client_order_id(
+                f"{trade.trade_id}:{role}",
+                "evedex",
+                occurred_at=datetime.fromtimestamp(decision.decided_at_ms / 1_000, tz=UTC),
+            )
+            stored_client = (
+                trade.stop_client_order_id if role == "STOP_LOSS" else trade.target_client_order_id
+            )
             expected_keys = {
                 "trade_id",
                 "client_order_id",
@@ -464,8 +544,8 @@ class ProductionLiveExitRiskPublisher:
             expected_tpsl = role
             if (
                 set(payload) != expected_keys
-                or effect.client_order_id
-                != (trade.stop_client_order_id if role == "STOP_LOSS" else trade.target_client_order_id)
+                or effect.client_order_id != expected_client
+                or stored_client not in {None, expected_client}
                 or payload.get("parent_order_id") != trade.entry_client_order_id
                 or payload.get("side") != trade.side
                 or payload.get("tpsl_type") != expected_tpsl
@@ -476,7 +556,7 @@ class ProductionLiveExitRiskPublisher:
             ):
                 raise ValueError("protective effect differs from original exit plan")
             return
-        expected_client = trade.close_client_order_id
+        expected_close_client = trade.close_client_order_id
         if set(payload) != {"trade_id", "client_order_id", "venue_symbol", "quantity_hex", "leverage_hex"}:
             raise ValueError("close effect payload fields differ from the exact close contract")
         quantity_hex = payload.get("quantity_hex")
@@ -487,7 +567,7 @@ class ProductionLiveExitRiskPublisher:
         except Exception:
             raise ValueError("close effect quantity/leverage encoding is invalid") from None
         if (
-            effect.client_order_id != expected_client
+            effect.client_order_id != expected_close_client
             or not math.isfinite(quantity)
             or quantity <= 0
             or quantity > trade.filled_quantity

@@ -1629,31 +1629,65 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
         self, connection: asyncpg.Connection, identity: asyncpg.Record
     ) -> None:
         protected = tuple(identity[key] for key in ("owner_role", "runtime_role", *_WRITER_TABLES))
-        for role_field, writer_role in ((key, identity[key]) for key in _WRITER_TABLES):
+        writers = tuple((key, identity[key]) for key in _WRITER_TABLES)
+        if len(set(protected)) != len(protected):
+            raise ProductionStateError("production state roles are not isolated")
+        for _, writer_role in writers:
             await _check_role_isolated(connection, writer_role, protected)
+
+        # PostgreSQL can evaluate the complete exact role/table privilege matrix
+        # in one statement. Keep this uncached: every signing evidence read must
+        # recheck current grants on its own repeatable-read snapshot.
+        rows = await connection.fetch(
+            """
+            WITH role_table AS (
+                SELECT r.role_field, r.role_name, t.table_name,
+                       to_regclass(format('%I.%I', $3::text, t.table_name)) AS table_oid
+                FROM unnest($1::text[], $2::text[]) AS r(role_field, role_name)
+                CROSS JOIN unnest($4::text[]) AS t(table_name)
+            )
+            SELECT role_field, role_name, table_name,
+                   CASE WHEN table_oid IS NULL THEN NULL
+                        ELSE has_table_privilege(role_name, table_oid, 'INSERT') END AS has_insert,
+                   CASE WHEN table_oid IS NULL THEN NULL
+                        ELSE has_table_privilege(role_name, table_oid, 'SELECT') END AS has_select,
+                   CASE WHEN table_oid IS NULL THEN NULL
+                        ELSE has_table_privilege(
+                            role_name, table_oid,
+                            'UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'
+                        ) END AS has_mutating,
+                   has_schema_privilege(role_name, $3, 'CREATE') AS can_create_schema
+            FROM role_table
+            ORDER BY role_field, table_name
+            """,
+            [role_field for role_field, _ in writers],
+            [writer_role for _, writer_role in writers],
+            SCHEMA,
+            list(_TABLES),
+        )
+        expected_keys = {
+            (role_field, writer_role, table) for role_field, writer_role in writers for table in _TABLES
+        }
+        actual_keys = [(row["role_field"], row["role_name"], row["table_name"]) for row in rows]
+        if len(actual_keys) != len(expected_keys) or set(actual_keys) != expected_keys:
+            raise ProductionStateError("production state writer privilege matrix is incomplete")
+        matrix = {(row["role_field"], row["role_name"], row["table_name"]): row for row in rows}
+
+        for role_field, writer_role in writers:
             allowed = _WRITER_TABLES[role_field]
             for table in _TABLES:
-                name = f"{SCHEMA}.{table}"
-                has_insert = await connection.fetchval(
-                    "SELECT has_table_privilege($1,$2,'INSERT')", writer_role, name
-                )
-                if not has_insert:
-                    if table in allowed:
+                row = matrix[(role_field, writer_role, table)]
+                expected_insert = table in allowed
+                if row["has_insert"] is not expected_insert:
+                    if expected_insert:
                         raise ProductionStateError("production state writer privilege is absent")
-                elif table not in allowed:
                     raise ProductionStateError("production state writer crosses its least-privilege boundary")
-                for privilege in ("UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"):
-                    if await connection.fetchval(
-                        "SELECT has_table_privilege($1,$2,$3)", writer_role, name, privilege
-                    ):
-                        raise ProductionStateError("production state writer has excessive table privileges")
-                has_select = await connection.fetchval(
-                    "SELECT has_table_privilege($1,$2,'SELECT')", writer_role, name
-                )
+                if row["has_mutating"] is not False:
+                    raise ProductionStateError("production state writer has excessive table privileges")
                 expected_select = table in _writer_select_tables(role_field, self.state_schema_version)
-                if has_select != expected_select:
+                if row["has_select"] is not expected_select:
                     raise ProductionStateError("production state writer SELECT privilege mismatch")
-            if await connection.fetchval("SELECT has_schema_privilege($1,$2,'CREATE')", writer_role, SCHEMA):
+            if matrix[(role_field, writer_role, _TABLES[0])]["can_create_schema"] is not False:
                 raise ProductionStateError("production state writer can modify its schema")
 
     async def _read_snapshot(
