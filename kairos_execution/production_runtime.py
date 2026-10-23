@@ -136,6 +136,7 @@ class ProductionExecutionRuntime:
             raise ValueError("wire dispatcher differs from the exact production authorization scope")
         if authorization._preconditions.context != context:
             raise ValueError("production preconditions differ from the custody/database context")
+        self._check_concrete_transport_binding(dispatcher, binding)
         self.signer = signer
         self.authorization = authorization
         self.claims = claims
@@ -146,6 +147,19 @@ class ProductionExecutionRuntime:
         self.binding = binding
         self._clock = clock or (lambda: datetime.now(UTC))
 
+    @staticmethod
+    def _check_concrete_transport_binding(
+        dispatcher: ProductionEffectDispatcher, binding: CustodyBindingV1
+    ) -> None:
+        # TP/SL has no chainId in the REST body: its domain is bound through
+        # custody. The actual SDK sender must therefore agree with that exact
+        # binding, not merely validate the other operations' body chainId.
+        from .production_transport import ProductionEvedexTransport
+
+        transport = getattr(dispatcher.sender, "__self__", None)
+        if isinstance(transport, ProductionEvedexTransport):
+            transport.require_runtime_binding(binding)
+
     async def inspect_authority(self, request: ManagedSigningRequestV1) -> ProductionAuthorityInspection:
         """Validate one exact request and return facts, not LIVE readiness/authority.
 
@@ -154,6 +168,7 @@ class ProductionExecutionRuntime:
         durable reservation before claiming/signing.
         """
         request = ManagedSigningRequestV1.model_validate(request)
+        self._check_concrete_transport_binding(self.dispatcher, self.binding)
         if request.context != self.context:
             raise ValueError("signing request differs from the production runtime context")
         if request.operation not in _WIRE_SHAPE:

@@ -1,0 +1,358 @@
+import { createRequire } from "node:module";
+import { Agent as HttpsAgent } from "node:https";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+
+const require = createRequire(import.meta.url);
+const evedex = require("@evedex/exchange-bot-sdk");
+const sdkEntry = require.resolve("@evedex/exchange-bot-sdk");
+const { RestClient } = require(join(dirname(sdkEntry), "utils", "rest.js"));
+const axios = require("axios");
+const SDK_VERSION = "1.2.11";
+const EXCHANGE_API_VERSION = "1.0.70";
+const EXCHANGE_CRYPTO_VERSION = "1.1.0";
+const PAGE_LIMIT = 100;
+const MAX_RECORDS = 10_000;
+const HTTP_TIMEOUT_MS = 20_000;
+const MAX_HTTP_BYTES = 4 * 1024 * 1024;
+const PROD_PROFILE = Object.freeze({
+  exchangeURI: "https://trading-api.evedex.com",
+  authURI: "https://auth-api.evedex.com",
+  centrifugeURI: "wss://ws.evedex.com/connection/websocket",
+  centrifugePrefix: "futures-perp",
+  chainId: "42161",
+});
+
+const HTTP_ORIGINS = new Set([new URL(PROD_PROFILE.exchangeURI).origin, new URL(PROD_PROFILE.authURI).origin]);
+
+function validateProdHttpUrl(request) {
+  if (typeof request?.url !== "string") throw new TypeError("EVEDEX HTTP URL is missing");
+  let url;
+  try {
+    url = new URL(request.url);
+  } catch {
+    throw new TypeError("EVEDEX HTTP URL is malformed");
+  }
+  if (url.protocol !== "https:" || !HTTP_ORIGINS.has(url.origin) || url.username || url.password || url.hash) {
+    throw new TypeError("EVEDEX HTTP destination is outside the fixed HTTPS PROD origins");
+  }
+  const route = `${String(request.method).toUpperCase()} ${url.pathname}`;
+  if (url.origin !== new URL(PROD_PROFILE.exchangeURI).origin) {
+    throw new TypeError("EVEDEX PROD API-key account does not authorize auth-origin requests");
+  }
+  const allowed = new Set([
+    "GET /api/user/me",
+    "GET /api/user/funding",
+    "GET /api/order",
+    "GET /api/tpsl",
+    "POST /api/v2/order/limit",
+    "POST /api/v2/order/market",
+    "POST /api/v2/order/stop-limit",
+  ]);
+  if (!allowed.has(route) && !/^GET \/api\/order\/[A-Za-z0-9_.:-]{1,160}$/.test(route) &&
+      !/^DELETE \/api\/order\/[A-Za-z0-9_.:-]{1,160}$/.test(route) &&
+      !/^POST \/api\/v2\/position\/[A-Z0-9]{1,32}\/close$/.test(route) &&
+      !/^POST \/api\/tpsl\/[A-Z0-9]{1,32}$/.test(route) &&
+      !/^DELETE \/api\/tpsl\/[A-Z0-9]{1,32}\/[A-Za-z0-9_.:-]{1,160}$/.test(route)) {
+    throw new TypeError("EVEDEX HTTP route is outside the fixed PROD method allowlist");
+  }
+  return url;
+}
+
+export class PinnedProdRestClient extends RestClient {
+  constructor({ adapter } = {}) {
+    super({});
+    this.adapter = adapter;
+    this.httpsAgent = new HttpsAgent({ keepAlive: false, maxSockets: 8 });
+  }
+
+  async authRequest(request) {
+    // Check destination before the SDK adds the API-key header.
+    validateProdHttpUrl(request);
+    const session = this.getSession();
+    if (!session || typeof session.apiKey !== "string" || Object.keys(session).length !== 1) {
+      throw new TypeError("EVEDEX PROD HTTP client accepts API-key authentication only");
+    }
+    return super.authRequest(request);
+  }
+
+  async request(request) {
+    const url = validateProdHttpUrl(request);
+    const config = {
+      url: url.toString(),
+      method: request.method,
+      headers: request.headers,
+      data: request.body,
+      timeout: HTTP_TIMEOUT_MS,
+      maxRedirects: 0,
+      proxy: false,
+      maxContentLength: MAX_HTTP_BYTES,
+      maxBodyLength: MAX_HTTP_BYTES,
+      httpsAgent: this.httpsAgent,
+      ...(this.adapter ? { adapter: this.adapter } : {}),
+    };
+    try {
+      return await axios.request(config);
+    } catch {
+      // The SDK's RequestError retains request headers, so never pass it through.
+      throw new Error("EVEDEX PROD HTTP transport failed");
+    }
+  }
+}
+
+const OPERATIONS = new Map([
+  ["/api/v2/order/limit", {
+    keys: ["id", "instrument", "side", "leverage", "quantity", "limitPrice", "chainId", "timeInForce", "signature"],
+    call: (gateway, body) => gateway.createLimitOrderV2(body),
+  }],
+  ["/api/v2/order/market", {
+    keys: ["id", "instrument", "side", "timeInForce", "leverage", "cashQuantity", "chainId", "signature"],
+    call: (gateway, body) => gateway.createMarketOrderV2(body),
+  }],
+  ["/api/v2/order/stop-limit", {
+    keys: ["id", "instrument", "side", "leverage", "quantity", "limitPrice", "stopPrice", "chainId", "signature"],
+    call: (gateway, body) => gateway.createStopLimitOrderV2(body),
+  }],
+  ["/api/v2/position/{instrument}/close", {
+    keys: ["id", "instrument", "leverage", "quantity", "chainId", "signature"],
+    call: (gateway, body) => gateway.closePositionV2(body),
+  }],
+  ["/api/tpsl/{instrument}", {
+    keys: ["instrument", "type", "side", "quantity", "price", "order", "signature"],
+    call: (gateway, body) => gateway.createTpSl(body),
+  }],
+]);
+
+function packageVersion(packageName) {
+  const entry = require.resolve(packageName);
+  let directory = dirname(entry);
+  for (;;) {
+    const candidate = join(directory, "package.json");
+    try {
+      const parsed = JSON.parse(readFileSync(candidate, "utf8"));
+      if (parsed.name === packageName) return parsed.version;
+    } catch {
+      // Continue to the package root; no package contents are trusted as config.
+    }
+    const parent = dirname(directory);
+    if (parent === directory) throw new Error("pinned EVEDEX dependency metadata is unavailable");
+    directory = parent;
+  }
+}
+
+export function assertPinnedProdProfile(sdk = evedex) {
+  if (
+    packageVersion("@evedex/exchange-bot-sdk") !== SDK_VERSION ||
+    packageVersion("@evedex/exchange-api") !== EXCHANGE_API_VERSION ||
+    packageVersion("@evedex/exchange-crypto") !== EXCHANGE_CRYPTO_VERSION
+  ) {
+    throw new Error("installed EVEDEX SDK components differ from the reviewed production pins");
+  }
+  const actual = sdk.GatewayParamsMap.get(sdk.Environment.PROD);
+  if (!actual || Object.keys(PROD_PROFILE).some((key) => actual[key] !== PROD_PROFILE[key])) {
+    throw new Error("installed EVEDEX SDK production profile differs from the reviewed endpoint and chain pin");
+  }
+  return { ...PROD_PROFILE, sdkVersion: SDK_VERSION, exchangeApiVersion: EXCHANGE_API_VERSION };
+}
+
+function text(value, field) {
+  if (typeof value !== "string" || value.length === 0 || value.length > 160 || /[\u0000-\u001f]/.test(value)) {
+    throw new TypeError(`${field} is malformed`);
+  }
+  return value;
+}
+
+function validateBody(path, body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) throw new TypeError("signed body must be an object");
+  const operation = OPERATIONS.get(path);
+  if (!operation) {
+    const closeMatch = /^\/api\/v2\/position\/([A-Z0-9]{1,32})\/close$/.exec(path);
+    const tpslMatch = /^\/api\/tpsl\/([A-Z0-9]{1,32})$/.exec(path);
+    const matchedPath = closeMatch ? "/api/v2/position/{instrument}/close" : tpslMatch ? "/api/tpsl/{instrument}" : null;
+    if (!matchedPath || body.instrument !== (closeMatch?.[1] ?? tpslMatch?.[1])) {
+      throw new TypeError("signed operation is outside the fixed EVEDEX production allowlist");
+    }
+    path = matchedPath;
+  }
+  const selected = OPERATIONS.get(path);
+  const keys = Object.keys(body).sort();
+  const expected = [...selected.keys].sort();
+  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
+    throw new TypeError("signed body fields differ from the pinned EVEDEX production schema");
+  }
+  if (!/^0x[0-9a-fA-F]{130}$/.test(body.signature)) throw new TypeError("signed body signature is malformed");
+  if (!/^[A-Z0-9]{1,32}$/.test(text(body.instrument, "instrument"))) throw new TypeError("instrument is malformed");
+  if ("chainId" in body && body.chainId !== 42161) throw new TypeError("signed message chain differs from the pinned EVEDEX production chain");
+  if ("side" in body && !["BUY", "SELL"].includes(body.side)) throw new TypeError("signed side is malformed");
+  if ("timeInForce" in body && body.timeInForce !== "IOC") throw new TypeError("only the pinned IOC policy is supported");
+  for (const field of ["quantity", "limitPrice", "stopPrice", "cashQuantity", "price"]) {
+    if (field in body && (typeof body[field] !== "string" || !/^(0|[1-9][0-9]*)(\.[0-9]*[1-9])?$/.test(body[field]))) {
+      throw new TypeError(`${field} must be a canonical decimal string`);
+    }
+  }
+  if ("id" in body) text(body.id, "id");
+  if ("order" in body) text(body.order, "order");
+  if ("type" in body && !["stop-loss", "take-profit"].includes(body.type)) throw new TypeError("TP/SL type is malformed");
+  return { operation: selected, body };
+}
+
+function expectedAccount(account, expectedAccountId) {
+  if (!account || String(account.exchangeId ?? "") !== expectedAccountId) {
+    throw new Error("authenticated EVEDEX API key does not match the exact configured PROD account");
+  }
+}
+
+export class EvedexProdSdkGateway {
+  constructor({ apiKey, expectedAccountId, gatewayFactory, axiosAdapter } = {}) {
+    this.profile = assertPinnedProdProfile();
+    if (typeof apiKey !== "string" || apiKey.length === 0) throw new Error("EVEDEX_PROD_API_KEY is required");
+    if (typeof expectedAccountId !== "string" || expectedAccountId.length === 0) {
+      throw new Error("EVEDEX_PROD_EXPECTED_ACCOUNT_ID is required");
+    }
+    this.apiKey = apiKey;
+    this.expectedAccountId = expectedAccountId;
+    this.gatewayFactory = gatewayFactory ?? ((options) => new evedex.Gateway(options));
+    this.axiosAdapter = axiosAdapter;
+    this.gateway = undefined;
+    this.account = undefined;
+    this.authPromise = undefined;
+    this.preflightAttempted = false;
+    this.preflightFailed = false;
+  }
+
+  async preflight() {
+    if (this.account) return this.authenticatedIdentity;
+    if (this.authPromise) return this.authPromise;
+    if (this.preflightFailed || this.preflightAttempted) throw new Error("EVEDEX PROD SDK preflight already failed; create a fresh client after reconciliation");
+    this.preflightAttempted = true;
+    this.authPromise = (async () => {
+      const gateway = this.gatewayFactory({
+        authURI: this.profile.authURI,
+        exchangeURI: this.profile.exchangeURI,
+        centrifuge: { uri: this.profile.centrifugeURI, prefix: this.profile.centrifugePrefix },
+        httpClient: new PinnedProdRestClient({ adapter: this.axiosAdapter }),
+      });
+      try {
+        const account = await gateway.createApiKeyAccount({ apiKey: this.apiKey });
+        const identity = account?.exchangeAccount;
+        expectedAccount(identity, this.expectedAccountId);
+        this.gateway = gateway;
+        this.account = account;
+        this.authenticatedIdentity = identity;
+        return identity;
+      } catch (error) {
+        this.preflightFailed = true;
+        await gateway.closeWsConnection?.();
+        throw error;
+      }
+    })();
+    try {
+      await this.authPromise;
+      return this.authenticatedIdentity;
+    } finally {
+      this.authPromise = undefined;
+    }
+  }
+
+  #requirePreflight() {
+    assertPinnedProdProfile();
+    if (!this.account || this.preflightFailed) throw new Error("EVEDEX PROD SDK preflight is required before any operation");
+  }
+
+  async sendSignedPost({ method, path, body }) {
+    if (method !== "POST") throw new TypeError("only exact signed POST operations are supported");
+    const validated = validateBody(path, body);
+    this.#requirePreflight();
+    return validated.operation.call(this.account.exchangeGateway, validated.body);
+  }
+
+  async cancelOrder({ instrument, orderId }) {
+    text(instrument, "instrument");
+    text(orderId, "orderId");
+    if (!/^[A-Z0-9]{1,32}$/.test(instrument)) throw new TypeError("instrument is malformed");
+    if (!/^[A-Za-z0-9_.:-]{1,160}$/.test(orderId)) throw new TypeError("orderId is malformed");
+    this.#requirePreflight();
+    await this.account.exchangeGateway.cancelOrder({ orderId });
+    const record = await this.account.exchangeGateway.getOrder(orderId);
+    if (record?.id !== orderId || record?.instrument !== instrument || record?.status !== "CANCELLED") {
+      throw new Error("EVEDEX cancellation was not positively confirmed by the exact order record");
+    }
+    return { id: orderId, status: "CANCELED" };
+  }
+
+  async cancelTpSl({ instrument, protectionId }) {
+    text(instrument, "instrument");
+    text(protectionId, "protectionId");
+    if (!/^[A-Z0-9]{1,32}$/.test(instrument)) throw new TypeError("instrument is malformed");
+    if (!/^[A-Za-z0-9_.:-]{1,160}$/.test(protectionId)) throw new TypeError("protectionId is malformed");
+    this.#requirePreflight();
+    await this.account.exchangeGateway.cancelTpSl({ instrument, id: protectionId });
+    const record = await this.#findCancelledTpSl(instrument, protectionId);
+    if (!record) throw new Error("EVEDEX cancellation was not positively confirmed by the exact TP/SL record");
+    return { id: protectionId, status: "CANCELED" };
+  }
+
+  async #findCancelledTpSl(instrument, protectionId) {
+    let expectedCount;
+    const seen = new Set();
+    for (let offset = 0; offset <= MAX_RECORDS; offset += PAGE_LIMIT) {
+      const page = await this.account.exchangeGateway.getTpSl({ instrument, limit: PAGE_LIMIT, offset });
+      if (!page || !Number.isInteger(page.count) || page.count < 0 || page.count > MAX_RECORDS ||
+          !Array.isArray(page.list) || page.list.length > PAGE_LIMIT) {
+        throw new Error("EVEDEX TP/SL cancellation verification page is malformed");
+      }
+      if (expectedCount === undefined) expectedCount = page.count;
+      if (page.count !== expectedCount) throw new Error("EVEDEX TP/SL history changed during cancellation verification");
+      for (const item of page.list) {
+        if (typeof item?.id !== "string" || seen.has(item.id)) throw new Error("EVEDEX TP/SL cancellation history has invalid identities");
+        seen.add(item.id);
+        if (item.id === protectionId) return item.instrument === instrument && item.status === "cancelled" ? item : null;
+      }
+      if (seen.size === expectedCount) return null;
+      if (page.list.length === 0 || seen.size > expectedCount) throw new Error("EVEDEX TP/SL cancellation history is incomplete");
+    }
+    throw new Error("EVEDEX TP/SL cancellation verification exceeded its bound");
+  }
+
+  async fetchAccountIdentity() {
+    this.#requirePreflight();
+    return this.account.exchangeGateway.me();
+  }
+
+  async fetchOrderHistoryPage({ version, limit, offset, next }) {
+    if (version !== 2 || !Number.isInteger(limit) || limit < 1 || limit > 100 ||
+        !Number.isInteger(offset) || offset < 0 || offset > MAX_RECORDS ||
+        (next !== undefined && (typeof next !== "string" || next.length === 0 || next.length > 500))) {
+      throw new TypeError("order history page query is malformed");
+    }
+    this.#requirePreflight();
+    return this.account.exchangeGateway.getOrders({ version, limit, offset, ...(next === undefined ? {} : { next }) });
+  }
+
+  async fetchTpSlPage({ limit, offset }) {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100 || !Number.isInteger(offset) || offset < 0 || offset > MAX_RECORDS) {
+      throw new TypeError("TP/SL history page query is malformed");
+    }
+    this.#requirePreflight();
+    return this.account.exchangeGateway.getTpSl({ limit, offset });
+  }
+
+  async fetchFunding() {
+    this.#requirePreflight();
+    return this.account.exchangeGateway.getFunding();
+  }
+
+  async close() {
+    const gateway = this.gateway;
+    this.gateway = undefined;
+    this.account = undefined;
+    await gateway?.closeWsConnection?.();
+  }
+}
+
+export const PROD_SDK_PROFILE = Object.freeze({ ...PROD_PROFILE, sdkVersion: SDK_VERSION, exchangeApiVersion: EXCHANGE_API_VERSION });
+
+export function safeProdError(error) {
+  const knownCode = ["TypeError", "RangeError", "Error"].includes(error?.name) ? error.name : "SdkOperationError";
+  return { code: knownCode, message: "EVEDEX PROD SDK operation failed; reconcile before any further mutation." };
+}
