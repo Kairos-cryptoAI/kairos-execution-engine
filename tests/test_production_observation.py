@@ -321,6 +321,25 @@ async def test_boolean_amount_is_not_accepted_as_one_dollar():
         await _observer(responses=responses).capture_once()
 
 
+@pytest.mark.asyncio
+async def test_zero_funding_is_observable_but_does_not_create_capital_or_trading_readiness():
+    responses = _responses()
+    responses["/api/market/available-balance"] = {
+        "funding": {"balance": "0"},
+        "availableBalance": "0",
+        "negativeUnPnL": "0",
+        "position": [],
+        "openOrder": [],
+    }
+    responses["/api/position"] = []
+    responses["/api/order/opened"] = []
+    responses["/api/tpsl"] = {"list": []}
+    capture = await _observer(responses=responses).capture_once()
+    assert json.loads(capture.components[1].normalized_payload_json)["funding_balance"] == 0
+    assert capture.readiness is False
+    assert capture.authoritative_reconciliation is False
+
+
 class _Context:
     def __init__(self, value):
         self.value = value

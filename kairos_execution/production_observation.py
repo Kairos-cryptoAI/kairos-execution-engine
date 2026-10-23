@@ -334,7 +334,7 @@ class ProductionAccountObserver:
         funding = ProductionAccountObserver._number(value["funding"].get("balance"), "funding.balance")
         available = ProductionAccountObserver._number(value.get("availableBalance"), "availableBalance")
         negative_unpnl = ProductionAccountObserver._number(value.get("negativeUnPnL"), "negativeUnPnL")
-        if funding <= 0 or available < 0 or negative_unpnl < 0:
+        if funding < 0 or available < 0 or negative_unpnl < 0:
             raise ValueError("available-balance amounts are outside their valid range")
         positions = value.get("position")
         orders = value.get("openOrder")
