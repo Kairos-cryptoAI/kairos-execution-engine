@@ -1,8 +1,9 @@
 """Append-only terminal evidence for conservative PROD entry-risk reservations.
 
 This module does not mutate schema-v2 reservations. It records a separately
-verified zero-residual receipt; until cap readers explicitly join this table,
-all schema-v2 reservations continue to count.
+verified zero-residual receipt. Default receipt-v1/state-v2 never free capital.
+Explicit receipt-v2 additionally requires complete funding/side/settlement and
+owner lineage for the independent fresh state-v3 accounting acceptor.
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ import json
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from uuid import UUID, uuid4
 
 import asyncpg  # type: ignore[import-untyped]  # Upstream ships no typing marker/stubs.
@@ -30,6 +31,7 @@ from .production_state import (
 SCHEMA = "kairos_production_reconciliation_v1"
 SCHEMA_VERSION = 1
 MAX_EVIDENCE_AGE = timedelta(minutes=2)
+ACCOUNTING_SCHEMA = "kairos_production_reconciliation_v2"
 
 DDL = """
 CREATE SCHEMA kairos_production_reconciliation_v1;
@@ -198,6 +200,71 @@ class VenueTerminalEvidenceVerifier(Protocol):
     ) -> VenueTerminalEvidenceV1: ...
 
 
+class VenueTerminalEvidenceV2(VenueTerminalEvidenceV1):
+    """Explicit accounting proof; missing funding/settlement facts never default.
+
+    Positive funding cost is a paid debit; negative is a credit. Settlement
+    covers the entire owned trade, including all fees and funding, not an ACK.
+    """
+
+    entry_side: Literal["BUY", "SELL"]
+    funding_cost_usd: Decimal
+    funding_complete: Literal[True]
+    settled_at: datetime
+    owner_arm_sha256: Digest
+    reservation_request_sha256: Digest
+
+    @field_validator("funding_cost_usd")
+    @classmethod
+    def _funding_finite(cls, value: Decimal) -> Decimal:
+        return cls._finite_decimals(value)
+
+    @field_validator("settled_at")
+    @classmethod
+    def _settled_utc(cls, value: datetime) -> datetime:
+        return cls._utc(value)
+
+    @model_validator(mode="after")
+    def _settled_bounds(self) -> VenueTerminalEvidenceV2:
+        if self.settled_at > self.collection_finished_at:
+            raise ValueError("settlement must be covered by terminal collection")
+        return self
+
+
+# A separate create-only schema: historical receipts cannot acquire missing
+# economics by migration, defaults, or reinterpretation.
+DDL_V2 = DDL.replace(SCHEMA, ACCOUNTING_SCHEMA).replace("CHECK(schema_version=1)", "CHECK(schema_version=2)")
+DDL_V2 = DDL_V2.replace(
+    " payload jsonb NOT NULL,",
+    " entry_side text NOT NULL CHECK(entry_side IN ('BUY','SELL')),\n"
+    " funding_cost_usd numeric NOT NULL CHECK(abs(funding_cost_usd) < 'Infinity'::numeric),\n"
+    " funding_complete boolean NOT NULL CHECK(funding_complete),\n"
+    " settled_at timestamptz NOT NULL,\n"
+    " owner_arm_sha256 text NOT NULL CHECK(owner_arm_sha256 ~ '^[a-f0-9]{64}$'),\n"
+    " reservation_request_sha256 text NOT NULL CHECK(reservation_request_sha256 ~ '^[a-f0-9]{64}$'),\n"
+    " unowned_exposure_count integer NOT NULL CHECK(unowned_exposure_count=0),\n"
+    " payload jsonb NOT NULL,",
+).replace(
+    " CHECK(collection_finished_at>=collection_started_at),",
+    " CHECK(settled_at<=collection_finished_at),\n CHECK(collection_finished_at>=collection_started_at),",
+)
+DDL_V2 += """
+CREATE FUNCTION kairos_production_reconciliation_v2.stamp_receipt_acceptance() RETURNS trigger
+ LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+ BEGIN
+  NEW.inserted_at := clock_timestamp();
+  IF NEW.observed_at>NEW.inserted_at
+   OR NEW.inserted_at-NEW.observed_at>interval '2 minutes' THEN
+   RAISE EXCEPTION 'terminal receipt is stale at database acceptance';
+  END IF;
+  RETURN NEW;
+ END $$;
+CREATE TRIGGER receipt_acceptance_guard BEFORE INSERT
+ ON kairos_production_reconciliation_v2.terminal_receipts FOR EACH ROW
+ EXECUTE FUNCTION kairos_production_reconciliation_v2.stamp_receipt_acceptance();
+"""
+
+
 class ProductionReservationReconciler:
     """Validate independent trade/journal/venue evidence and append one receipt."""
 
@@ -214,6 +281,7 @@ class ProductionReservationReconciler:
         trades: Any,
         effects: Any,
         clock=None,
+        schema_version: int = 1,
     ) -> None:
         if not isinstance(database_uuid, UUID) or database_uuid.int == 0:
             raise ProductionReconciliationError("nonzero production database UUID is required")
@@ -234,6 +302,10 @@ class ProductionReservationReconciler:
         self.trades = trades
         self.effects = effects
         self._clock = clock or (lambda: datetime.now(UTC))
+        if schema_version not in (1, 2):
+            raise ProductionReconciliationError("unsupported reconciliation schema version")
+        self.schema_version = schema_version
+        self.schema = SCHEMA if schema_version == 1 else ACCOUNTING_SCHEMA
 
     async def reconcile_terminal(
         self, *, binding: ReservationTradeBindingV1, raw_venue_evidence: Any, source_id: str
@@ -243,7 +315,8 @@ class ProductionReservationReconciler:
         if verifier is None:
             raise ProductionReconciliationError("venue evidence source is not registered")
         try:
-            evidence = VenueTerminalEvidenceV1.model_validate(
+            evidence_type = VenueTerminalEvidenceV1 if self.schema_version == 1 else VenueTerminalEvidenceV2
+            evidence = evidence_type.model_validate(
                 verifier.verify_terminal_evidence(raw_venue_evidence, context=self.context, binding=binding)
             )
             if evidence.source_id != source_id:
@@ -259,7 +332,8 @@ class ProductionReservationReconciler:
             facts_digest = _canonical_sha256([event.model_dump(mode="json") for event in facts])
             await self._verify_facts(facts, binding, trade, evidence)
             now = self._now()
-            self._verify_venue_evidence(evidence, binding, now)
+            if self.schema_version == 1:
+                self._verify_venue_evidence(evidence, binding, now)
             payload = {
                 "database_uuid": str(self.database_uuid),
                 "context_sha256": self.context_sha256,
@@ -291,6 +365,16 @@ class ProductionReservationReconciler:
                 "residual_order_count": 0,
                 "residual_protection_count": 0,
             }
+            if isinstance(evidence, VenueTerminalEvidenceV2):
+                payload.update(
+                    entry_side=evidence.entry_side,
+                    funding_cost_usd=_decimal_text(evidence.funding_cost_usd),
+                    funding_complete=True,
+                    settled_at=evidence.settled_at.isoformat(),
+                    owner_arm_sha256=evidence.owner_arm_sha256,
+                    reservation_request_sha256=evidence.reservation_request_sha256,
+                    unowned_exposure_count=0,
+                )
             payload_sha = _canonical_sha256(payload)
             receipt_id = uuid4()
             async with self.pool.acquire() as connection:
@@ -302,7 +386,8 @@ class ProductionReservationReconciler:
                     )
                     reservation = await connection.fetchrow(
                         "SELECT r.effect_id,r.signing_request_id,r.decision_id,r.context_sha256,"
-                        "r.account_sha256,d.payload AS risk_payload,d.payload_sha256 "
+                        "r.account_sha256,r.owner_arm_sha256,r.request_sha256,"
+                        "d.payload AS risk_payload,d.payload_sha256 "
                         "FROM kairos_production_state_v1.risk_reservations r "
                         "JOIN kairos_production_state_v1.risk_decisions d "
                         "ON d.context_sha256=r.context_sha256 AND d.signing_request_id=r.signing_request_id "
@@ -311,63 +396,101 @@ class ProductionReservationReconciler:
                         binding.effect_id,
                     )
                     self._verify_reservation(reservation, binding)
+                    if isinstance(evidence, VenueTerminalEvidenceV2):
+                        risk_payload = reservation["risk_payload"]
+                        if isinstance(risk_payload, str):
+                            risk_payload = json.loads(risk_payload)
+                        if (
+                            evidence.owner_arm_sha256 != reservation["owner_arm_sha256"]
+                            or evidence.reservation_request_sha256 != reservation["request_sha256"]
+                            or evidence.entry_side != risk_payload.get("side")
+                            or evidence.entry_side != trade.side
+                        ):
+                            raise ProductionReconciliationError("accounting economics/owner lineage mismatch")
                     existing = await connection.fetchrow(
-                        "SELECT receipt_id,payload_sha256 "
-                        "FROM kairos_production_reconciliation_v1.terminal_receipts "
-                        "WHERE account_sha256=$1 AND effect_id=$2",
+                        (
+                            "SELECT receipt_id,payload_sha256 FROM kairos_production_reconciliation_v1."
+                            "terminal_receipts WHERE account_sha256=$1 AND effect_id=$2"
+                            if self.schema_version == 1
+                            else "SELECT receipt_id,payload_sha256,inserted_at FROM "
+                            "kairos_production_reconciliation_v2."
+                            "terminal_receipts WHERE account_sha256=$1 AND effect_id=$2"
+                        ),
                         self.account_sha256,
                         binding.effect_id,
                     )
                     if existing is not None:
                         if existing["payload_sha256"] != payload_sha:
                             raise ProductionReconciliationError("terminal receipt identity was rebound")
+                        if self.schema_version == 2:
+                            # Exact replay retains the original independently
+                            # verified proof and database acceptance time. A new
+                            # collection/hash is not allowed to replace it.
+                            self._verify_venue_evidence(evidence, binding, existing["inserted_at"])
                         return {
                             "receipt_id": str(existing["receipt_id"]),
                             "created": False,
                             "payload_sha256": payload_sha,
                         }
-                    await connection.execute(
-                        "INSERT INTO kairos_production_reconciliation_v1.terminal_receipts "
-                        "(receipt_id,database_uuid,context_sha256,account_sha256,trade_id,decision_id,effect_id,"
-                        "signing_request_id,client_order_id,exchange_parent_order_id,trade_journal_head_sha256,"
-                        "lifecycle_entry_effect_id,execution_facts_sha256,owned_effects_sha256,"
-                        "entry_filled_quantity,closed_quantity,entry_notional_usd,"
-                        "exit_notional_usd,entry_fees_usd,exit_fees_usd,"
-                        "venue_source_id,venue_evidence_sha256,venue_complete,venue_terminal,"
-                        "collection_started_at,collection_finished_at,observed_at,"
-                        "residual_position_quantity,residual_order_count,residual_protection_count,"
-                        "payload,payload_sha256) "
-                        "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::numeric,$16::numeric,"
-                        "$17::numeric,$18::numeric,$19::numeric,$20::numeric,$21,$22,true,true,"
-                        "$23,$24,$25,0,0,0,$26::jsonb,$27)",
-                        receipt_id,
-                        self.database_uuid,
-                        self.context_sha256,
-                        self.account_sha256,
-                        binding.trade_id,
-                        binding.decision_id,
-                        binding.effect_id,
-                        binding.signing_request_id,
-                        binding.client_order_id,
-                        binding.exchange_parent_order_id,
-                        trade.journal_head_sha256,
-                        binding.lifecycle_entry_effect_id,
-                        facts_digest,
-                        effects_digest,
-                        _decimal_text(evidence.entry_filled_quantity),
-                        _decimal_text(evidence.closed_quantity),
-                        _decimal_text(evidence.entry_notional_usd),
-                        _decimal_text(evidence.exit_notional_usd),
-                        _decimal_text(evidence.entry_fees_usd),
-                        _decimal_text(evidence.exit_fees_usd),
-                        evidence.source_id,
-                        evidence.source_evidence_sha256,
-                        evidence.collection_started_at,
-                        evidence.collection_finished_at,
-                        evidence.observed_at,
-                        json.dumps(payload, sort_keys=True, separators=(",", ":")),
-                        payload_sha,
-                    )
+                    if isinstance(evidence, VenueTerminalEvidenceV2):
+                        self._verify_venue_evidence(evidence, binding, now)
+                        # Named JSON projection keeps the independently versioned
+                        # columns and canonical payload exactly identical.
+                        names = ",".join(payload)
+                        await connection.execute(
+                            f"INSERT INTO {self.schema}.terminal_receipts (receipt_id,{names},"
+                            "payload,payload_sha256) SELECT $1,"
+                            + ",".join(f"x.{name}" for name in payload)
+                            + ",$2::jsonb,$3 FROM jsonb_populate_record("
+                            + f"NULL::{self.schema}.terminal_receipts,"
+                            "$2::jsonb) x",
+                            receipt_id,
+                            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                            payload_sha,
+                        )
+                    else:
+                        await connection.execute(
+                            "INSERT INTO kairos_production_reconciliation_v1.terminal_receipts "
+                            "(receipt_id,database_uuid,context_sha256,account_sha256,trade_id,decision_id,effect_id,"
+                            "signing_request_id,client_order_id,exchange_parent_order_id,trade_journal_head_sha256,"
+                            "lifecycle_entry_effect_id,execution_facts_sha256,owned_effects_sha256,"
+                            "entry_filled_quantity,closed_quantity,entry_notional_usd,"
+                            "exit_notional_usd,entry_fees_usd,exit_fees_usd,"
+                            "venue_source_id,venue_evidence_sha256,venue_complete,venue_terminal,"
+                            "collection_started_at,collection_finished_at,observed_at,"
+                            "residual_position_quantity,residual_order_count,residual_protection_count,"
+                            "payload,payload_sha256) "
+                            "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::numeric,$16::numeric,"
+                            "$17::numeric,$18::numeric,$19::numeric,$20::numeric,$21,$22,true,true,"
+                            "$23,$24,$25,0,0,0,$26::jsonb,$27)",
+                            receipt_id,
+                            self.database_uuid,
+                            self.context_sha256,
+                            self.account_sha256,
+                            binding.trade_id,
+                            binding.decision_id,
+                            binding.effect_id,
+                            binding.signing_request_id,
+                            binding.client_order_id,
+                            binding.exchange_parent_order_id,
+                            trade.journal_head_sha256,
+                            binding.lifecycle_entry_effect_id,
+                            facts_digest,
+                            effects_digest,
+                            _decimal_text(evidence.entry_filled_quantity),
+                            _decimal_text(evidence.closed_quantity),
+                            _decimal_text(evidence.entry_notional_usd),
+                            _decimal_text(evidence.exit_notional_usd),
+                            _decimal_text(evidence.entry_fees_usd),
+                            _decimal_text(evidence.exit_fees_usd),
+                            evidence.source_id,
+                            evidence.source_evidence_sha256,
+                            evidence.collection_started_at,
+                            evidence.collection_finished_at,
+                            evidence.observed_at,
+                            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                            payload_sha,
+                        )
             return {"receipt_id": str(receipt_id), "created": True, "payload_sha256": payload_sha}
         except ProductionReconciliationError:
             raise
@@ -393,7 +516,7 @@ class ProductionReservationReconciler:
             or state["account_sha256"] != self.account_sha256
         ):
             raise ProductionReconciliationError("production state identity differs from reconciliation scope")
-        if state["schema_version"] != 2:
+        if state["schema_version"] != (2 if self.schema_version == 1 else 3):
             raise ProductionReconciliationError("unsupported production state schema")
         if (
             state["runtime_role"] == self.expected_role
@@ -416,6 +539,8 @@ class ProductionReservationReconciler:
             await _check_role_isolated(connection, self.expected_role, (protected,))
         reconcile_identity = await connection.fetchrow(
             "SELECT * FROM kairos_production_reconciliation_v1.identity WHERE singleton=true"
+            if self.schema_version == 1
+            else "SELECT * FROM kairos_production_reconciliation_v2.identity WHERE singleton=true"
         )
         if reconcile_identity is None or any(
             (
@@ -424,6 +549,7 @@ class ProductionReservationReconciler:
                 reconcile_identity["account_sha256"] != self.account_sha256,
                 reconcile_identity["owner_role"] != state["owner_role"],
                 reconcile_identity["reconciler_role"] != self.expected_role,
+                reconcile_identity["schema_version"] != self.schema_version,
             )
         ):
             raise ProductionReconciliationError("reconciliation schema identity mismatch")
@@ -435,7 +561,7 @@ class ProductionReservationReconciler:
             if await connection.fetchval(
                 "SELECT has_table_privilege($1,$2,$3)",
                 self.expected_role,
-                f"{SCHEMA}.terminal_receipts",
+                f"{self.schema}.terminal_receipts",
                 privilege,
             ):
                 raise ProductionReconciliationError(
@@ -634,9 +760,13 @@ async def provision_production_reconciliation_schema(
     context: ProductionContextV1,
     owner_role: str,
     reconciler_role: str,
+    schema_version: int = 1,
 ) -> None:
     """Owner-only create-only provisioning; never modifies schema-v2 tables."""
     owner_role, reconciler_role = _role(owner_role), _role(reconciler_role)
+    if schema_version not in (1, 2):
+        raise ProductionReconciliationError("unsupported reconciliation schema version")
+    schema = SCHEMA if schema_version == 1 else ACCOUNTING_SCHEMA
     context = ProductionContextV1.model_validate(context)
     if database_uuid.int == 0:
         raise ProductionReconciliationError("nonzero database UUID is required")
@@ -651,6 +781,8 @@ async def provision_production_reconciliation_schema(
         or state["database_uuid"] != database_uuid
         or state["account_sha256"] != _account_scope_sha256(context)
         or state["owner_role"] != owner_role
+        or state["schema_version"] != (2 if schema_version == 1 else 3)
+        or state["policy_namespace"] != policy_namespace
     ):
         raise ProductionReconciliationError(
             "existing production state identity differs from reconciliation scope"
@@ -665,22 +797,24 @@ async def provision_production_reconciliation_schema(
     if reconciler_role in protected:
         raise ProductionReconciliationError("reconciler role must be separately provisioned and isolated")
     await _check_role_isolated(connection, reconciler_role, protected)
-    if await connection.fetchval("SELECT to_regnamespace($1)", SCHEMA) is not None:
+    if await connection.fetchval("SELECT to_regnamespace($1)", schema) is not None:
         raise ProductionReconciliationError("reconciliation schema already exists; do not re-provision")
     async with connection.transaction():
-        await connection.execute(DDL)
+        await connection.execute(DDL if schema_version == 1 else DDL_V2)
         await connection.execute(
-            "INSERT INTO kairos_production_reconciliation_v1.identity VALUES(true,$1,$2,$3,$4,$5,$6)",
+            "INSERT INTO kairos_production_reconciliation_v1.identity VALUES(true,$1,$2,$3,$4,$5,$6)"
+            if schema_version == 1
+            else "INSERT INTO kairos_production_reconciliation_v2.identity VALUES(true,$1,$2,$3,$4,$5,$6)",
             database_uuid,
             _identity(policy_namespace),
             _account_scope_sha256(context),
-            SCHEMA_VERSION,
+            schema_version,
             owner_role,
             reconciler_role,
         )
-        await connection.execute(f'GRANT USAGE ON SCHEMA {SCHEMA} TO "{reconciler_role}"')
-        await connection.execute(f'GRANT SELECT,INSERT ON {SCHEMA}.terminal_receipts TO "{reconciler_role}"')
-        await connection.execute(f'GRANT SELECT ON {SCHEMA}.identity TO "{reconciler_role}"')
+        await connection.execute(f'GRANT USAGE ON SCHEMA {schema} TO "{reconciler_role}"')
+        await connection.execute(f'GRANT SELECT,INSERT ON {schema}.terminal_receipts TO "{reconciler_role}"')
+        await connection.execute(f'GRANT SELECT ON {schema}.identity TO "{reconciler_role}"')
         await connection.execute(
             f'GRANT SELECT ON kairos_production_state_v1.identity TO "{reconciler_role}"'
         )

@@ -341,8 +341,7 @@ async def test_oversized_sidecar_mutation_response_latches_unknown_outcome():
                 ),
             }
             stdout.feed_data(
-                json.dumps({"id": request["id"], "ok": False, "error": refusal}).encode("utf-8")
-                + b"\n"
+                json.dumps({"id": request["id"], "ok": False, "error": refusal}).encode("utf-8") + b"\n"
             )
             stdout.feed_eof()
 

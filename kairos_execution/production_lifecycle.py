@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from types import MappingProxyType
 from typing import Any, Literal
+from uuid import UUID
 
 from kairos_core.contracts import RiskTradeDecisionV1
 from kairos_core.enums import (
@@ -35,6 +36,7 @@ from pydantic import Field, model_validator
 from .lifecycle_scope import ExecutionLifecycleScope, LifecycleAdmissionPolicy
 from .managed_signer import CustodyBindingV1
 from .paper_engine import PaperExecutionSafetyError, _EvedexProtectedExecutionEngine
+from .production_accounting import PostgresProductionAccounting
 from .production_lifecycle_binding import ProductionLifecycleBindingV1
 from .production_observation import PROD_EXCHANGE_ORIGIN
 from .production_readiness import (
@@ -158,13 +160,16 @@ class ProductionLifecycleEngine(_EvedexProtectedExecutionEngine):
         reconciler: ProductionReservationReconciler,
         source_id: str,
         raw_venue_evidence: Any,
+        accounting: PostgresProductionAccounting | None = None,
     ) -> dict[str, Any]:
         """Complete the explicit position→flat account→terminal-evidence path.
 
         Venue truth is interpreted independently by the reconciler's registered
         source. An empty account GET or successful ACK is never sufficient. The
         receipt is append-only; schema-v2 reservations deliberately remain
-        counted until a separately qualified accounting reader is deployed.
+        counted. An explicit fresh state-v3/reconciliation-v2 composition can
+        additionally accept that exact receipt through its isolated accounting
+        writer; it never deletes reservations, resets loss or promotes LIVE.
         """
         if (
             not isinstance(reconciler, ProductionReservationReconciler)
@@ -174,6 +179,18 @@ class ProductionLifecycleEngine(_EvedexProtectedExecutionEngine):
             or reconciler.effects is not self.effects
         ):
             raise PaperExecutionSafetyError("terminal reconciler differs from the exact PROD lifecycle")
+        if accounting is not None and (
+            not isinstance(accounting, PostgresProductionAccounting)
+            or accounting.context != self.production_settings.context
+            or accounting.database_uuid != self.production_runtime.database_uuid
+            or accounting.expected_database != self.production_runtime.state_source.expected_database
+            or accounting.expected_database != reconciler.expected_database
+            or accounting.policy_namespace != self.production_runtime.state_source.policy_namespace
+            or accounting.policy_namespace != reconciler.policy_namespace
+            or self.production_runtime.state_source.state_schema_version != 3
+            or reconciler.schema_version != 2
+        ):
+            raise PaperExecutionSafetyError("accounting requires the exact fresh v3/v2 PROD composition")
         async with self._lifecycle_lock:
             async with self.trades.account_lock(**self._remote_account_scope):
                 await self._reconcile_once_unlocked()
@@ -218,13 +235,28 @@ class ProductionLifecycleEngine(_EvedexProtectedExecutionEngine):
                 receipt = await reconciler.reconcile_terminal(
                     binding=binding, raw_venue_evidence=raw_venue_evidence, source_id=source_id
                 )
+                accounting_receipt = None
+                if accounting is not None:
+                    # A failed or ambiguous accounting append leaves the exact
+                    # terminal receipt retained and does not report a release.
+                    try:
+                        terminal_id = UUID(receipt["receipt_id"])
+                        terminal_hash = receipt["payload_sha256"]
+                    except (KeyError, ValueError, TypeError, AttributeError):
+                        raise PaperExecutionSafetyError(
+                            "exact terminal accounting receipt is malformed"
+                        ) from None
+                    accounting_receipt = await accounting.accept_terminal_receipt(
+                        receipt_id=terminal_id, receipt_payload_sha256=terminal_hash
+                    )
                 return {
                     "status": "CLOSED_ACCOUNT_RECONCILED_EVIDENCE_RECORDED",
                     "trade_id": trade_id,
                     "account_snapshot_sha256": canonical_digest(snapshot),
                     "terminal_receipt": receipt,
                     "live_ready": False,
-                    "reservation_released": False,
+                    "reservation_released": accounting_receipt is not None,
+                    "accounting_receipt": accounting_receipt,
                 }
 
     def __init__(

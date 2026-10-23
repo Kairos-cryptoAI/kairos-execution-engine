@@ -67,6 +67,11 @@ protective/exit work. No arbitrary DELETE path is accepted.
 
 ## Terminal evidence is not automatic capital reuse
 
+The later [sources/accounting continuation](PRODUCTION-SOURCES-ACCOUNTING.md)
+adds an explicit fresh state-v3/reconciliation-v2 accounting path. The
+default state-v2 behaviour described below is unchanged; real pinned SDK
+history remains unqualified to produce release authority.
+
 Terminal receipts have their own create-only schema and isolated reconciler role.
 They preserve both effect IDs, exact reservation/request/order lineage, trade and
 effect heads, complete public facts and side-neutral gross notionals/fees. The

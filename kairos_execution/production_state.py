@@ -5,10 +5,11 @@ is explicit and owner-only. Runtime reads require the exact isolated evidence
 database and claims identity; upstream writers use separate PostgreSQL roles
 for operator/owner-arm, risk and exposure records. Entry signing now commits an
 exact-decimal account-scoped risk/notional reservation before any signing claim
-or custody callback. Reservations are immutable and are never released by
-expiry or local outcomes. The optional terminal reconciler appends independent
-evidence without changing these conservative totals; a future reviewed reader
-must qualify capital reuse separately. One isolated state database is required per venue
+or custody callback. Reservations are immutable and never released by expiry
+or local outcomes. Default state-v2 keeps all reservations counted. Explicit
+fresh-only state-v3 excludes only independently accepted accounting records
+over complete reconciliation-v2 evidence, retaining adverse loss and historical
+cap/equity floors. One isolated state database is required per venue
 account so policy/system contexts share the same account reservation ledger.
 """
 
@@ -53,6 +54,7 @@ from .signing_authorization import (
 
 SCHEMA = "kairos_production_state_v1"
 SCHEMA_VERSION = 2
+ACCOUNTING_STATE_SCHEMA_VERSION = 3
 _ROLE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,62}\Z")
 _ID_PATTERN = re.compile(r"[A-Za-z0-9_.:-]{1,160}\Z")
 _DIGEST_PATTERN = re.compile(r"[a-f0-9]{64}\Z")
@@ -430,6 +432,58 @@ REVOKE ALL ON ALL TABLES IN SCHEMA kairos_production_state_v1 FROM PUBLIC;
 REVOKE ALL ON ALL FUNCTIONS IN SCHEMA kairos_production_state_v1 FROM PUBLIC;
 """
 
+
+def _reservation_totals_query(schema_version: int) -> str:
+    """No historical row/cap/baseline is removed, including across policy arms."""
+    accounting = schema_version == ACCOUNTING_STATE_SCHEMA_VERSION
+    risk = "CASE WHEN a.effect_id IS NULL THEN r.risk_usd ELSE 0 END" if accounting else "r.risk_usd"
+    notional = (
+        "CASE WHEN a.effect_id IS NULL THEN r.notional_usd ELSE 0 END" if accounting else "r.notional_usd"
+    )
+    return (
+        f"SELECT coalesce(sum({risk}),0) AS risk_usd, "
+        f"coalesce(sum({notional}),0) AS notional_usd, "
+        "max(r.aggregate_open_risk_usd) AS base_risk, "
+        "max(r.aggregate_open_notional_usd) AS base_notional, "
+        "max(r.daily_realized_loss_usd) AS daily_realized, "
+        "min(r.account_equity_usd) AS account_equity, min(r.dollar_cap) AS dollar_cap, "
+        "min(r.daily_stop_loss_usd) AS daily_stop"
+        + (", coalesce(sum(a.loss_charge_usd),0) AS realized_charge " if accounting else " ")
+        + "FROM kairos_production_state_v1.risk_reservations r "
+        + (
+            "LEFT JOIN kairos_production_accounting_v1.accepted_releases a "
+            "ON a.account_sha256=r.account_sha256 AND a.effect_id=r.effect_id "
+            if accounting
+            else ""
+        )
+        + "WHERE r.account_sha256=$1"
+    )
+
+
+# Fresh explicit provisioning only; no ALTER, migration or reinterpretation of
+# retained v2 state. The accounting schema must be independently provisioned
+# before the v3 runtime can reserve anything.
+_V2_TRIGGER_TOTALS_START = DDL.index("  SELECT coalesce(sum(risk_usd),0) AS risk_usd,")
+_V2_TRIGGER_TOTALS_END = DDL.index("  base_risk :=", _V2_TRIGGER_TOTALS_START)
+_V3_TRIGGER_TOTALS = (
+    _reservation_totals_query(3)
+    .replace(
+        "FROM kairos_production_state_v1.risk_reservations r",
+        "INTO prior FROM kairos_production_state_v1.risk_reservations r",
+    )
+    .replace("$1", "NEW.account_sha256")
+)
+DDL_V3 = (
+    (DDL[:_V2_TRIGGER_TOTALS_START] + "  " + _V3_TRIGGER_TOTALS + ";\n" + DDL[_V2_TRIGGER_TOTALS_END:])
+    .replace("CHECK(schema_version=2)", "CHECK(schema_version=3)")
+    .replace(
+        "daily_loss := greatest(NEW.daily_realized_loss_usd,coalesce(prior.daily_realized,0));",
+        "daily_loss := greatest(NEW.daily_realized_loss_usd,coalesce(prior.daily_realized,0))"
+        "+coalesce(prior.realized_charge,0);",
+    )
+)
+
+
 _TABLES = (
     "identity",
     "owner_arms",
@@ -600,6 +654,7 @@ async def provision_production_state_schema(
     operator_writer_role: str,
     risk_writer_role: str,
     exposure_writer_role: str,
+    state_schema_version: int = SCHEMA_VERSION,
 ) -> None:
     """Explicit owner-only schema provisioning; never called by a runtime path.
 
@@ -608,6 +663,8 @@ async def provision_production_state_schema(
     and refuses an existing schema.
     """
     expected_database = _database_name(expected_database)
+    if state_schema_version not in (SCHEMA_VERSION, ACCOUNTING_STATE_SCHEMA_VERSION):
+        raise ProductionStateError("unsupported explicit production state schema version")
     roles = {
         "owner_role": _role(owner_role),
         "runtime_role": _role(runtime_role),
@@ -634,13 +691,13 @@ async def provision_production_state_schema(
         raise ProductionStateError("production state schema already exists; do not re-provision")
 
     async with connection.transaction():
-        await connection.execute(DDL)
+        await connection.execute(DDL if state_schema_version == SCHEMA_VERSION else DDL_V3)
         await connection.execute(
             "INSERT INTO kairos_production_state_v1.identity VALUES(true,$1,$2,$3,$4,$5,$6,$7,$8,$9)",
             database_uuid,
             policy_namespace,
             _account_scope_sha256(context),
-            SCHEMA_VERSION,
+            state_schema_version,
             owner_role,
             runtime_role,
             operator_writer_role,
@@ -671,6 +728,7 @@ class _StateDB:
         context: ProductionContextV1,
         role_field: str,
         expected_role: str,
+        state_schema_version: int = SCHEMA_VERSION,
     ) -> None:
         self.pool = pool
         self.expected_database = _database_name(expected_database)
@@ -682,6 +740,9 @@ class _StateDB:
         self.context_sha256 = canonical_digest(self.context)
         self.role_field = role_field
         self.expected_role = _role(expected_role)
+        if state_schema_version not in (SCHEMA_VERSION, ACCOUNTING_STATE_SCHEMA_VERSION):
+            raise ProductionStateError("unsupported explicit production state schema version")
+        self.state_schema_version = state_schema_version
 
     async def inspect(self, connection: asyncpg.Connection) -> asyncpg.Record:
         actual = await connection.fetchrow("SELECT current_database() AS db,current_user AS role")
@@ -694,7 +755,7 @@ class _StateDB:
             "database_uuid": self.database_uuid,
             "policy_namespace": self.policy_namespace,
             "account_sha256": _account_scope_sha256(self.context),
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": self.state_schema_version,
             self.role_field: self.expected_role,
         }
         if identity is None or any(identity[key] != value for key, value in expected_columns.items()):
@@ -965,6 +1026,7 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
         context: ProductionContextV1,
         max_snapshot_age: timedelta = timedelta(seconds=5),
         clock_probe: Callable[[], datetime] = lambda: datetime.now(UTC),
+        state_schema_version: int = SCHEMA_VERSION,
     ) -> None:
         if not timedelta(0) < max_snapshot_age <= timedelta(seconds=5):
             raise ValueError("production state freshness may not exceed five seconds")
@@ -976,6 +1038,7 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
             context=context,
             role_field="runtime_role",
             expected_role=runtime_role,
+            state_schema_version=state_schema_version,
         )
         self.runtime_role = _role(runtime_role)
         self.max_snapshot_age = max_snapshot_age
@@ -1278,9 +1341,10 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
     ) -> None:
         """Commit one account-scoped entry reservation before signing.
 
-        Reservations are immutable and deliberately have no release API in
-        this version. A signed/unknown order therefore continues consuming
-        capacity until a later schema adds bound authoritative reconciliation.
+        Reservations remain immutable. Default v2 keeps every reservation
+        counted; explicit fresh v3 joins accepted terminal accounting records.
+        A signed/unknown order always keeps consuming capacity without that
+        exact independent proof. Neither version resets a daily limit.
         """
         try:
             request = ManagedSigningRequestV1.model_validate(request)
@@ -1445,16 +1509,12 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
                 if prior_request is not None:
                     raise ProductionStateError("signing request already reserves a different effect")
 
+                if self.state_schema_version == ACCOUNTING_STATE_SCHEMA_VERSION:
+                    from .production_accounting import inspect_accounting_runtime
+
+                    await inspect_accounting_runtime(connection, state_source=self)
                 totals = await connection.fetchrow(
-                    "SELECT coalesce(sum(risk_usd),0) AS risk_usd, "
-                    "coalesce(sum(notional_usd),0) AS notional_usd, "
-                    "max(aggregate_open_risk_usd) AS base_risk, "
-                    "max(aggregate_open_notional_usd) AS base_notional, "
-                    "max(daily_realized_loss_usd) AS daily_realized, "
-                    "min(account_equity_usd) AS account_equity, "
-                    "min(dollar_cap) AS dollar_cap, "
-                    "min(daily_stop_loss_usd) AS daily_stop "
-                    "FROM kairos_production_state_v1.risk_reservations WHERE account_sha256=$1",
+                    _reservation_totals_query(self.state_schema_version),
                     account_digest,
                 )
                 reserved_risk = Decimal(totals["risk_usd"])
@@ -1471,6 +1531,11 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
                     risk.daily_realized_loss_usd,
                     Decimal(totals["daily_realized"] or 0),
                 )
+                if self.state_schema_version == ACCOUNTING_STATE_SCHEMA_VERSION:
+                    # Deliberately no daily/window reset or profit offset. The
+                    # historical snapshot floor can overlap this charge; that
+                    # over-count is conservative until a qualified daily ledger.
+                    daily_realized += Decimal(totals["realized_charge"])
                 account_equity = min(
                     risk.account_equity_usd,
                     Decimal(totals["account_equity"] or risk.account_equity_usd),

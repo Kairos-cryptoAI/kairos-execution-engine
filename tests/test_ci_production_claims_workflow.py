@@ -15,6 +15,15 @@ class ClaimsWorkflowRegressionTests(unittest.TestCase):
         self.assertIn("timeout-minutes: 15", job)
         self.assertIn("image: timescale/timescaledb:2.28.3-pg16", job)
         self.assertIn("POSTGRES_PASSWORD: kairos_test", job)
+        self.assertIn(
+            "KAIROS_PRODUCTION_ACCOUNTING_FIXTURE_ADMIN_DSN: "
+            "postgresql://kairos:kairos_test@localhost:5432/kairos_execution_test_000000000001",
+            job,
+        )
+        self.assertNotIn(
+            "KAIROS_PRODUCTION_ACCOUNTING_FIXTURE_ADMIN_DSN",
+            WORKFLOW.split("  execution-journal-integration:", 1)[0],
+        )
         self.assertIn("uv sync --python 3.11 --locked --dev --extra evedex", job)
         self.assertIn("uv run --python 3.11 --locked --dev --extra evedex pytest -q -m integration", job)
         self.assertLess(

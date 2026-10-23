@@ -140,6 +140,9 @@ jobs:
     env:
       KAIROS_PERSISTENCE_DATABASE_URL: postgresql://kairos:kairos_test@localhost:5432/kairos_execution_test_000000000001
       KAIROS_EXECUTION_TEST_DATABASE: kairos_execution_test_000000000001
+      # Public disposable service only; the accounting test creates fresh,
+      # separately owned databases and never upgrades or resets retained state.
+      KAIROS_PRODUCTION_ACCOUNTING_FIXTURE_ADMIN_DSN: postgresql://kairos:kairos_test@localhost:5432/kairos_execution_test_000000000001
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
