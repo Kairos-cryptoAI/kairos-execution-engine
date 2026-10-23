@@ -207,8 +207,8 @@ class ProductionAccountObserver:
                 # Reuse the established EVEDEX normalizers/cross-checks rather
                 # than creating a second account-summary interpretation.
                 balance_payload = json.loads(balance[0].raw_json)
-                position_payload = json.loads(positions[0].raw_json)
-                order_payload = json.loads(orders[0].raw_json)
+                position_payload = EvedexAdapter._as_list(json.loads(positions[0].raw_json))
+                order_payload = EvedexAdapter._as_list(json.loads(orders[0].raw_json))
                 EvedexAdapter._cross_check_positions(balance_payload["position"], position_payload)
                 EvedexAdapter._cross_check_orders(balance_payload["openOrder"], order_payload)
                 reads = [before[0], balance[0], positions[0], orders[0], tpsl[0], after[0]]

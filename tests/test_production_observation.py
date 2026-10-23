@@ -162,6 +162,17 @@ async def test_capture_is_immutable_bounded_account_bound_and_explicitly_non_aut
 
 
 @pytest.mark.asyncio
+async def test_documented_list_envelopes_are_normalized_before_cross_component_checks():
+    responses = _responses()
+    responses["/api/position"] = {"list": responses["/api/position"]}
+    responses["/api/order/opened"] = {"list": responses["/api/order/opened"]}
+    capture = await _observer(responses=responses).capture_once()
+    assert len(json.loads(capture.components[2].normalized_payload_json)) == 1
+    assert len(json.loads(capture.components[3].normalized_payload_json)) == 1
+    assert capture.authoritative_reconciliation is False
+
+
+@pytest.mark.asyncio
 async def test_context_alias_is_not_accepted_as_authenticated_exchange_id():
     observer = _observer(context=_context("primary"))
     with pytest.raises(ProductionObservationError, match="does not match"):
