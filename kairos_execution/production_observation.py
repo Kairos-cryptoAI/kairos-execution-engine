@@ -42,6 +42,19 @@ GetJson = Callable[[str], Awaitable[Any]]
 Clock = Callable[[], datetime]
 
 
+def _credential_headers(jwt: str | None, api_key: str | None) -> dict[str, str]:
+    if (jwt is None) == (api_key is None):
+        raise ValueError("authenticated production reads require exactly one JWT or API key")
+    credential = jwt if jwt is not None else api_key
+    if (
+        not isinstance(credential, str)
+        or not 1 <= len(credential) <= 8192
+        or any(not 33 <= ord(character) <= 126 for character in credential)
+    ):
+        raise ValueError("authenticated production reads require a nonempty bounded credential")
+    return {"Authorization": f"Bearer {credential}"} if jwt is not None else {"x-api-key": credential}
+
+
 def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -144,8 +157,9 @@ class ProductionAccountObserver:
         self,
         *,
         context: ProductionContextV1,
-        jwt: str,
         get_json: GetJson,
+        jwt: str | None = None,
+        api_key: str | None = None,
         exchange_base_url: str = PROD_EXCHANGE_ORIGIN,
         clock: Clock | None = None,
         max_capture_seconds: float = MAX_CAPTURE_SECONDS,
@@ -156,8 +170,7 @@ class ProductionAccountObserver:
             PROD_EXCHANGE_ORIGIN + "/",
         }:
             raise ValueError("read-only production observation requires the exact official PROD HTTPS origin")
-        if not isinstance(jwt, str) or not jwt.strip():
-            raise ValueError("authenticated production account reads require a JWT")
+        _credential_headers(jwt, api_key)
         if not callable(get_json):
             raise ValueError("a GET-only JSON transport is required")
         if not math.isfinite(max_capture_seconds) or not 0 < max_capture_seconds <= MAX_CAPTURE_SECONDS:
@@ -279,7 +292,7 @@ class ProductionAccountObserver:
         """Refuse contradictory row ownership when the endpoint supplies it.
 
         An absent row owner is not invented or turned into authoritative
-        reconciliation; all reads remain bound only to the checked JWT account.
+        reconciliation; reads remain bound only to the checked credential's account.
         """
         if isinstance(payload, list):
             rows = payload
@@ -492,15 +505,19 @@ class ProductionAccountObserver:
 class AiohttpProdGetJson:
     """Minimal GET-only HTTP transport for the exact official PROD origin."""
 
-    def __init__(self, *, jwt: str, exchange_base_url: str = PROD_EXCHANGE_ORIGIN) -> None:
+    def __init__(
+        self,
+        *,
+        jwt: str | None = None,
+        api_key: str | None = None,
+        exchange_base_url: str = PROD_EXCHANGE_ORIGIN,
+    ) -> None:
         if exchange_base_url.rstrip("/") != PROD_EXCHANGE_ORIGIN or exchange_base_url not in {
             PROD_EXCHANGE_ORIGIN,
             PROD_EXCHANGE_ORIGIN + "/",
         }:
             raise ValueError("GET transport requires the exact official PROD HTTPS origin")
-        if not isinstance(jwt, str) or not jwt.strip():
-            raise ValueError("authenticated production account reads require a JWT")
-        self._jwt = jwt
+        self._headers = _credential_headers(jwt, api_key)
         self._base = PROD_EXCHANGE_ORIGIN
 
     async def __call__(self, path: str) -> Any:
@@ -513,9 +530,7 @@ class AiohttpProdGetJson:
                 "aiohttp is unavailable for authenticated account reads"
             ) from None
         timeout = aiohttp.ClientTimeout(total=3.0, connect=1.0)
-        async with aiohttp.ClientSession(
-            headers={"Authorization": f"Bearer {self._jwt}"}, timeout=timeout
-        ) as session:
+        async with aiohttp.ClientSession(headers=self._headers, timeout=timeout) as session:
             async with session.get(f"{self._base}{path}", allow_redirects=False) as response:
                 if not 200 <= response.status < 300:
                     raise ProductionObservationError("authenticated PROD account GET failed")

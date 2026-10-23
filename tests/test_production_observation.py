@@ -213,7 +213,7 @@ def test_read_seam_has_no_signer_or_chain_parameter_and_transport_only_exposes_g
 
 @pytest.mark.asyncio
 async def test_missing_jwt_and_margin_call_fail_closed():
-    with pytest.raises(ValueError, match="require a JWT"):
+    with pytest.raises(ValueError, match="require a nonempty"):
         ProductionAccountObserver(context=_context(), jwt=" ", get_json=lambda _: None)
 
     responses = _responses()
@@ -332,7 +332,7 @@ class _Context:
         return False
 
 
-def _mock_http(monkeypatch, chunks, *, status=200):
+def _mock_http(monkeypatch, chunks, *, status=200, options=None):
     import aiohttp
 
     calls = []
@@ -353,7 +353,12 @@ def _mock_http(monkeypatch, chunks, *, status=200):
             calls.append((url, kwargs))
             return _Context(Response())
 
-    monkeypatch.setattr(aiohttp, "ClientSession", lambda **kwargs: _Context(Session()))
+    def create_session(**kwargs):
+        if options is not None:
+            options.append(kwargs)
+        return _Context(Session())
+
+    monkeypatch.setattr(aiohttp, "ClientSession", create_session)
     return calls
 
 
@@ -367,6 +372,20 @@ async def test_real_transport_seam_is_get_only_nonredirecting_and_path_allowlist
         with pytest.raises(ProductionObservationError, match="unsupported"):
             await transport(path)
     assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_api_key_reads_use_official_x_api_key_header_without_wallet_or_login(monkeypatch):
+    options = []
+    _mock_http(monkeypatch, [b'{"exchangeId":42}'], options=options)
+    transport = AiohttpProdGetJson(api_key="synthetic-api-key")
+    assert await transport("/api/user/me") == {"exchangeId": 42}
+    assert options[0]["headers"] == {"x-api-key": "synthetic-api-key"}
+    for credentials in ({}, {"jwt": "synthetic-jwt", "api_key": "synthetic-api-key"}):
+        with pytest.raises(ValueError, match="exactly one"):
+            AiohttpProdGetJson(**credentials)
+    with pytest.raises(ValueError, match="nonempty"):
+        AiohttpProdGetJson(api_key="synthetic\r\ninjected-header")
 
 
 @pytest.mark.asyncio
