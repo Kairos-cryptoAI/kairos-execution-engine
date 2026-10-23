@@ -239,6 +239,7 @@ async def test_version_probe_cancellation_reaps_only_owned_probe_without_reading
 ):
     node = tmp_path / "node.exe"
     node.write_bytes(b"test-fixture-not-executed")
+    node.chmod(0o700)
     client = ProductionEvedexSdkClient(
         node_executable=node,
         api_key_file=tmp_path / "missing-api-key",
