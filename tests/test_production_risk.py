@@ -161,7 +161,7 @@ def _inputs():
     venue_data = paper.venue_quality.model_dump(mode="python")
     venue_data.update(
         profile=EvedexProfile.PROD,
-        symbol="BTCUSD:PROD",
+        symbol="BTCUSD",
         observed_at_ms=T0 + 60_300,
         expires_at_ms=T0 + 65_400,
         reference_timestamp_ms=T0 + 60_000,
@@ -213,7 +213,7 @@ def _inputs():
         wallet_address="0x" + "12" * 20,
         chain_id=161803,
         schema_sha256="3" * 64,
-        approved_instruments=("BTCUSD:PROD", "ETHUSD:PROD", "SOLUSD:PROD", "BNBUSD:PROD", "XRPUSD:PROD"),
+        approved_instruments=("BTCUSD", "ETHUSD", "SOLUSD", "BNBUSD", "XRPUSD"),
         custody_receipt_sha256="4" * 64,
     )
     writer = MemoryRiskWriter(context)

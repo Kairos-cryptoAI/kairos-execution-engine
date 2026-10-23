@@ -262,7 +262,7 @@ async def test_fresh_native_live_risk_is_staged_and_resolved_without_execution(m
         venue_data = paper.venue_quality.model_dump(mode="python")
         venue_data.update(
             profile=EvedexProfile.PROD,
-            symbol="BTCUSD:PROD",
+            symbol="BTCUSD",
             observed_at_ms=fixture_base_ms + 60_300,
             expires_at_ms=int((stage_now + timedelta(seconds=2)).timestamp() * 1_000),
             reference_timestamp_ms=fixture_base_ms + 60_000,
@@ -284,11 +284,11 @@ async def test_fresh_native_live_risk_is_staged_and_resolved_without_execution(m
         custody = custody.model_copy(
             update={
                 "approved_instruments": (
-                    "BTCUSD:PROD",
-                    "ETHUSD:PROD",
-                    "SOLUSD:PROD",
-                    "BNBUSD:PROD",
-                    "XRPUSD:PROD",
+                    "BTCUSD",
+                    "ETHUSD",
+                    "SOLUSD",
+                    "BNBUSD",
+                    "XRPUSD",
                 )
             }
         )

@@ -42,9 +42,12 @@ No signer, wire dispatcher, trade engine, service, owner arm, operator state,
 readiness record, or network client is constructed or called by this module.
 Staging is not signing authority, deployment evidence, account acceptance,
 profitability evidence, or a claim that an order was sent.
-The later managed runtime still requires independent current owner/operator/kill
-checks, and each protective/exit effect needs its own exact risk and exposure
-evidence; entry approval is never copied to exits.
+The later managed runtime still requires independent current owner and entry
+operator checks, including the entry KILL state. Each protective/exit effect
+needs its own exact risk and exposure evidence; entry approval is never copied
+to exits. Existing KILL/DISARM semantics stop new entries, not already-owned
+risk-reducing exits. This is not evidence of a separately qualified global
+wire cutoff.
 
 ## Current EVEDEX account-source boundary
 
