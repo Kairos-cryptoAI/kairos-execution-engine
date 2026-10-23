@@ -62,6 +62,18 @@ _OPS = {
         ("order", "string"),
     ],
 }
+_PRODUCTION_OPS = {
+    **_OPS,
+    "New take-profit/stop-loss": [
+        ("instrument", "string"),
+        ("type", "string"),
+        ("side", "string"),
+        ("quantity", "uint96"),
+        ("price", "uint80"),
+    ],
+}
+_PRODUCTION_PROFILE = "kairos.evedex-managed-sdk.v1"
+_LEGACY_PROFILE = "kairos.evedex-legacy-signing.v1"
 _DOMAIN = {
     "name": "EVEDEX",
     "version": "2",
@@ -144,7 +156,14 @@ def _run(request: dict, expected_binding: dict) -> dict:
     operation = request.get("operation")
     if type(operation) is not str:
         raise ValueError("operation not allowlisted")
-    fields = _OPS.get(operation)
+    schema_profile = request.get("schema_profile")
+    if schema_profile == _PRODUCTION_PROFILE:
+        profile_ops = _PRODUCTION_OPS
+    elif schema_profile == _LEGACY_PROFILE:
+        profile_ops = _OPS
+    else:
+        raise ValueError("schema profile not allowlisted")
+    fields = profile_ops.get(operation)
     if fields is None:
         raise ValueError("operation not allowlisted")
     ref = request.get("custody_reference")
@@ -176,7 +195,12 @@ def _run(request: dict, expected_binding: dict) -> dict:
     if request.get("domain") != expected_domain or request.get("types") != expected_types:
         raise ValueError("domain/schema mismatch")
     message = request.get("message")
-    if type(message) is not dict or set(message) != {name for name, _ in fields}:
+    metadata_fields = (
+        {"order"}
+        if schema_profile == _PRODUCTION_PROFILE and operation == "New take-profit/stop-loss"
+        else set()
+    )
+    if type(message) is not dict or set(message) != {name for name, _ in fields} | metadata_fields:
         raise ValueError("message/schema mismatch")
     for name, kind in fields:
         value = message[name]
@@ -229,11 +253,12 @@ def _run(request: dict, expected_binding: dict) -> dict:
         account = Account.from_key(bytes(private_key))
         if account.address.casefold() != wallet.casefold():
             raise ValueError("decrypted wallet mismatch")
+        signed_message = {name: message[name] for name, _ in fields}
         signable = Account.sign_typed_data(
             account.key,
             domain_data=expected_domain,
             message_types=expected_types,
-            message_data=message,
+            message_data=signed_message,
         )
         signature = signable.signature.hex()
         if not signature.startswith("0x"):

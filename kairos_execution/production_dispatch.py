@@ -25,6 +25,7 @@ from .managed_signer import (
     ManagedSigningRequestV1,
     SignedTypedDataV1,
     _typed_message,
+    production_signed_message,
 )
 from .production_readiness import ProductionContextV1, StrictRecord, _aware, canonical_digest
 from .signing_authorization import signing_effect_id
@@ -77,7 +78,7 @@ class ProductionSignatureVerifier(Protocol):
 
 
 class ProductionWireRequestV1(StrictRecord):
-    """One already-signed EVEDEX POST, bound to exact scope/effect/body/deadline."""
+    """One SDK-normalized EVEDEX POST bound to signed geometry and wire policy."""
 
     version: Literal["kairos.production-wire-request.v1"] = "kairos.production-wire-request.v1"
     context: ProductionContextV1
@@ -132,6 +133,31 @@ _OPERATION_BINDINGS: dict[str, tuple[str, WireEffectType, str]] = {
     "Position close order": ("/api/v2/position/{instrument}/close", "CLOSE_POSITION", "id"),
     "New take-profit/stop-loss": ("/api/tpsl/{instrument}", "PROTECTIVE_STOP", "order"),
 }
+
+
+def production_wire_body(operation: str, message: dict[str, Any], signature: str) -> dict[str, Any]:
+    """Derive the pinned SDK REST representation from reviewed EIP-712 units.
+
+    EIP quantities/prices are integers at 1e8, while exchange-crypto 1.1.0
+    (SDK 1.2.11) emits canonical decimal strings on REST. Never send the scaled
+    signing integers as human units. Limit IOC is fixed dispatch policy, not
+    an extra signed EIP field; its exact value is covered by the wire claim.
+    """
+    if operation not in _OPERATION_BINDINGS:
+        raise ProductionDispatchError("wire operation has no reviewed REST normalization")
+    result = dict(message)
+    for field in ("quantity", "limitPrice", "stopPrice", "cashQuantity", "price"):
+        if field not in message:
+            continue
+        value = message[field]
+        if type(value) is not int or value < 0:
+            raise ProductionDispatchError("wire numeric geometry must use exact unsigned EIP integers")
+        whole, fraction = divmod(value, 100_000_000)
+        result[field] = str(whole) + ("." + f"{fraction:08d}".rstrip("0") if fraction else "")
+    if operation == "New limit order":
+        result["timeInForce"] = "IOC"
+    result["signature"] = signature
+    return result
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -197,7 +223,9 @@ def _validate_effect(request: ProductionWireRequestV1) -> dict[str, Any]:
     ).encode()
     if hashlib.sha256(canonical).hexdigest() != request.signed.request_sha256:
         raise ProductionDispatchError("managed signature belongs to a different signing request")
-    if _canonical_bytes(request.body) != _canonical_bytes({**message, "signature": signature}):
+    if _canonical_bytes(request.body) != _canonical_bytes(
+        production_wire_body(request.signing_request.operation, message, signature)
+    ):
         raise ProductionDispatchError("wire body differs from the exact independently signed message")
     return message
 
@@ -283,7 +311,11 @@ class ProductionEffectDispatcher:
 
         # Derive the frozen transport body from the verified typed geometry,
         # not the caller-owned mutable body mapping after its validation.
-        body = json.loads(_canonical_bytes({**message, "signature": request.signed.signature}))
+        body = json.loads(
+            _canonical_bytes(
+                production_wire_body(request.signing_request.operation, message, request.signed.signature)
+            )
+        )
         body_digest = _sha256(_canonical_bytes(body))
         context_digest = canonical_digest(self.context)
         claim_record = {
@@ -325,7 +357,7 @@ class ProductionEffectDispatcher:
                 wallet_address=request.custody_binding.wallet_address,
                 domain=build_domain(request.custody_binding.chain_id),
                 types=types,
-                message=typed_message,
+                message=production_signed_message(request.signing_request.operation, typed_message),
                 signature=request.signed.signature,
             )
         except Exception:

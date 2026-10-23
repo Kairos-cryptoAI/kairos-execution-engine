@@ -13,7 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from .managed_signer import (
@@ -23,7 +23,12 @@ from .managed_signer import (
     SignedTypedDataV1,
 )
 from .production_claims import PostgresProductionClaims
-from .production_dispatch import ProductionEffectDispatcher, ProductionWireRequestV1, WireEffectType
+from .production_dispatch import (
+    ProductionEffectDispatcher,
+    ProductionWireRequestV1,
+    WireEffectType,
+    production_wire_body,
+)
 from .production_readiness import ProductionContextV1, canonical_digest
 from .production_state import AsyncPostgresProductionSigningStateSource
 from .signing_authorization import (
@@ -54,6 +59,19 @@ class ProductionRuntimeOutcome:
     effect_id: str
     status: Literal["TRANSPORT_RESPONSE_UNRECONCILED"] = "TRANSPORT_RESPONSE_UNRECONCILED"
     lifecycle_complete: Literal[False] = False
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionTransportResponse:
+    """Exact transport ACK plus its receipt, not a fill/reconciliation result.
+
+    Kept separate from the public summary so lifecycle validation can inspect
+    the venue response without treating a successful POST as a closed trade.
+    The response is never a signing capability and contains no request secrets.
+    """
+
+    receipt: ProductionRuntimeOutcome
+    response: dict[str, Any]
 
 
 _WIRE_SHAPE: dict[str, tuple[WireEffectType, str]] = {
@@ -175,6 +193,14 @@ class ProductionExecutionRuntime:
         Cancellation, timeout, and ambiguous outcomes propagate unchanged; the
         underlying signer/dispatcher retain their committed one-use claims.
         """
+        return (await self.dispatch_one_response(request)).receipt
+
+    async def dispatch_one_response(self, request: ManagedSigningRequestV1) -> ProductionTransportResponse:
+        """Same one-shot boundary, retaining ACK for the durable lifecycle.
+
+        This is not a second attempt or a replay facility. Both entry points
+        share the same persistent signing/wire claims and unknown-outcome rule.
+        """
         request = ManagedSigningRequestV1.model_validate(request)
         inspection = await self.inspect_authority(request)
         now = self._clock()
@@ -182,11 +208,14 @@ class ProductionExecutionRuntime:
         wire = self._wire_request(request, signed, inspection)
         # Dispatcher performs an independent fresh state check after its own
         # durable one-use wire claim and immediately before exactly one POST.
-        await self.dispatcher.dispatch_one(wire)
-        return ProductionRuntimeOutcome(
-            request_id=request.request_id,
-            decision_id=inspection.decision_id,
-            effect_id=inspection.effect_id,
+        response = await self.dispatcher.dispatch_one(wire)
+        return ProductionTransportResponse(
+            receipt=ProductionRuntimeOutcome(
+                request_id=request.request_id,
+                decision_id=inspection.decision_id,
+                effect_id=inspection.effect_id,
+            ),
+            response=json.loads(json.dumps(response, allow_nan=False)),
         )
 
     @staticmethod
@@ -226,7 +255,7 @@ class ProductionExecutionRuntime:
             effect_type=effect_type,
             method="POST",
             path=path,
-            body={**message, "signature": signed.signature},
+            body=production_wire_body(request.operation, message, signed.signature),
             signing_request=request,
             custody_binding=self.binding,
             signed=signed,

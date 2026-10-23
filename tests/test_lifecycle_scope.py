@@ -6,7 +6,11 @@ import pytest
 from kairos_core.enums import EvedexProfile, TradingMode
 
 from kairos_execution.lifecycle_scope import PaperDevCanaryPolicy
-from kairos_execution.paper_engine import PaperExecutionEngine, PaperExecutionSafetyError
+from kairos_execution.paper_engine import (
+    PaperExecutionEngine,
+    PaperExecutionSafetyError,
+    _EvedexProtectedExecutionEngine,
+)
 from tests.paper_fixtures import approved_decision
 from tests.test_canary_admission import engine_fixture
 
@@ -69,3 +73,36 @@ def test_paper_engine_has_no_caller_selectable_lifecycle_policy(tmp_path):
             engine.settings,
             lifecycle_policy=PaperDevCanaryPolicy.from_settings(engine.settings),  # type: ignore[call-arg]
         )
+
+
+def test_internal_lifecycle_seam_requires_explicit_policy_and_does_not_create_canary(tmp_path):
+    paper = engine_fixture(tmp_path)
+
+    class ExplicitPolicy:
+        scope = paper._lifecycle_scope
+
+        @staticmethod
+        def validate_decision_scope(decision):
+            return None
+
+    settings = SimpleNamespace(service_name="explicit-lifecycle-test")
+    engine = _EvedexProtectedExecutionEngine(
+        paper.adapter,
+        paper.trades,
+        paper.effects,
+        settings,
+        lifecycle_policy=ExplicitPolicy(),
+        mutation_budget=object(),
+        runtime_health=object(),
+    )
+
+    assert engine.settings is settings
+    assert engine._lifecycle_policy is not paper._lifecycle_policy
+    assert engine._canary_scope is None
+    assert engine._expected_venue_health() == {
+        "profile": "DEV",
+        "chain_id": 16182,
+        "exchange_url": "https://trading-api.evedex.tech",
+        "auth_url": "https://auth-api.evedex.tech",
+        "sdk_version": "1.2.11",
+    }

@@ -6,8 +6,9 @@ database and claims identity; upstream writers use separate PostgreSQL roles
 for operator/owner-arm, risk and exposure records. Entry signing now commits an
 exact-decimal account-scoped risk/notional reservation before any signing claim
 or custody callback. Reservations are immutable and are never released by
-expiry or local outcomes; only a future authoritative venue reconciler may add
-that lifecycle. One isolated production-state database is required per venue
+expiry or local outcomes. The optional terminal reconciler appends independent
+evidence without changing these conservative totals; a future reviewed reader
+must qualify capital reuse separately. One isolated state database is required per venue
 account so policy/system contexts share the same account reservation ledger.
 """
 
@@ -25,6 +26,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import asyncpg  # type: ignore[import-untyped]  # Upstream ships no typing marker/stubs.
+from pydantic import Field, field_validator
 
 from .managed_signer import CustodyBindingV1, ManagedSigningRequestV1, _typed_message
 from .production_claims import (
@@ -38,6 +40,7 @@ from .production_claims import (
 from .production_readiness import (
     ProductionContextV1,
     SignedManualArmRequestV1,
+    StrictRecord,
     canonical_digest,
 )
 from .signing_authorization import (
@@ -62,6 +65,56 @@ _SQLSTATE_CODES = {
     "23514": "check_constraint",
     "42501": "privilege_denied",
 }
+
+
+class AcceptedEntryReservationV1(StrictRecord):
+    """Read-only proof that one signed ENTRY effect reserved risk for an arm."""
+
+    context_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    account_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    effect_id: str = Field(pattern=r"^[a-f0-9]{64}$")
+    signing_request_id: str = Field(min_length=1, max_length=160)
+    decision_id: str = Field(min_length=1, max_length=160)
+    client_order_id: str = Field(min_length=1, max_length=160)
+    owner_arm_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    risk_evidence: RiskGeometryV1
+    observed_at: datetime
+    reserved_at: datetime
+    risk_usd: Decimal = Field(gt=0)
+    notional_usd: Decimal = Field(gt=0)
+    account_equity_usd: Decimal = Field(gt=0)
+    daily_realized_loss_usd: Decimal = Field(ge=0)
+    aggregate_open_risk_usd: Decimal = Field(ge=0)
+    aggregate_open_notional_usd: Decimal = Field(ge=0)
+    dollar_cap: Decimal = Field(gt=0)
+    daily_stop_loss_usd: Decimal = Field(gt=0)
+    evidence_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    request_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+    @field_validator("observed_at", "reserved_at")
+    @classmethod
+    def utc_timestamps(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != timedelta(0):
+            raise ValueError("reservation timestamps must be explicit UTC")
+        return value
+
+    @field_validator(
+        "risk_usd",
+        "notional_usd",
+        "account_equity_usd",
+        "daily_realized_loss_usd",
+        "aggregate_open_risk_usd",
+        "aggregate_open_notional_usd",
+        "dollar_cap",
+        "daily_stop_loss_usd",
+    )
+    @classmethod
+    def finite_reservation_amounts(cls, value: Decimal) -> Decimal:
+        if not value.is_finite():
+            raise ValueError("reservation amounts must be finite")
+        return value
+
+
 _PYTHON_ERROR_CODES = {
     "AttributeError": "python_attribute_error",
     "TypeError": "python_type_error",
@@ -927,6 +980,237 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
         self.runtime_role = _role(runtime_role)
         self.max_snapshot_age = max_snapshot_age
         self._clock_probe = clock_probe
+
+    async def resolve_owner_lineage_async(
+        self, manual_request_sha256: str
+    ) -> tuple[SignedManualArmRequestV1, AcceptedManualNonceV1]:
+        """Resolve one accepted signed owner arm from the isolated read snapshot.
+
+        This is deliberately independent of signing requests: cancellation is
+        authenticated by the original accepted owner lineage, not by forging a
+        new managed-signing operation. The arm may be historical; its caller
+        verifies it at the durable nonce-claim time using the same pinned owner
+        key and preconditions as order authorization.
+        """
+        try:
+            request_digest = _digest(manual_request_sha256)
+            started_at = self._clock_probe()
+            if started_at.tzinfo is None or started_at.utcoffset() != timedelta(0):
+                raise ProductionStateError("an explicit UTC owner-lineage time is required")
+            async with asyncio.timeout(10):
+                async with self.pool.acquire() as connection:
+                    async with connection.transaction(isolation="repeatable_read", readonly=True):
+                        await connection.execute("SET LOCAL statement_timeout='5s'")
+                        identity = await self.inspect(connection)
+                        claims = PostgresProductionClaims(
+                            self.pool,
+                            expected_database=self.expected_database,
+                            database_uuid=self.database_uuid,
+                            policy_namespace=self.policy_namespace,
+                            runtime_role=self.runtime_role,
+                            context=self.context,
+                        )
+                        await claims.inspect(connection)
+                        claim_identity = await connection.fetchrow(
+                            "SELECT schema_version FROM kairos_production_evidence_v1.identity "
+                            "WHERE singleton=true"
+                        )
+                        if (
+                            claim_identity is None
+                            or claim_identity["schema_version"] != CLAIMS_SCHEMA_VERSION
+                        ):
+                            raise ProductionStateError("production claims schema version mismatch")
+                        await self._inspect_writer_contract(connection, identity)
+                        arm_row = await connection.fetchrow(
+                            "SELECT * FROM kairos_production_state_v1.owner_arms "
+                            "WHERE context_sha256=$1 AND request_sha256=$2",
+                            self.context_sha256,
+                            request_digest,
+                        )
+                        owner_arm = self._verified_payload(arm_row, SignedManualArmRequestV1, "owner arm")
+                        arm = owner_arm.request
+                        if arm.context != self.context or canonical_digest(arm) != request_digest:
+                            raise ProductionStateError("stored owner arm context/request binding mismatch")
+                        if (
+                            arm_row["owner_identity"] != arm.owner_identity
+                            or arm_row["nonce"] != arm.nonce
+                            or arm_row["observed_at"] != arm.created_at
+                        ):
+                            raise ProductionStateError("stored owner arm identity mismatch")
+                        nonce_row = await connection.fetchrow(
+                            "SELECT * FROM kairos_production_evidence_v1.claims "
+                            "WHERE claim_kind='MANUAL_NONCE' AND namespace=$1 AND identity=$2",
+                            arm.owner_identity,
+                            arm.nonce,
+                        )
+                        if nonce_row is None:
+                            raise ProductionStateError("accepted owner nonce claim is absent")
+                        owner_claim = AcceptedManualNonceV1(
+                            owner_identity=nonce_row["namespace"],
+                            nonce=nonce_row["identity"],
+                            request_sha256=nonce_row["request_sha256"],
+                            context_sha256=nonce_row["context_sha256"],
+                            database_uuid=self.database_uuid,
+                            claimed_at=nonce_row["claimed_at"].astimezone(UTC),
+                        )
+                        if (
+                            owner_claim.owner_identity != arm.owner_identity
+                            or owner_claim.nonce != arm.nonce
+                            or owner_claim.request_sha256 != request_digest
+                            or owner_claim.context_sha256 != self.context_sha256
+                            or owner_claim.claimed_at < arm.created_at
+                        ):
+                            raise ProductionStateError("accepted owner nonce does not bind the exact arm")
+                        resolved_at = (await connection.fetchval("SELECT clock_timestamp()")).astimezone(UTC)
+            checked_at = self._clock_probe()
+            _validate_snapshot_clock(
+                started_at=started_at,
+                resolved_at=resolved_at,
+                checked_at=checked_at,
+                max_age=self.max_snapshot_age,
+            )
+            return owner_arm, owner_claim
+        except ProductionStateError:
+            raise
+        except Exception:
+            raise ProductionStateError("authoritative production owner lineage is unavailable") from None
+
+    async def resolve_entry_reservation_async(
+        self,
+        signing_effect_id: str,
+        manual_request_sha256: str,
+        signing_request_id: str,
+        decision_id: str,
+    ) -> AcceptedEntryReservationV1:
+        """Resolve an immutable ENTRY risk reservation and its exact risk row.
+
+        This read-only lookup exists for historical lifecycle cancellation: it
+        proves that the original signing effect was durably reserved against
+        this owner arm, without relying on an expired short-lived risk lease.
+        The reservation, risk row, claims identity, and writer contract are
+        checked inside one isolated REPEATABLE READ snapshot.
+        """
+        try:
+            effect_digest = _digest(signing_effect_id)
+            owner_digest = _digest(manual_request_sha256)
+            request_id = _identity(signing_request_id)
+            expected_decision = _identity(decision_id)
+            started_at = self._clock_probe()
+            if started_at.tzinfo is None or started_at.utcoffset() != timedelta(0):
+                raise ProductionStateError("an explicit UTC entry-reservation time is required")
+            async with asyncio.timeout(10):
+                async with self.pool.acquire() as connection:
+                    async with connection.transaction(isolation="repeatable_read", readonly=True):
+                        await connection.execute("SET LOCAL statement_timeout='5s'")
+                        identity = await self.inspect(connection)
+                        claims = PostgresProductionClaims(
+                            self.pool,
+                            expected_database=self.expected_database,
+                            database_uuid=self.database_uuid,
+                            policy_namespace=self.policy_namespace,
+                            runtime_role=self.runtime_role,
+                            context=self.context,
+                        )
+                        await claims.inspect(connection)
+                        claim_identity = await connection.fetchrow(
+                            "SELECT schema_version FROM kairos_production_evidence_v1.identity "
+                            "WHERE singleton=true"
+                        )
+                        if (
+                            claim_identity is None
+                            or claim_identity["schema_version"] != CLAIMS_SCHEMA_VERSION
+                        ):
+                            raise ProductionStateError("production claims schema version mismatch")
+                        await self._inspect_writer_contract(connection, identity)
+                        risk_row = await connection.fetchrow(
+                            "SELECT * FROM kairos_production_state_v1.risk_decisions "
+                            "WHERE context_sha256=$1 AND signing_request_id=$2",
+                            self.context_sha256,
+                            request_id,
+                        )
+                        risk = self._verified_payload(risk_row, RiskGeometryV1, "entry risk decision")
+                        _, evidence_sha256 = _payload(risk)
+                        if (
+                            risk.context != self.context
+                            or risk.signing_request_id != request_id
+                            or risk.decision_id != expected_decision
+                            or risk.effect_id != effect_digest
+                            or risk.operation != "New limit order"
+                            or risk.client_order_id is None
+                            or risk.observed_at != risk_row["observed_at"]
+                            or risk.valid_until != risk_row["valid_until"]
+                        ):
+                            raise ProductionStateError("entry risk row differs from exact signing effect")
+                        reservation_row = await connection.fetchrow(
+                            "SELECT * FROM kairos_production_state_v1.risk_reservations "
+                            "WHERE context_sha256=$1 AND account_sha256=$2 AND effect_id=$3",
+                            self.context_sha256,
+                            _account_scope_sha256(self.context),
+                            effect_digest,
+                        )
+                        if reservation_row is None:
+                            raise ProductionStateError("exact entry risk reservation is absent")
+                        if (
+                            reservation_row["context_sha256"] != self.context_sha256
+                            or reservation_row["account_sha256"] != _account_scope_sha256(self.context)
+                            or reservation_row["effect_id"] != effect_digest
+                            or reservation_row["signing_request_id"] != request_id
+                            or reservation_row["decision_id"] != expected_decision
+                            or reservation_row["owner_arm_sha256"] != owner_digest
+                            or reservation_row["observed_at"] != risk.observed_at
+                            or reservation_row["evidence_sha256"] != evidence_sha256
+                            or Decimal(reservation_row["risk_usd"]) != risk.worst_case_loss_usd
+                            or risk.price is None
+                            or Decimal(reservation_row["notional_usd"])
+                            != Decimal(risk.quantity) * Decimal(risk.price) / Decimal(10**16)
+                            or Decimal(reservation_row["account_equity_usd"]) != risk.account_equity_usd
+                            or Decimal(reservation_row["daily_realized_loss_usd"])
+                            != risk.daily_realized_loss_usd
+                            or Decimal(reservation_row["aggregate_open_risk_usd"])
+                            != risk.aggregate_open_risk_usd
+                            or Decimal(reservation_row["aggregate_open_notional_usd"])
+                            != risk.aggregate_open_notional_usd
+                        ):
+                            raise ProductionStateError(
+                                "entry risk reservation does not bind exact arm and risk row"
+                            )
+                        fact = AcceptedEntryReservationV1(
+                            context_sha256=reservation_row["context_sha256"],
+                            account_sha256=reservation_row["account_sha256"],
+                            effect_id=reservation_row["effect_id"],
+                            signing_request_id=reservation_row["signing_request_id"],
+                            decision_id=reservation_row["decision_id"],
+                            client_order_id=risk.client_order_id,
+                            owner_arm_sha256=reservation_row["owner_arm_sha256"],
+                            risk_evidence=risk,
+                            observed_at=reservation_row["observed_at"].astimezone(UTC),
+                            reserved_at=reservation_row["reserved_at"].astimezone(UTC),
+                            risk_usd=Decimal(reservation_row["risk_usd"]),
+                            notional_usd=Decimal(reservation_row["notional_usd"]),
+                            account_equity_usd=Decimal(reservation_row["account_equity_usd"]),
+                            daily_realized_loss_usd=Decimal(reservation_row["daily_realized_loss_usd"]),
+                            aggregate_open_risk_usd=Decimal(reservation_row["aggregate_open_risk_usd"]),
+                            aggregate_open_notional_usd=Decimal(
+                                reservation_row["aggregate_open_notional_usd"]
+                            ),
+                            dollar_cap=Decimal(reservation_row["dollar_cap"]),
+                            daily_stop_loss_usd=Decimal(reservation_row["daily_stop_loss_usd"]),
+                            evidence_sha256=reservation_row["evidence_sha256"],
+                            request_sha256=reservation_row["request_sha256"],
+                        )
+                        resolved_at = (await connection.fetchval("SELECT clock_timestamp()")).astimezone(UTC)
+            checked_at = self._clock_probe()
+            _validate_snapshot_clock(
+                started_at=started_at,
+                resolved_at=resolved_at,
+                checked_at=checked_at,
+                max_age=self.max_snapshot_age,
+            )
+            return fact
+        except ProductionStateError:
+            raise
+        except Exception:
+            raise ProductionStateError("authoritative entry risk reservation is unavailable") from None
 
     async def resolve_signing_evidence_async(
         self, *, request: ManagedSigningRequestV1, binding: CustodyBindingV1, now: datetime

@@ -1,8 +1,8 @@
 """Internal immutable execution scope and PAPER admission policy.
 
-The current durable lifecycle is intentionally specialized to the approved
-EVEDEX DEV canary. This module extracts its scope/admission boundary without
-introducing another runtime mode or a caller-selectable policy.
+The public PAPER facade is intentionally specialized to the approved EVEDEX
+DEV canary. The separate explicit production composer reuses the internal scope
+boundary; it does not make PAPER policy caller-selectable or enable a factory.
 """
 
 from __future__ import annotations

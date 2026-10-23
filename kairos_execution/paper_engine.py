@@ -1,4 +1,4 @@
-"""Crash-safe PAPER execution for strict ``RiskTradeDecisionV1`` messages."""
+"""Protected EVEDEX lifecycle and fixed PAPER facade for strict Risk decisions."""
 
 from __future__ import annotations
 
@@ -6,7 +6,8 @@ import asyncio
 import hashlib
 import json
 import math
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
@@ -33,7 +34,6 @@ from kairos_core.enums import (
     TradeExecutionEventType,
     TradeExitReason,
     TradeLifecycleState,
-    TradingMode,
 )
 from kairos_persistence import (
     EffectPreparation,
@@ -113,8 +113,12 @@ class _VenueTriggeredExit:
     fee_usd: float
 
 
-class PaperExecutionEngine:
-    """One-stop/one-target/one-timeout lifecycle with durable effects."""
+class _EvedexProtectedExecutionEngine:
+    """Shared durable lifecycle implementation with explicit admission scope.
+
+    This is an internal extension seam, not a runtime factory. The public PAPER
+    facade below remains bound to the fixed EVEDEX DEV canary policy.
+    """
 
     _MAX_ENTRY_ELIGIBILITY_WAIT_S = 2.0
     _EFFECT_AMBIGUITY_GRACE = timedelta(minutes=2)
@@ -124,11 +128,12 @@ class PaperExecutionEngine:
 
     def __init__(
         self,
-        adapter: EvedexSidecarAdapter,
+        adapter: Any,
         trades: TradeLifecycleRepository,
         effects: ExecutionJournalRepository,
-        settings: ExecSettings,
+        settings: Any,
         *,
+        lifecycle_policy: LifecycleAdmissionPolicy,
         clock: Callable[[], datetime] | None = None,
         sleeper: Callable[[float], Awaitable[None]] | None = None,
         mutation_budget: ExecutionMutationBudgetRepository | None = None,
@@ -137,12 +142,10 @@ class PaperExecutionEngine:
         canary_scope: CanaryScope | None = None,
         operator_control: PaperOperatorControl | None = None,
     ) -> None:
-        if settings.trading_mode is not TradingMode.PAPER:
-            raise ValueError("PaperExecutionEngine requires TradingMode.PAPER")
         self.adapter = adapter
         self.trades = trades
         self.effects = effects
-        self._lifecycle_policy: LifecycleAdmissionPolicy = PaperDevCanaryPolicy.from_settings(settings)
+        self._lifecycle_policy = lifecycle_policy
         self._lifecycle_scope = self._lifecycle_policy.scope
         self.mutation_budget = mutation_budget or ExecutionMutationBudgetRepository(trades.pool)
         self.runtime_health = runtime_health or ExecutionRuntimeHealthRepository(trades.pool)
@@ -158,13 +161,14 @@ class PaperExecutionEngine:
         self._operator_control = operator_control
         self._canary_scope: CanaryScope | None = None
         self._canary_scope_error = "MISSING"
-        try:
-            self._canary_scope = load_expected_scope(settings, canary_scope)
-            self._canary_scope_error = ""
-        except (OSError, ValueError, TypeError, AttributeError) as exc:
-            # Validation/file errors may include paths or file contents. Keep
-            # their type only, and do not disable recovery of existing trades.
-            self._canary_scope_error = type(exc).__name__
+        if isinstance(lifecycle_policy, PaperDevCanaryPolicy):
+            try:
+                self._canary_scope = load_expected_scope(settings, canary_scope)
+                self._canary_scope_error = ""
+            except (OSError, ValueError, TypeError, AttributeError) as exc:
+                # Validation/file errors may include paths or file contents. Keep
+                # their type only, and do not disable recovery of existing trades.
+                self._canary_scope_error = type(exc).__name__
 
     @property
     def recovery_blocked(self) -> bool:
@@ -1586,16 +1590,7 @@ class PaperExecutionEngine:
             compensation=False,
             require_entry_headroom=True,
         )
-        admission, scope = self._canary_entry_admission()
-        operator = self._operator_entry_control()
-        async with (
-            operator.final_dispatch_guard(decision=decision, expected_scope=scope, effect_id=effect_id),
-            admission.final_dispatch(decision=decision, expected_scope=scope, effect_id=effect_id),
-        ):
-            # Canary-lock acquisition can consume the remaining operator lease.
-            # This read-only recheck takes no advisory lock and finishes its SQL
-            # transaction before send; both dispatch locks are already held.
-            await self._check_operator_entry(decision, effect_id)
+        async with self._entry_dispatch_guard(decision, effect_id):
             response = await self.adapter.place_limit(
                 effect_id=effect_id,
                 client_order_id=client_order_id,
@@ -1645,6 +1640,29 @@ class PaperExecutionEngine:
     async def _bind_canary_entry(self, decision: RiskTradeDecisionV1, effect_id: str) -> None:
         admission, scope = self._canary_entry_admission()
         await admission.bind_entry(decision=decision, expected_scope=scope, effect_id=effect_id)
+
+    @asynccontextmanager
+    async def _entry_dispatch_guard(
+        self, decision: RiskTradeDecisionV1, effect_id: str
+    ) -> AsyncIterator[None]:
+        """Hold the PAPER operator/canary leases and repeat the last guard.
+
+        Kept as one overridable seam so a future explicitly admitted executor
+        can define its dispatch authority without changing lifecycle ordering.
+        The PAPER implementation retains both durable locks and its final
+        operator-lease freshness check immediately before venue submission.
+        """
+        admission, scope = self._canary_entry_admission()
+        operator = self._operator_entry_control()
+        async with (
+            operator.final_dispatch_guard(decision=decision, expected_scope=scope, effect_id=effect_id),
+            admission.final_dispatch(decision=decision, expected_scope=scope, effect_id=effect_id),
+        ):
+            # Canary-lock acquisition can consume the remaining operator lease.
+            # This read-only recheck takes no advisory lock and finishes its SQL
+            # transaction before send; both dispatch locks are already held.
+            await self._check_operator_entry(decision, effect_id)
+            yield
 
     async def _assert_entry_admission(self, trade: TradeRecord) -> None:
         if not await self.trades.entries_allowed(
@@ -3388,14 +3406,18 @@ class PaperExecutionEngine:
         )
         return result.trade, result.event
 
-    def _accept_health(self, health: dict[str, Any]) -> None:
-        expected = {
+    def _expected_venue_health(self) -> dict[str, Any]:
+        """Exact pinned profile fields required by the existing PAPER route."""
+        return {
             "profile": "DEV",
             "chain_id": 16182,
             "exchange_url": "https://trading-api.evedex.tech",
             "auth_url": "https://auth-api.evedex.tech",
             "sdk_version": "1.2.11",
         }
+
+    def _accept_health(self, health: dict[str, Any]) -> None:
+        expected = self._expected_venue_health()
         if any(health.get(key) != value for key, value in expected.items()):
             raise PaperExecutionSafetyError("sidecar health differs from the pinned EVEDEX DEV profile")
         age = self._telemetry_integer(health, "auth_age_ms")
@@ -4166,3 +4188,40 @@ class PaperExecutionEngine:
     @staticmethod
     def _from_ms(value: int) -> datetime:
         return datetime.fromtimestamp(value / 1000, tz=UTC)
+
+
+class PaperExecutionEngine(_EvedexProtectedExecutionEngine):
+    """PAPER facade permanently bound to the existing EVEDEX DEV canary."""
+
+    def __init__(
+        self,
+        adapter: EvedexSidecarAdapter,
+        trades: TradeLifecycleRepository,
+        effects: ExecutionJournalRepository,
+        settings: ExecSettings,
+        *,
+        clock: Callable[[], datetime] | None = None,
+        sleeper: Callable[[float], Awaitable[None]] | None = None,
+        mutation_budget: ExecutionMutationBudgetRepository | None = None,
+        runtime_health: ExecutionRuntimeHealthRepository | None = None,
+        canary_sessions: CanaryAdmissionRepository | None = None,
+        canary_scope: CanaryScope | None = None,
+        operator_control: PaperOperatorControl | None = None,
+    ) -> None:
+        # Keep the public constructor and its immutable scope checks unchanged;
+        # callers cannot supply a policy or use this facade for LIVE/PROD.
+        policy = PaperDevCanaryPolicy.from_settings(settings)
+        super().__init__(
+            adapter,
+            trades,
+            effects,
+            settings,
+            lifecycle_policy=policy,
+            clock=clock,
+            sleeper=sleeper,
+            mutation_budget=mutation_budget,
+            runtime_health=runtime_health,
+            canary_sessions=canary_sessions,
+            canary_scope=canary_scope,
+            operator_control=operator_control,
+        )

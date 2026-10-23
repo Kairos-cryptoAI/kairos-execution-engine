@@ -58,14 +58,36 @@ class ClaimsWorkflowRegressionTests(unittest.TestCase):
     def test_environment_values_are_fresh_and_bound_to_test_only_database(self):
         from tests.bootstrap_production_claims_ci import (
             DATABASE,
+            LIFECYCLE_DATABASE,
             SIMULATOR_DATABASE,
             github_environment_values,
         )
 
-        created = frozenset({DATABASE, SIMULATOR_DATABASE})
-        first = github_environment_values("00000000-0000-4000-8000-000000000001", created_databases=created)
-        second = github_environment_values("00000000-0000-4000-8000-000000000002", created_databases=created)
+        created = frozenset({DATABASE, LIFECYCLE_DATABASE, SIMULATOR_DATABASE})
+        first = github_environment_values(
+            "00000000-0000-4000-8000-000000000001",
+            "00000000-0000-4000-8000-000000000003",
+            created_databases=created,
+        )
+        second = github_environment_values(
+            "00000000-0000-4000-8000-000000000002",
+            "00000000-0000-4000-8000-000000000004",
+            created_databases=created,
+        )
         self.assertEqual(first["KAIROS_PRODUCTION_CLAIMS_TEST_DATABASE"], DATABASE)
+        self.assertEqual(first["KAIROS_PRODUCTION_LIFECYCLE_TEST_DATABASE"], LIFECYCLE_DATABASE)
+        self.assertNotEqual(
+            first["KAIROS_PRODUCTION_LIFECYCLE_TEST_DATABASE_UUID"],
+            second["KAIROS_PRODUCTION_LIFECYCLE_TEST_DATABASE_UUID"],
+        )
+        self.assertIn(
+            "/" + LIFECYCLE_DATABASE,
+            first["KAIROS_PRODUCTION_LIFECYCLE_TEST_OWNER_DSN"],
+        )
+        self.assertIn(
+            "terminal-reconciler-ci-public-test-only",
+            first["KAIROS_PRODUCTION_LIFECYCLE_TEST_RECONCILER_DSN"],
+        )
         self.assertNotEqual(
             first["KAIROS_PRODUCTION_CLAIMS_TEST_DATABASE_UUID"],
             second["KAIROS_PRODUCTION_CLAIMS_TEST_DATABASE_UUID"],
@@ -90,19 +112,37 @@ class ClaimsWorkflowRegressionTests(unittest.TestCase):
             first["KAIROS_SIM_CONTROLLER_DATABASE_URL"],
             "postgresql://kairos:kairos_test@localhost:5432/" + SIMULATOR_DATABASE,
         )
-        for created_databases in (frozenset(), frozenset({DATABASE})):
+        for created_databases in (
+            frozenset(),
+            frozenset({DATABASE}),
+            frozenset({DATABASE, SIMULATOR_DATABASE}),
+        ):
             with self.subTest(created_databases=created_databases), self.assertRaises(ValueError):
                 github_environment_values(
                     "00000000-0000-4000-8000-000000000001",
+                    "00000000-0000-4000-8000-000000000003",
                     created_databases=created_databases,
                 )
+        with self.assertRaisesRegex(ValueError, "distinct nonzero UUIDs"):
+            github_environment_values(
+                "00000000-0000-4000-8000-000000000001",
+                "00000000-0000-4000-8000-000000000001",
+                created_databases=created,
+            )
 
     def test_simulator_database_is_separate_fixed_test_target(self):
-        from tests.bootstrap_production_claims_ci import SIMULATOR_DATABASE, bootstrap_sql
+        from tests.bootstrap_production_claims_ci import (
+            LIFECYCLE_DATABASE,
+            RECONCILER_ROLE,
+            SIMULATOR_DATABASE,
+            bootstrap_sql,
+        )
 
         statements = bootstrap_sql()
         self.assertEqual(SIMULATOR_DATABASE, "kairos_sim_controller_ci_000000000001")
         self.assertIn(f"CREATE DATABASE {SIMULATOR_DATABASE} OWNER kairos", statements)
+        self.assertIn(f"CREATE DATABASE {LIFECYCLE_DATABASE} OWNER kairos_claim_owner_ci", statements)
+        self.assertTrue(any(f"{RECONCILER_ROLE}" in statement for statement in statements))
         self.assertNotIn("IF NOT EXISTS", " ".join(statements))
         self.assertNotIn("DROP DATABASE", " ".join(statements))
         self.assertNotIn("KAIROS_SIM_CONTROLLER_DATABASE_URL", "\n".join(statements))

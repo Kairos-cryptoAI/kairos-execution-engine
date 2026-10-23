@@ -168,6 +168,18 @@ async def test_composition_inspects_then_signs_and_dispatches_exactly_once_witho
 
 
 @pytest.mark.asyncio
+async def test_lifecycle_can_inspect_raw_ack_without_promoting_it_to_fill_or_retry():
+    runtime, request, _, _, backend, sends, _, _ = runtime_fixture()
+    outcome = await runtime.dispatch_one_response(request)
+    assert outcome.response == {"id": json.loads(request.message_json)["id"], "status": "NEW"}
+    assert outcome.receipt.lifecycle_complete is False
+    assert outcome.receipt.status == "TRANSPORT_RESPONSE_UNRECONCILED"
+    with pytest.raises(ManagedSigningError):
+        await runtime.dispatch_one_response(request)
+    assert len(backend.calls) == len(sends) == 1
+
+
+@pytest.mark.asyncio
 async def test_inspection_deadline_is_bounded_without_claim_or_key_access():
     runtime, request, source, claims, backend, sends, _, now = runtime_fixture()
     request = request.model_copy(update={"expires_at": now + timedelta(milliseconds=30)})

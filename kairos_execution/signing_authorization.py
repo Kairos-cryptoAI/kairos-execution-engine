@@ -532,7 +532,12 @@ class ProductionSigningAuthorizationVerifier:
                 raise ManagedSigningError("protection side differs from the protected position side")
             raise ManagedSigningError("exit side is not the reducing side for authoritative exposure")
         quantity = message["quantity"]
-        if quantity <= 0 or quantity > exposure.remaining_quantity:
+        # The reviewed EVEDEX TPSL schema uses zero to protect the entire
+        # currently owned position. It is not an empty direct close, nor an
+        # authorization to grow exposure. Parent/side/trigger and the positive
+        # fresh exposure lease are still checked independently below/above.
+        whole_position_protection = request.operation == "New take-profit/stop-loss" and quantity == 0
+        if not whole_position_protection and (quantity <= 0 or quantity > exposure.remaining_quantity):
             raise ManagedSigningError("exit quantity exceeds remaining exposure")
         if message.get("order", exposure.parent_order_id) != exposure.parent_order_id:
             raise ManagedSigningError("protective exit parent differs from authoritative exposure")

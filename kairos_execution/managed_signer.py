@@ -37,6 +37,37 @@ _OPERATIONS = frozenset(
         "New take-profit/stop-loss",
     }
 )
+PRODUCTION_SIGNING_PROFILE = "kairos.evedex-managed-sdk.v1"
+LEGACY_SIGNING_PROFILE = "kairos.evedex-legacy-signing.v1"
+_UNSIGNED_PRODUCTION_METADATA = {
+    "New limit order": {"timeInForce": "IOC", "postOnly": False},
+    "New take-profit/stop-loss": {"order": "required deterministic parent client order ID"},
+}
+
+
+def production_signing_types(operation: str) -> dict[str, list[dict[str, str]]]:
+    """Return the pinned SDK EIP-712 type profile without changing legacy schemas.
+
+    SDK 1.1.0's TP/SL typehash omits `order`; that field remains a required
+    request/journal metadata value and is never included in the typehash.
+    """
+    if operation not in _OPERATIONS:
+        raise ManagedSigningError("signing operation is not allowlisted")
+    types = json.loads(json.dumps(EIP712_SCHEMAS[operation]))
+    if operation == "New take-profit/stop-loss":
+        types[operation] = [field for field in types[operation] if field["name"] != "order"]
+    return types
+
+
+def production_signed_message(operation: str, message: dict) -> dict:
+    """Project validated request geometry to exactly the pinned SDK signed fields."""
+    types = production_signing_types(operation)
+    field_order = [field["name"] for field in types[operation]]
+    fields = set(field_order)
+    metadata = {"order"} if operation == "New take-profit/stop-loss" else set()
+    if type(message) is not dict or set(message) != fields | metadata:
+        raise ManagedSigningError("typed message does not match the production signing profile")
+    return {name: message[name] for name in field_order}
 
 
 class ManagedSigningError(PermissionError):
@@ -133,11 +164,14 @@ class AsyncSigningAuthorizationVerifier(Protocol):
 
 
 def reviewed_schema_sha256(chain_id: int) -> str:
-    """Bind the local reviewed non-Withdraw schema/domain, not a caller's types."""
+    """Bind the SDK schema version and its explicit unsigned REST metadata policy."""
     encoded = json.dumps(
         {
+            "profile": PRODUCTION_SIGNING_PROFILE,
+            "sdk": {"package": "@evedex/exchange-crypto", "version": "1.1.0"},
             "domain": build_domain(chain_id),
-            "types": {key: EIP712_SCHEMAS[key] for key in sorted(_OPERATIONS)},
+            "types": {key: production_signing_types(key)[key] for key in sorted(_OPERATIONS)},
+            "unsigned_request_metadata": _UNSIGNED_PRODUCTION_METADATA,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -161,9 +195,11 @@ def _typed_message(request: ManagedSigningRequestV1, binding: CustodyBindingV1) 
         message = json.loads(request.message_json, object_pairs_hook=_reject_duplicate_keys)
     except (ValueError, TypeError):
         raise ManagedSigningError("malformed typed message") from None
-    types = json.loads(json.dumps(EIP712_SCHEMAS[request.operation]))
+    types = production_signing_types(request.operation)
     fields = types[request.operation]
-    if type(message) is not dict or set(message) != {item["name"] for item in fields}:
+    expected_fields = {item["name"] for item in fields}
+    metadata_fields = {"order"} if request.operation == "New take-profit/stop-loss" else set()
+    if type(message) is not dict or set(message) != expected_fields | metadata_fields:
         raise ManagedSigningError("typed message does not match the fixed schema")
     for field in fields:
         value = message[field["name"]]

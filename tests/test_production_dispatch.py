@@ -11,11 +11,16 @@ from kairos_execution.production_dispatch import (
     ProductionDispatchError,
     ProductionEffectDispatcher,
     ProductionWireRequestV1,
+    production_wire_body,
 )
 from kairos_execution.production_readiness import canonical_digest
 from kairos_execution.signing_authorization import signing_effect_id
 from tests.test_managed_signer import NOW, setup_signer
 from tests.test_production_claims import claims_fixture
+
+
+def _wire_body(request, signed):
+    return production_wire_body(request.operation, json.loads(request.message_json), signed.signature)
 
 
 class CurrentState:
@@ -56,7 +61,7 @@ async def test_wire_claim_and_second_state_check_precede_one_exact_transport_cal
         effect_type="PLACE_ORDER",
         method="POST",
         path="/api/v2/order/limit",
-        body={**message, "signature": signed.signature},
+        body=_wire_body(signing_request, signed),
         signing_request=signing_request,
         custody_binding=signer.binding,
         signed=signed,
@@ -67,6 +72,8 @@ async def test_wire_claim_and_second_state_check_precede_one_exact_transport_cal
     async def sender(**kwargs):
         assert len(db.claims) == 2  # typed-signing + distinct WIRE_DISPATCH committed
         assert len(auth.calls) == 2
+        assert kwargs["body"]["timeInForce"] == "IOC"
+        assert "postOnly" not in kwargs["body"]
         db.events.append("WIRE_SEND")
         sends.append(kwargs)
         return {"id": message["id"], "status": "NEW"}
@@ -107,7 +114,7 @@ async def test_duplicate_delivery_never_sends_twice():
         effect_type="PLACE_ORDER",
         method="POST",
         path="/api/v2/order/limit",
-        body={**message, "signature": signed.signature},
+        body=_wire_body(signing_request, signed),
         signing_request=signing_request,
         custody_binding=signer.binding,
         signed=signed,
@@ -149,7 +156,7 @@ async def test_changed_wire_body_or_signature_claim_fails_before_wire_admission(
         effect_type="PLACE_ORDER",
         method="POST",
         path="/api/v2/order/limit",
-        body={**message, "signature": signed.signature, "quantity": 101},
+        body={**_wire_body(signing_request, signed), "quantity": "0.00000101"},
         signing_request=signing_request,
         custody_binding=signer.binding,
         signed=signed,
@@ -191,7 +198,7 @@ async def test_wire_json_numeric_type_substitution_is_rejected_before_authorizat
         effect_type="PLACE_ORDER",
         method="POST",
         path="/api/v2/order/limit",
-        body={**message, "signature": signed.signature, "leverage": altered},
+        body={**_wire_body(signing_request, signed), "leverage": altered},
         signing_request=signing_request,
         custody_binding=signer.binding,
         signed=signed,
@@ -218,6 +225,57 @@ async def test_wire_json_numeric_type_substitution_is_rejected_before_authorizat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"timeInForce": "GTC"},
+        {"timeInForce": "FOK"},
+        {"postOnly": True},
+    ],
+)
+async def test_tampered_unsigned_order_metadata_fails_before_state_or_claim_reads(mutation):
+    signer, signing_request, _, _, _ = setup_signer()
+    claims, db = claims_fixture(context=signing_request.context)
+    signed = await signer.sign_async(signing_request, now=NOW, claims=claims)
+    events_after_signing = list(db.events)
+    message = json.loads(signing_request.message_json)
+    decision_id = "decision-synthetic-metadata"
+    body = {**_wire_body(signing_request, signed), **mutation}
+    request = ProductionWireRequestV1(
+        context=signing_request.context,
+        database_uuid=claims.database_uuid,
+        decision_id=decision_id,
+        effect_id=signing_effect_id(request=signing_request, message=message, decision_id=decision_id),
+        effect_type="PLACE_ORDER",
+        method="POST",
+        path="/api/v2/order/limit",
+        body=body,
+        signing_request=signing_request,
+        custody_binding=signer.binding,
+        signed=signed,
+    )
+    auth, sends = CurrentState(), []
+
+    async def sender(**kwargs):
+        sends.append(kwargs)
+        return {"id": "unexpected", "status": "NEW"}
+
+    dispatcher = ProductionEffectDispatcher(
+        authorization=auth,
+        signature_verifier=SyntheticSignatureVerifier(),
+        claims=claims,
+        database_uuid=claims.database_uuid,
+        context=request.context,
+        clock=lambda: NOW,
+        sender=sender,
+    )
+    with pytest.raises(ProductionDispatchError, match="differs from the exact"):
+        await dispatcher.dispatch_one(request)
+    assert not sends and not auth.calls
+    assert db.events == events_after_signing
+
+
+@pytest.mark.asyncio
 async def test_independent_signature_failure_refuses_before_durable_wire_claim():
     signer, signing_request, _, _, _ = setup_signer()
     claims, db = claims_fixture(context=signing_request.context)
@@ -233,7 +291,7 @@ async def test_independent_signature_failure_refuses_before_durable_wire_claim()
         effect_type="PLACE_ORDER",
         method="POST",
         path="/api/v2/order/limit",
-        body={**message, "signature": signed.signature},
+        body=_wire_body(signing_request, signed),
         signing_request=signing_request,
         custody_binding=signer.binding,
         signed=signed,
@@ -280,7 +338,7 @@ async def test_disarm_between_claim_and_transport_marks_unresolved_without_send(
         effect_type="PLACE_ORDER",
         method="POST",
         path="/api/v2/order/limit",
-        body={**message, "signature": signed.signature},
+        body=_wire_body(signing_request, signed),
         signing_request=signing_request,
         custody_binding=signer.binding,
         signed=signed,
@@ -326,7 +384,7 @@ async def test_transport_cancellation_is_terminal_unresolved_and_never_retried()
         effect_type="PLACE_ORDER",
         method="POST",
         path="/api/v2/order/limit",
-        body={**message, "signature": signed.signature},
+        body=_wire_body(signing_request, signed),
         signing_request=signing_request,
         custody_binding=signer.binding,
         signed=signed,
@@ -369,7 +427,7 @@ async def test_dispatch_deadline_covers_durable_reads_and_caps_signing_expiry():
         effect_type="PLACE_ORDER",
         method="POST",
         path="/api/v2/order/limit",
-        body={**message, "signature": signed.signature},
+        body=_wire_body(signing_request, signed),
         signing_request=signing_request.model_copy(update={"expires_at": NOW + timedelta(seconds=60)}),
         custody_binding=signer.binding,
         signed=signed,
@@ -404,7 +462,7 @@ async def test_dispatch_deadline_covers_durable_reads_and_caps_signing_expiry():
         effect_type="PLACE_ORDER",
         method="POST",
         path="/api/v2/order/limit",
-        body={**short_message, "signature": short_signed.signature},
+        body=_wire_body(short_signing_request, short_signed),
         signing_request=short_signing_request,
         custody_binding=signer2.binding,
         signed=short_signed,
@@ -446,7 +504,7 @@ async def test_wall_clock_rollback_and_zero_database_uuid_fail_closed():
         effect_type="PLACE_ORDER",
         method="POST",
         path="/api/v2/order/limit",
-        body={**message, "signature": signed.signature},
+        body=_wire_body(signing_request, signed),
         signing_request=signing_request,
         custody_binding=signer.binding,
         signed=signed,
@@ -494,7 +552,7 @@ async def test_sender_deadline_returns_no_late_success_and_refuses_replay():
         effect_type="PLACE_ORDER",
         method="POST",
         path="/api/v2/order/limit",
-        body={**message, "signature": signed.signature},
+        body=_wire_body(signing_request, signed),
         signing_request=signing_request,
         custody_binding=signer.binding,
         signed=signed,
@@ -546,7 +604,7 @@ async def test_terminal_timeout_does_not_wait_for_late_ack_or_allow_replay():
         effect_type="PLACE_ORDER",
         method="POST",
         path="/api/v2/order/limit",
-        body={**message, "signature": signed.signature},
+        body=_wire_body(signing_request, signed),
         signing_request=signing_request,
         custody_binding=signer.binding,
         signed=signed,

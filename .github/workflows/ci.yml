@@ -81,6 +81,19 @@ jobs:
         run: npm test
       - name: Audit production dependency tree
         run: npm audit --omit=dev
+      - name: Install Python for pinned SDK signature parity
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.3"
+          python-version: "3.11"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Compare managed signature profile against installed pinned SDK
+        working-directory: .
+        run: |
+          uv sync --locked --extra evedex
+          uv run --locked --extra evedex python -c "import eth_account, coincurve; from tests.test_managed_sdk_schema import PINNED_SDK_AVAILABLE; assert PINNED_SDK_AVAILABLE"
+          uv run --locked --extra evedex pytest -q tests/test_managed_sdk_schema.py
 
   optional-adapters:
     name: All exchange adapters

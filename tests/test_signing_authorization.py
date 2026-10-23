@@ -397,6 +397,43 @@ def test_exit_signing_deadline_must_not_outlive_exposure_lease():
         verifier.verify_request_at(request, binding, now=now)
 
 
+def test_zero_quantity_tpsl_protects_only_fresh_owned_positive_exposure():
+    verifier, request, binding, evidence, now = fixture("New take-profit/stop-loss")
+    message = json.loads(request.message_json)
+    message["quantity"] = 0
+    request = request.model_copy(update={"message_json": json.dumps(message)})
+    risk = evidence.risk.model_copy(
+        update={
+            "quantity": 0,
+            "effect_id": signing_effect_id(
+                request=request, message=message, decision_id=evidence.risk.decision_id
+            ),
+        }
+    )
+    verifier._source.evidence = evidence.model_copy(update={"risk": risk})
+    verifier.verify_request_at(request, binding, now=now)
+    verifier._source.evidence = evidence.model_copy(update={"risk": risk, "exposure": None})
+    with pytest.raises(ManagedSigningError, match="exposure lineage"):
+        verifier.verify_request_at(request, binding, now=now)
+    verifier._source.evidence = evidence.model_copy(
+        update={
+            "risk": risk,
+            "exposure": evidence.exposure.model_copy(update={"parent_order_id": "wrong-parent"}),
+        }
+    )
+    with pytest.raises(ManagedSigningError, match="parent"):
+        verifier.verify_request_at(request, binding, now=now)
+
+
+def test_zero_quantity_direct_close_stays_forbidden():
+    verifier, request, binding, _, now = fixture("Position close order")
+    message = json.loads(request.message_json)
+    message["quantity"] = 0
+    request = request.model_copy(update={"message_json": json.dumps(message)})
+    with pytest.raises(ManagedSigningError, match="typed order geometry"):
+        verifier.verify_request_at(request, binding, now=now)
+
+
 def test_position_close_is_independent_of_arm_and_requires_reducing_risk_side():
     verifier, request, binding, evidence, now = fixture("Position close order")
     verifier._source.evidence = evidence.model_copy(

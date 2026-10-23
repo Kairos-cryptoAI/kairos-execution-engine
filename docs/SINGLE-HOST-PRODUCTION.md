@@ -82,9 +82,14 @@ fresh isolated test database; no primary database or legacy queue is involved.
 
 ## Explicitly not completed by these components
 
-The service does not yet compose a production lifecycle executor, independently
-operated PROD state producers, atomic account-scoped pending-risk/notional
-reservation, and a capability issuer. The async PostgreSQL reader is a component,
+The default service does not select a production lifecycle executor. An explicit
+[managed lifecycle composition](PRODUCTION-LIFECYCLE.md) now reuses the native
+FSM through partial fill/protection/cancellation/recovery/close/account proof;
+its native-PostgreSQL fixture tests are not real-venue acceptance. Independently
+operated PROD state producers, accepted custody/transport and a capability issuer
+remain undeployed. The account-scoped reservation is append-only and remains
+conservative even after terminal evidence; automatic capital reuse is not added.
+The async PostgreSQL reader is a component,
 not evidence that its upstream writers are deployed or that risk calculations
 are independently qualified. Settings and factory still reject LIVE. A signed
 readiness record or presence of keys must not be converted into a permissive

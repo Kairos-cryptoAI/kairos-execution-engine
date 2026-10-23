@@ -20,6 +20,11 @@ from pathlib import Path
 from typing import Any
 
 from .crypto import EIP712_SCHEMAS, build_domain
+from .managed_signer import (
+    LEGACY_SIGNING_PROFILE,
+    PRODUCTION_SIGNING_PROFILE,
+    production_signing_types,
+)
 
 MAX_REQUEST_BYTES = 32 * 1024
 MAX_RESPONSE_BYTES = 4096
@@ -203,7 +208,7 @@ def _validate_contract(
     domain: dict[str, Any],
     types: dict[str, list],
     message: dict[str, Any],
-) -> str:
+) -> tuple[str, str]:
     if not isinstance(expected_custody_reference, str) or not expected_custody_reference:
         raise LocalCustodyError("custody reference is invalid")
     if custody_reference != expected_custody_reference:
@@ -222,12 +227,22 @@ def _validate_contract(
     if not isinstance(types, dict) or len(types) != 1:
         raise LocalCustodyError("typed schema is not allowlisted")
     operation = next(iter(types), None)
-    if operation not in _OPERATIONS or types != EIP712_SCHEMAS[operation]:
+    if operation not in _OPERATIONS:
+        raise LocalCustodyError("typed schema is not allowlisted")
+    if types == production_signing_types(operation):
+        schema_profile = PRODUCTION_SIGNING_PROFILE
+        fixed_types = production_signing_types(operation)
+        metadata_fields = {"order"} if operation == "New take-profit/stop-loss" else set()
+    elif types == EIP712_SCHEMAS[operation]:
+        schema_profile = LEGACY_SIGNING_PROFILE
+        fixed_types = EIP712_SCHEMAS[operation]
+        metadata_fields = set()
+    else:
         raise LocalCustodyError("typed schema is not allowlisted")
     if domain != build_domain(chain_id):
         raise LocalCustodyError("typed domain differs from custody binding")
-    fields = EIP712_SCHEMAS[operation][operation]
-    if type(message) is not dict or set(message) != {field["name"] for field in fields}:
+    fields = fixed_types[operation]
+    if type(message) is not dict or set(message) != {field["name"] for field in fields} | metadata_fields:
         raise LocalCustodyError("typed message does not match its fixed schema")
     for field in fields:
         value = message[field["name"]]
@@ -258,7 +273,7 @@ def _validate_contract(
             raise LocalCustodyError("typed price/cash quantity must be positive")
     if "quantity" in message and message["quantity"] == 0 and operation != "New take-profit/stop-loss":
         raise LocalCustodyError("typed quantity must be positive")
-    return operation
+    return operation, schema_profile
 
 
 class LocalEncryptedKeystoreBackend:
@@ -309,7 +324,7 @@ class LocalEncryptedKeystoreBackend:
             raise ValueError("dedicated custody worker is unavailable")
 
     def sign_typed_data(self, *, custody_reference: str, domain: dict, types: dict, message: dict) -> str:
-        operation = _validate_contract(
+        operation, schema_profile = _validate_contract(
             custody_reference=custody_reference,
             expected_custody_reference=self.custody_reference,
             wallet_address=self.wallet_address,
@@ -329,6 +344,7 @@ class LocalEncryptedKeystoreBackend:
             "types": types,
             "message": message,
             "operation": operation,
+            "schema_profile": schema_profile,
             "keystore_file": str(self.keystore_file),
             "unlock_file": str(self.unlock_file),
         }
@@ -475,14 +491,21 @@ class CoincurveTypedDataVerifier:
                 normalized_chain_id = int(chain_id)
             else:
                 return False
-            if (
-                primary not in _OPERATIONS
-                or types != EIP712_SCHEMAS[primary]
-                or domain != build_domain(normalized_chain_id)
-            ):
+            if primary not in _OPERATIONS or domain != build_domain(normalized_chain_id):
                 return False
-            fields = EIP712_SCHEMAS[primary][primary]
-            if type(message) is not dict or set(message) != {field["name"] for field in fields}:
+            production_profile = types == production_signing_types(primary)
+            legacy_profile = types == EIP712_SCHEMAS[primary]
+            if not production_profile and not legacy_profile:
+                return False
+            fields = types[primary]
+            signed_fields = {field["name"] for field in fields}
+            metadata_fields = (
+                {"order"} if production_profile and primary == "New take-profit/stop-loss" else set()
+            )
+            accepted_keys = {frozenset(signed_fields)}
+            if metadata_fields:
+                accepted_keys.add(frozenset(signed_fields | metadata_fields))
+            if type(message) is not dict or frozenset(message) not in accepted_keys:
                 return False
             for field in fields:
                 value = message[field["name"]]
@@ -492,11 +515,19 @@ class CoincurveTypedDataVerifier:
                         return False
                 elif type(value) is not str or not 0 < len(value) <= 160:
                     return False
+            if "order" in message and re.fullmatch(r"[0-9]{5}:[A-Fa-f0-9]{26}", message["order"]) is None:
+                return False
+            # Dispatch verifies the projected venue EIP-712 payload (without
+            # TP/SL's required, unsigned parent-order metadata). Signing and
+            # request validation still require that metadata upstream.
+            signed_message = (
+                {field["name"]: message[field["name"]] for field in fields} if production_profile else message
+            )
             full = {
                 "types": {**types, "EIP712Domain": _domain_fields(domain)},
                 "primaryType": primary,
                 "domain": domain,
-                "message": message,
+                "message": signed_message,
             }
             signable = encode_typed_data(full_message=full)
             digest = keccak(b"\x19" + signable.version + signable.header + signable.body)

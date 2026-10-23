@@ -344,6 +344,11 @@ not venue/economic/PAPER qualification.
 
 ## Runtime delivery durability
 
+The separate opt-in [managed PROD lifecycle](docs/PRODUCTION-LIFECYCLE.md) now
+composes existing decision/effect journals, managed signing/wire claims,
+protection, cancellation, recovery and terminal account evidence. Its fixtures
+are engineering checks, not EVEDEX acceptance; the default LIVE refusal remains.
+
 With Redis, consumed IDs, execution reports and completion are committed through
 `kairos-persistence`; Redis is ACKed only after PostgreSQL commits. Configure
 `KAIROS_PERSISTENCE_DATABASE_URL` through the deployment secret provider. This
