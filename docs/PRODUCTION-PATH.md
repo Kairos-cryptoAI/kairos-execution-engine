@@ -62,6 +62,35 @@ the exact durable canonical decision/chain and startup recovery, then uses the
 existing recovery path without renewing the old entry quote. New/RECEIVED
 entries still require fresh market evidence; this does not change PAPER.
 
+## Explicit upstream verification composition
+
+`build_opt_in_production_live_risk_evaluator` in `production_input_risk`
+constructs the actual Risk evaluator with `LiveInputsSourceVerifier` and the
+fixed, fail-closed EVEDEX account verifier. Scope, limits, producer trust policy
+and a dedicated Ed25519 public key are mandatory constructor inputs; nothing
+is registered or activated by default. This composition is available to the
+existing `ProductionLiveRiskPublisher`, not a new trading service.
+
+The bounded producer envelope binds the exact native Router/review,
+`DecisionContextV1`, Text output, separate raw Macro source/allocation, original
+source clocks, provider prompt/response and reservation identities, PROD venue
+quality and its two market-source receipts. It checks exact bytes/digests,
+signature, scope, native context/evidence identities and original freshness.
+Text retains its native 30-minute source / 10-minute planning limits, while
+venue/book/reference each retain the two-second execution cap. The envelope's
+five-second lease never refreshes an upstream timestamp. Explicit unavailable
+fields remain unavailable; an absent required source refuses authorization.
+
+A signature authenticates only the independently trusted capture process's
+statement, not a provider signature, profitability, account truth or LIVE
+authority. There is still **no qualified, registered real capture producer**
+in the default service. A caller signing hand-built DTOs or old source probes
+is not qualification. A producer must retain the actual native boundary's
+original bytes, receipt clocks and uncached model/budget records and undergo
+independent acceptance before deployment may register its dedicated identity.
+Observed-SIM intents remain SIM-only. The new composition/negative tests use
+explicitly synthetic fixtures; they are not a real-source or venue E2E pass.
+
 ## Compatibility and limits
 
 Legacy manually assembled lifecycle callers may omit the stager, preserving

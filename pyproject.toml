@@ -70,13 +70,14 @@ exclude = [
 required-version = "==0.12.3"
 override-dependencies = [
     "kairos-core @ git+https://github.com/Kairos-cryptoAI/kairos-core.git@ff3af7592cbd47be985d794d8d9903aaa8e5df07",
+    "kairos-persistence @ git+https://github.com/Kairos-cryptoAI/kairos-persistence.git@506628fc8686ff7373d72f37ac032e53a47b233f",
 ]
 
 [tool.uv.sources]
 kairos-core = { git = "https://github.com/Kairos-cryptoAI/kairos-core.git", rev = "ff3af7592cbd47be985d794d8d9903aaa8e5df07" }
-kairos-persistence = { git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git", rev = "c6773575a09f918b4d495848705b4234f73f3a32" }
-kairos-risk-manager = { git = "https://github.com/Kairos-cryptoAI/kairos-risk-manager.git", rev = "ef4365979069c601101b6f3a3560afa9bd67777f" }
-kairos-quant-scouts = { git = "https://github.com/Kairos-cryptoAI/kairos-quant-scouts.git", rev = "cbd8e60b05952c4238aa51a13bc4327350b8e643" }
+kairos-persistence = { git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git", rev = "506628fc8686ff7373d72f37ac032e53a47b233f" }
+kairos-risk-manager = { git = "https://github.com/Kairos-cryptoAI/kairos-risk-manager.git", rev = "c37f6d7be446b2a906b9cba80ea31da4d12dbae3" }
+kairos-quant-scouts = { git = "https://github.com/Kairos-cryptoAI/kairos-quant-scouts.git", rev = "0a7c3b69bf2b2e55ab23d5c23da8ca884c06b301" }
 
 [tool.ruff]
 line-length = 110
