@@ -11,7 +11,7 @@ import base64
 import hashlib
 import json
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 from types import SimpleNamespace
 
@@ -170,7 +170,7 @@ def _native_calls(sink):
     return groups
 
 
-def _native(monkeypatch):
+def _native(monkeypatch, *, news_after_intent=False):
     _verifier, _proof, original_context, review, _venue, _scope, _old_now = _signed_fixture()
     # Explicit synthetic closed-minute clock: native intent/context contracts
     # require the decision to be the exact minute close, never a made-up tail.
@@ -201,7 +201,9 @@ def _native(monkeypatch):
         intent_id=None,
     )
     intent = StrategyIntentV1.model_validate(intent_data)
-    event = datetime.fromtimestamp((decision_ms - 1_000) / 1_000, tz=UTC)
+    event = datetime.fromtimestamp(
+        (decision_ms + 1 if news_after_intent else decision_ms - 1_000) / 1_000, tz=UTC
+    )
     body = (
         "<rss><channel><item><title>Bitcoin BTC ETF approval rally</title>"
         "<description>Bitcoin ETF bullish rally</description><link>https://fixture.invalid/news</link>"
@@ -318,7 +320,7 @@ async def test_actual_native_sequence_retains_sources_outputs_and_never_promotes
     assert {record.get("stage") for record in records} >= {
         "INTENT_INPUT",
         "TEXT_OUTPUT",
-        "MACRO_OUTPUT",
+        "MACRO_CONTEXT_SELECTION",
         "ROUTER_OUTPUT",
         "DECISION_CONTEXT",
         "REVIEW_OUTPUT",
@@ -394,28 +396,102 @@ async def test_native_output_sink_failure_and_closed_interlock_prevent_model_cal
     assert gateway.calls == []
 
 
-async def test_real_native_macro_and_review_preserve_defensive_allocation(monkeypatch):
-    composer, kwargs, sink, _claims, gateway, _interlock = _native(monkeypatch)
+async def test_same_intent_fresh_macro_is_refused_before_sources_claims_or_model_cost(monkeypatch):
+    composer, kwargs, sink, claims, gateway, _interlock = _native(monkeypatch)
     kwargs["macro_context_json"] = '{"explicitly_synthetic_offline_context":true}'
+    with pytest.raises(NativeCompositionRefused, match="fresh Macro work"):
+        await composer.compose(**kwargs)
+    assert gateway.calls == [] and sink.records == {} and claims.claimed == set()
+    assert composer.components.extractor.gateway.budget.reserved == {}
+
+
+async def test_causal_previously_retained_native_macro_is_reused_without_a_new_macro_call(monkeypatch):
+    composer, kwargs, sink, _claims, gateway, _interlock = _native(monkeypatch)
+    # Genuine native defensive output with its DEFAULT actual creation clock,
+    # retained before the explicit synthetic next-minute fixture intent.
+    original = composer.components.macro.defensive(kwargs["macro_trigger"])
+    original_received = int(datetime.now(UTC).timestamp() * 1_000)
+    composer.components.context_store.ingest("macro", original.to_payload(), received_at_ms=original_received)
     result = await composer.compose(**kwargs)
-    assert [call["workload"].value for call in gateway.calls] == [
-        "text_scouts",
-        "macro_strategist",
-        "aggregator_normal",
-    ]
-    assert result.allocation is not None
-    assert result.allocation.stable_reserve_pct == 1.0
-    assert result.allocation.max_gross_leverage == 1.0
-    assert result.allocation.strategy_weights == {}
-    assert result.review.intent.canonical_intent_bytes() == kwargs["intent"].canonical_intent_bytes()
-    macro_pair = next(
-        pair
-        for pair in _native_calls(sink).values()
-        if json.loads(pair["started"])["workload"] == "macro_strategist"
+    assert result.allocation == original
+    macro_source = next(source for source in result.context.sources if source.kind == "macro")
+    assert macro_source.availability == "AVAILABLE"
+    assert macro_source.receipts[0].received_at_ms == original_received
+    assert result.allocation.produced_at == original.produced_at
+    assert [call["workload"].value for call in gateway.calls] == ["text_scouts", "aggregator_normal"]
+    selection = next(
+        json.loads(raw)
+        for raw in sink.records.values()
+        if json.loads(raw).get("stage") == "MACRO_CONTEXT_SELECTION"
     )
-    call = read_native_budgeted_call(macro_pair["started"], macro_pair["completed"])
-    assert call.native_workload == "macro_strategist"
-    assert call.actual_microusd <= call.reserved_microusd
+    assert selection["payload"]["original_receipts"] == [macro_source.receipts[0].model_dump(mode="json")]
+
+
+def test_actual_default_clock_macro_created_after_real_decision_cut_is_not_causal(monkeypatch):
+    composer, kwargs, _sink, _claims, gateway, _interlock = _native(monkeypatch)
+    actual_now = int(datetime.now(UTC).timestamp() * 1_000)
+    real_decision_close = actual_now // 60_000 * 60_000 - 1
+    values = kwargs["intent"].model_dump(mode="python")
+    values.update(
+        decision_ts_ms=real_decision_close,
+        entry_eligible_ts_ms=real_decision_close + 1,
+        entry_expires_ts_ms=real_decision_close + 120_000,
+        intent_id=None,
+    )
+    intent = StrategyIntentV1.model_validate(values)
+    text = SignalWindow().aggregate(
+        intent.symbol, as_of=datetime.fromtimestamp(real_decision_close / 1_000, tz=UTC)
+    )
+    route = composer.components.router.build(intent, text)
+    allocation = composer.components.macro.defensive(kwargs["macro_trigger"])
+    received = int(datetime.now(UTC).timestamp() * 1_000)
+    composer.components.context_store.ingest("macro", allocation.to_payload(), received_at_ms=received)
+    source = composer.components.context_store._snapshot("macro", route, received, received)
+    assert int(allocation.produced_at.timestamp() * 1_000) > route.routed_at_ms
+    assert source.availability == "UNAVAILABLE"
+    assert gateway.calls == []
+
+
+def test_native_text_default_output_clock_is_original_publication_not_extractor_time():
+    from kairos_text.models import NewsItem
+    from kairos_text.schemas import SentimentBatch
+
+    published = datetime.now(UTC) - timedelta(seconds=10)
+    item = NewsItem(
+        title="Bitcoin ETF rally",
+        source="https://fixture.invalid/feed",
+        source_kind="rss",
+        url="https://fixture.invalid/news",
+        published_at=published,
+        timestamp_is_estimated=False,
+    )
+    batch = SentimentBatch.model_validate(
+        {
+            "signals": [
+                {
+                    "topic": "BTCUSDT",
+                    "sentiment": 0.8,
+                    "impact": "bullish",
+                    "confidence": 0.8,
+                    "summary": "Synthetic native source evidence.",
+                    "item_ids": [1],
+                }
+            ]
+        }
+    )
+    extractor = SentimentExtractor(None)
+    signals = extractor._signals_from_batch((item,), batch)
+    assert signals and signals[0].produced_at == published
+    assert int(signals[0].produced_at.timestamp() * 1_000) < extractor._clock_ms()
+
+
+async def test_post_intent_news_remains_retained_but_does_not_spend_text_budget(monkeypatch):
+    composer, kwargs, sink, _claims, gateway, _interlock = _native(monkeypatch, news_after_intent=True)
+    result = await composer.compose(**kwargs)
+    assert result.text_signals == ()
+    assert [call["workload"].value for call in gateway.calls] == ["aggregator_normal"]
+    assert any(json.loads(raw).get("kind") == "RSS_RESPONSE" for raw in sink.records.values())
+    assert not any(json.loads(raw).get("kind") == "SENTIMENT_EXTRACTION" for raw in sink.records.values())
 
 
 async def test_native_text_failure_keeps_unknown_reservation_and_explicit_local_fallback(monkeypatch):

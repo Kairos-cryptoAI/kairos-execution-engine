@@ -114,7 +114,7 @@ a lease, or calls a model. The resulting signed proof is the existing publisher/
 coordinator input, not new owner/account/operator authority.
 
 `NativeUpstreamComposer` invokes actual native RSS, Text preparation/extraction,
-optional Macro allocation, Router policy/window, context store and candidate
+Router policy/window, context store and candidate
 review components. It requires original source/extractor capture sinks and
 actual `BudgetedLLMGateway` instances retaining original call records through
 `NativeLLMCallSinkAdapter`. It does not construct a provider client, connection,
@@ -125,6 +125,25 @@ or cancelled calls remain claimed, their reservations remain outstanding, and
 no blind retry, release or timestamp renewal is performed. A shared native
 capture/review clock and original intent deadline bound the whole invocation;
 cancellation interlocks are checked around asynchronous work and persistence.
+
+Fresh Macro work is refused before claims/source/model work when supplied to
+this same-intent composition: an allocation created after the original event
+cut cannot become causal by changing its timestamp. Only the actual context
+store's previously retained eligible Macro observation is projected, with exact
+native payload/digest/identity and its original receipt; otherwise allocation
+remains unavailable/None. `MACRO_CONTEXT_SELECTION` is an explicit selection
+witness, not a new Macro output or a model-call completion. A full source
+projector must join that selection back to the original retained Macro
+source/model/persistence witnesses, potentially from an earlier session; it
+must not bind a current call or renew its receipt time. Native Macro preparation
+can still occur separately through its existing component, not this entry path.
+
+News is additionally cut at the unchanged original intent event time before
+Text dispatch. Native Text signal time remains the original article publication
+time (maximum over its exact input evidence), not extractor completion time.
+Post-intent news remains captured but does not spend Text budget for an input
+that the native Router would necessarily exclude. No intent, trigger, review
+deadline, source TTL or later two-second execution quote/reference is refreshed.
 
 The optional native Text capture seam retains original decompressed RSS response
 bytes and native parse/extraction witnesses in the same session. The explicit

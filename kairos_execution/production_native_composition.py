@@ -27,6 +27,7 @@ from kairos_core.contracts import (
     StrategicAllocation,
     StrategyIntentV1,
     canonical_json_bytes,
+    canonical_sha256,
 )
 from kairos_core.enums import StrategicTrigger
 
@@ -95,8 +96,38 @@ def _concrete(value: object, module: str, name: str) -> None:
         raise TypeError(f"the actual native {module}.{name} instance is required")
 
 
+def _allocation_from_context(context: DecisionContextV1) -> StrategicAllocation | None:
+    """Project only the native store's original causal Macro observation.
+
+    This is not qualification of Macro's raw source or model call. Deployment
+    must still join this exact identity/digest/receipt to its retained source
+    session before preparing a signed input envelope.
+    """
+    source = next(slot for slot in context.sources if slot.kind == "macro")
+    if source.availability == "UNAVAILABLE":
+        return None
+    payloads = source.payloads()
+    if len(payloads) != 1 or len(source.receipts) != 1:
+        raise NativeCompositionRefused("native Macro context requires one exact original observation")
+    allocation = StrategicAllocation.model_validate(payloads[0])
+    receipt = source.receipts[0]
+    produced = int(allocation.produced_at.timestamp() * 1_000)
+    if (
+        canonical_json_bytes(allocation) != canonical_json_bytes(payloads[0])
+        or canonical_sha256(allocation) != receipt.content_sha256
+        or allocation.message_id != receipt.message_id
+        or allocation.source != receipt.source
+        or produced != receipt.event_at_ms
+        or produced != receipt.produced_at_ms
+        or produced > context.event_as_of_ms
+        or receipt.received_at_ms > context.knowledge_cutoff_ms
+    ):
+        raise NativeCompositionRefused("native Macro context lost its original causal identity or receipt")
+    return allocation
+
+
 class NativeUpstreamComposer:
-    """Invoke native source/Text/Macro/Router/context/review without trading.
+    """Invoke native Text/Router/context/review with only causal retained Macro.
 
     Both source and extractor must already have independently configured native
     capture sinks. The emission sink adds output witnesses but does not replace
@@ -273,8 +304,18 @@ class NativeUpstreamComposer:
         Supplied market/bars/macro context still require their independent raw
         source witnesses. This method does not qualify their contents or invent
         an account, strategy intent, route override, model result or geometry.
+        ``macro_context_json`` is retained only as a fail-closed compatibility
+        argument: non-None refuses before spending. ``macro_trigger`` cannot
+        create a new allocation or promote a new trigger in this entry path.
         """
         c = self.components
+        if macro_context_json is not None:
+            # A fresh allocation created after this original intent cannot be
+            # causal at its event cut. Refuse before claims, sources or spending;
+            # never retime it, reroute the intent, or widen the review deadline.
+            raise NativeCompositionRefused(
+                "fresh Macro work cannot run inside an original intent; retained causal context required"
+            )
         intent = StrategyIntentV1.model_validate(intent.model_dump(mode="json"))
         market = MarketSnapshot.model_validate(market.model_dump(mode="json"))
         if not isinstance(bars, tuple) or not 1 <= len(bars) <= 1_440:
@@ -296,13 +337,13 @@ class NativeUpstreamComposer:
                 self._check(deadline)
                 raw.extend(await source.fetch())
                 self._check(deadline)
-            selected = c.relevance.select(
-                c.dedup.filter_unseen(
-                    c.dedup.collapse_batch(
-                        c.freshness.select(c.normalizer.normalize(raw)),
-                    )
-                )
-            )
+            timely = c.freshness.select(c.normalizer.normalize(raw))
+            if any(item.published_at.utcoffset() is None for item in timely):
+                raise NativeCompositionRefused("native news publication needs an original aware event clock")
+            causal_items = [
+                item for item in timely if int(item.published_at.timestamp() * 1_000) <= intent.decision_ts_ms
+            ]
+            selected = c.relevance.select(c.dedup.filter_unseen(c.dedup.collapse_batch(causal_items)))
             from kairos_text.dedup import dedup_key  # type: ignore[import-not-found,import-untyped]
 
             by_key = {hashlib.sha256(dedup_key(item).encode("utf-8")).hexdigest(): item for item in selected}
@@ -318,25 +359,6 @@ class NativeUpstreamComposer:
                     {
                         "items": [signal.model_dump(mode="json") for signal in signals],
                     },
-                    deadline=deadline,
-                )
-            )
-            allocation = None
-            if macro_context_json is not None:
-                if (
-                    not isinstance(macro_context_json, str)
-                    or len(macro_context_json.encode("utf-8")) > 1_000_000
-                ):
-                    raise NativeCompositionRefused("bounded original native Macro context is required")
-                records.append(self._emit(intent, "MACRO_INPUT", macro_context_json, deadline=deadline))
-                self._check(deadline)
-                allocation = await c.macro.allocate(macro_context_json, trigger=macro_trigger)
-                self._check(deadline)
-            records.append(
-                self._emit(
-                    intent,
-                    "MACRO_OUTPUT",
-                    allocation.model_dump(mode="json") if allocation is not None else None,
                     deadline=deadline,
                 )
             )
@@ -369,12 +391,25 @@ class NativeUpstreamComposer:
                 c.context_store.ingest(
                     "closed_bars", bar.model_dump(mode="json"), received_at_ms=self._check(deadline)
                 )
-            if allocation is not None:
-                c.context_store.ingest(
-                    "macro", allocation.model_dump(mode="json"), received_at_ms=self._check(deadline)
-                )
             captured = self._check(deadline)
             context = c.context_store.build(route, cutoff_ms=captured, captured_at_ms=captured)
+            allocation = _allocation_from_context(context)
+            macro_source = next(slot for slot in context.sources if slot.kind == "macro")
+            records.append(
+                self._emit(
+                    intent,
+                    "MACRO_CONTEXT_SELECTION",
+                    {
+                        "availability": macro_source.availability,
+                        "allocation": allocation.model_dump(mode="json") if allocation is not None else None,
+                        "original_receipts": [
+                            receipt.model_dump(mode="json") for receipt in macro_source.receipts
+                        ],
+                        "reason_code": macro_source.reason_code,
+                    },
+                    deadline=deadline,
+                )
+            )
             records.append(
                 self._emit(intent, "DECISION_CONTEXT", context.model_dump(mode="json"), deadline=deadline)
             )
