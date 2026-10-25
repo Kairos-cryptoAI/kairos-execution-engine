@@ -21,6 +21,7 @@ from typing import Literal
 from kairos_core.contracts import (
     CandidateReviewV1,
     CandidateRouteV1,
+    EvidenceReferenceV1,
     SentimentSignal,
     StrategicAllocation,
     VenueQualityV1,
@@ -58,6 +59,28 @@ _REQUIRED_STAGES = {
     "EVEDEX_BOOK",
 }
 _SINGLETON_STAGES = _REQUIRED_STAGES - {"TEXT_SOURCE", "MACRO_SOURCE"}
+
+
+def _review_evidence_matches_context(review: CandidateReviewV1, context: DecisionContextV1) -> bool:
+    """Join native review's exact sentiment + context refs, without arbitrary extras.
+
+    Older signed engineering callers used context-only references. Those remain
+    compatible, but neither form can introduce content outside the actual cut.
+    """
+    context_refs = context.evidence_references()
+    text = next(source for source in context.sources if source.kind == "text")
+    signals = tuple(SentimentSignal.model_validate(payload) for payload in text.payloads())
+    sentiment_refs = tuple(
+        EvidenceReferenceV1(
+            kind="sentiment",
+            reference=signal.message_id,
+            content_sha256=canonical_sha256(signal),
+            observed_at_ms=int(signal.produced_at.timestamp() * 1_000),
+        )
+        for signal in signals
+    )
+    native_refs = tuple(sorted((*sentiment_refs, *context_refs), key=canonical_json_bytes))
+    return review.evidence in (context_refs, native_refs)
 
 
 class LiveInputProducerTrustV1(StrictRecord):
@@ -98,6 +121,8 @@ class LiveInputStageReceiptV1(StrictRecord):
         "EVEDEX_BOOK",
         "MODEL_PROMPT",
         "MODEL_RESPONSE",
+        "MODEL_ATTEMPT_RECORD",
+        "MODEL_COMPLETION_RECORD",
     ]
     receipt_id: str = Field(min_length=1, max_length=160, pattern=r"^[A-Za-z0-9_.:-]+$")
     source_name: str | None = Field(default=None, min_length=1, max_length=160)
@@ -173,7 +198,12 @@ class LiveInputStageReceiptV1(StrictRecord):
                 raise ValueError("unavailable native outputs cannot claim an output origin")
         elif self.output_origin is not None:
             raise ValueError("only native Text/Macro outputs can carry an output origin")
-        model_stage = self.stage in {"MODEL_PROMPT", "MODEL_RESPONSE"}
+        model_stage = self.stage in {
+            "MODEL_PROMPT",
+            "MODEL_RESPONSE",
+            "MODEL_ATTEMPT_RECORD",
+            "MODEL_COMPLETION_RECORD",
+        }
         if model_stage:
             if (
                 self.workload_id is None
@@ -274,7 +304,15 @@ class SignedLiveInputsEnvelopeV1(StrictRecord):
             if sum(receipt.stage == stage for receipt in self.stages) != 1:
                 raise ValueError(f"{stage} must have exactly one explicit stage receipt")
         model_artifacts = [
-            stage for stage in self.stages if stage.stage in {"MODEL_PROMPT", "MODEL_RESPONSE"}
+            stage
+            for stage in self.stages
+            if stage.stage
+            in {
+                "MODEL_PROMPT",
+                "MODEL_RESPONSE",
+                "MODEL_ATTEMPT_RECORD",
+                "MODEL_COMPLETION_RECORD",
+            }
         ]
         call_pairs: dict[tuple[str, str], list[LiveInputStageReceiptV1]] = {}
         for receipt in model_artifacts:
@@ -284,7 +322,11 @@ class SignedLiveInputsEnvelopeV1(StrictRecord):
                 raise ValueError("duplicate model artifact for the same workload call")
             pair.append(receipt)
         for pair in call_pairs.values():
-            if {item.stage for item in pair} != {"MODEL_PROMPT", "MODEL_RESPONSE"}:
+            names = {item.stage for item in pair}
+            expected_names = {"MODEL_PROMPT", "MODEL_RESPONSE"}
+            if names & {"MODEL_ATTEMPT_RECORD", "MODEL_COMPLETION_RECORD"}:
+                expected_names |= {"MODEL_ATTEMPT_RECORD", "MODEL_COMPLETION_RECORD"}
+            if names != expected_names:
                 raise ValueError("each workload model call needs exactly one prompt and response artifact")
             if (
                 len(
@@ -325,8 +367,11 @@ class SignedLiveInputsEnvelopeV1(StrictRecord):
         if canonical_json_bytes(self.route) != canonical_json_bytes(self.review.route):
             raise ValueError("envelope route must equal the native review route")
         self.context.validate_for_route(self.route)
-        if self.review.evidence != self.context.evidence_references():
+        if not _review_evidence_matches_context(self.review, self.context):
             raise ValueError("review evidence must equal the exact native DecisionContext reference")
+        from .production_native_inputs import verify_native_call_receipts
+
+        verify_native_call_receipts(self.stages)
         return self
 
     def signed_payload(self) -> bytes:
@@ -391,7 +436,7 @@ class LiveInputsSourceVerifier:
             raise ValueError("producer, qualified implementation, policy, or source-set identity mismatch")
         if (
             canonical_json_bytes(envelope.review) != canonical_json_bytes(review)
-            or envelope.context.evidence_references() != review.evidence
+            or not _review_evidence_matches_context(review, envelope.context)
             or canonical_json_bytes(envelope.venue) != canonical_json_bytes(venue)
             or (envelope.allocation is None) != (allocation is None)
             or (
@@ -591,7 +636,16 @@ class LiveInputsSourceVerifier:
             "MACRO_ALLOCATION": by_stage["MACRO_ALLOCATION"][0].content_sha256,
         }
         for stage in envelope.stages:
-            if stage.stage in {"MODEL_PROMPT", "MODEL_RESPONSE"} and stage.workload_id in output_digests:
+            if (
+                stage.stage
+                in {
+                    "MODEL_PROMPT",
+                    "MODEL_RESPONSE",
+                    "MODEL_ATTEMPT_RECORD",
+                    "MODEL_COMPLETION_RECORD",
+                }
+                and stage.workload_id in output_digests
+            ):
                 if (
                     by_stage[stage.workload_id.replace("AGGREGATION", "AGGREGATE")][0].status != "CAPTURED"
                     or stage.bound_output_sha256 != output_digests[stage.workload_id]

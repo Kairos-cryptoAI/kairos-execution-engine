@@ -91,6 +91,64 @@ independent acceptance before deployment may register its dedicated identity.
 Observed-SIM intents remain SIM-only. The new composition/negative tests use
 explicitly synthetic fixtures; they are not a real-source or venue E2E pass.
 
+`production_native_inputs` is the narrow native-call linkage prerequisite. Its
+reader consumes the original create-only `kairos-llm` application-boundary
+`ATTEMPT_STARTED` and `COMPLETED` records, not reconstructed `LLMResult` objects.
+It joins the exact attempt digest, schema/prompt/reply bytes, requested/resolved
+model, original provider clocks and original RESERVED/COMMITTED budget identity
+and amounts. The provider `cached` flag still denotes input-token caching, not
+whole-response reuse. Four optional envelope stages retain both native records
+and the exact existing prompt/reply representation. When those records are
+present, the envelope independently verifies their full join and rejects reused
+call/reservation/request identities. Existing legacy fixtures are not upgraded
+to native captures by adding this adapter.
+
+`prepare_native_input_envelope` consumes an already retained canonical capture
+manifest plus those original call-record pairs. It preserves source/native
+stage bytes and clocks, binds each model call to its exact emitted output, and
+returns an **unsigned** preparation. Only an external producer may sign
+`native_input_signing_bytes`; `verify_signed_native_input_envelope` finalizes it
+through the actual independently pinned `LiveInputsSourceVerifier`. Neither
+operation reads or creates keys, performs I/O, registers a producer, refreshes
+a lease, or calls a model. The resulting signed proof is the existing publisher/
+coordinator input, not new owner/account/operator authority.
+
+`NativeUpstreamComposer` invokes actual native RSS, Text preparation/extraction,
+optional Macro allocation, Router policy/window, context store and candidate
+review components. It requires original source/extractor capture sinks and
+actual `BudgetedLLMGateway` instances retaining original call records through
+`NativeLLMCallSinkAdapter`. It does not construct a provider client, connection,
+strategy intent, account, route override or trade geometry. One native pipeline
+is admitted at a time; the existing durable processing-claim seam fences the
+intent before source/model work and selected news before Text dispatch. Unknown
+or cancelled calls remain claimed, their reservations remain outstanding, and
+no blind retry, release or timestamp renewal is performed. A shared native
+capture/review clock and original intent deadline bound the whole invocation;
+cancellation interlocks are checked around asynchronous work and persistence.
+
+The optional native Text capture seam retains original decompressed RSS response
+bytes and native parse/extraction witnesses in the same session. The explicit
+`production_native_text` readers verify original body/native-parser bytes and
+native Text prompt/schema/result/call-record joins. Text output replay uses the
+actual unchanged native model/fallback transform, with exact version-one
+`items`/`signals` mapping wrappers and extractor identity; source, input, model
+result and output substitution refuse. No persistence timestamp is
+invented from a capture timestamp: the durable session store must witness its
+own acknowledgement separately. Native Router/review/context output records are
+emitted synchronously before a composition result is exposed. Review evidence
+accepts the exact actual native combined sentiment/context references, not
+arbitrary additions; legacy context-only engineering references remain compatible.
+
+This does **not** close native capture qualification. Macro context, market/bar
+and venue raw sources still need their independent complete source witnesses;
+source/native session linkage and signed deployment acceptance remain required.
+Passing caller-built DTOs or an old probe manifest to preparation cannot
+establish that witness. There is no accepted producer or registration default,
+and composition results remain `live_ready=False` / `REJECT_ALL`. Tests using
+real native components and synthetic offline transport/model/budget fixtures
+establish engineering traversal only, not provider or real-venue acceptance.
+No real-source or paid-provider call is part of those tests.
+
 ## Compatibility and limits
 
 ### Explicit service runner and cancellation boundary

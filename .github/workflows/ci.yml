@@ -46,17 +46,19 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
       - name: Sync locked environment
-        run: uv sync --locked
+        run: uv sync --locked --extra native-inputs
+      - name: Require the real native input components
+        run: uv run --locked --extra native-inputs python -c "import kairos_text.sentiment, kairos_macro.strategist, kairos_router.candidate, kairos_aggregator.candidate_review, kairos_llm.budget"
       - name: Lint
-        run: uv run --locked ruff check .
+        run: uv run --locked --extra native-inputs ruff check .
       - name: Check formatting
-        run: uv run --locked ruff format --check .
+        run: uv run --locked --extra native-inputs ruff format --check .
       - name: Type check
-        run: uv run --locked mypy kairos_execution
+        run: uv run --locked --extra native-inputs mypy kairos_execution
       - name: Security scan
-        run: uv run --locked bandit -q -r kairos_execution -x tests
+        run: uv run --locked --extra native-inputs bandit -q -r kairos_execution -x tests
       - name: Test
-        run: uv run --locked pytest -q -m "not integration" --tb=short
+        run: uv run --locked --extra native-inputs pytest -q -m "not integration" --tb=short
       - name: Build source and wheel distributions
         run: uv build --no-sources
 
