@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -17,6 +20,7 @@ from kairos_execution.production_transport import (
     ProductionEvedexSdkClient,
     ProductionEvedexTransport,
     ProductionTransportError,
+    parse_raw_response_capture,
 )
 from tests.test_production_runtime import runtime_fixture
 from tests.test_signing_authorization import fixture as signing_fixture
@@ -76,6 +80,35 @@ class FakeClient:
         self.calls.append(("funding",))
         return {"list": [{"balance": "2.5000"}]}
 
+    async def fetch_raw_capture(self, payload):
+        self.calls.append(("raw_capture", payload))
+        source = payload["source"]
+        path = {
+            "account_identity": "/api/user/me",
+            "funding": "/api/user/funding",
+            "order_page": "/api/order",
+            "tpsl_page": "/api/tpsl",
+        }[source]
+        query = {
+            ("next" if key == "next_cursor" else key): str(value)
+            for key, value in payload.items()
+            if key != "source"
+        }
+        if source == "order_page":
+            query["withTpSL"] = ""
+        raw = b'{"quantity":1.2300,"large":123456789012345678901234567890}'
+        return {
+            "source": source,
+            "path": path,
+            "query_json": json.dumps(query, sort_keys=True, separators=(",", ":")),
+            "status": 200,
+            "requested_at": "2026-10-25T10:00:00.000Z",
+            "received_at": "2026-10-25T10:00:00.010Z",
+            "body_bytes": len(raw),
+            "body_sha256": hashlib.sha256(raw).hexdigest(),
+            "body_base64": base64.b64encode(raw).decode("ascii"),
+        }
+
 
 def _signed_tpsl():
     return {
@@ -109,6 +142,93 @@ async def test_preflight_binds_exact_exchange_id_and_enables_typed_sdk_surface_o
         ("tpsl", {"limit": 100, "offset": 0}),
         ("funding",),
     ]
+
+
+@pytest.mark.asyncio
+async def test_raw_capture_is_fixed_read_only_and_lossless_without_authority_promotion():
+    client = FakeClient()
+    transport = ProductionEvedexTransport(context=CONTEXT, custody_binding=BINDING, client=client)
+    await transport.preflight()
+    capture = await transport.fetch_raw_capture(
+        "order_page", version=2, limit=50, offset=100, next_cursor="cursor-1"
+    )
+    parsed = parse_raw_response_capture(
+        capture,
+        source="order_page",
+        expected_query={"version": 2, "limit": 50, "offset": 100, "next": "cursor-1", "withTpSL": ""},
+    )
+    assert parsed["quantity"] == Decimal("1.2300")
+    assert parsed["large"] == Decimal("123456789012345678901234567890")
+    assert client.calls[-1] == (
+        "raw_capture",
+        {
+            "source": "order_page",
+            "version": 2,
+            "limit": 50,
+            "offset": 100,
+            "next_cursor": "cursor-1",
+        },
+    )
+    with pytest.raises(ProductionTransportError, match="fixed account/history allowlist"):
+        await transport.fetch_raw_capture("arbitrary", limit=10, offset=0)
+    with pytest.raises(ProductionTransportError, match="fixed read contract"):
+        await transport.fetch_raw_capture("order_page", version=2, limit=True, offset=0)
+    assert len(client.calls) == 2  # preflight and the sole bounded capture
+
+    failed_client = FakeClient()
+    original_capture = failed_client.fetch_raw_capture
+
+    async def failed_http_capture(payload):
+        capture = await original_capture(payload)
+        capture["status"] = 503
+        return capture
+
+    failed_client.fetch_raw_capture = failed_http_capture
+    failed_transport = ProductionEvedexTransport(
+        context=CONTEXT, custody_binding=BINDING, client=failed_client
+    )
+    await failed_transport.preflight()
+    with pytest.raises(ProductionTransportError, match="status is not successful"):
+        await failed_transport.fetch_raw_capture("funding")
+
+
+def test_raw_capture_rejects_tampering_oversize_and_non_json_bodies():
+    raw = b'{"n":1.2000}'
+    capture = {
+        "source": "funding",
+        "path": "/api/user/funding",
+        "query_json": "{}",
+        "status": 200,
+        "requested_at": "2026-10-25T10:00:00.000Z",
+        "received_at": "2026-10-25T10:00:00.001Z",
+        "body_bytes": len(raw),
+        "body_sha256": hashlib.sha256(raw).hexdigest(),
+        "body_base64": base64.b64encode(raw).decode("ascii"),
+    }
+    assert parse_raw_response_capture(capture, source="funding", expected_query={})["n"] == Decimal("1.2000")
+    tampered = {**capture, "body_base64": base64.b64encode(b'{"n":2}').decode("ascii")}
+    with pytest.raises(ProductionTransportError, match="digest or length"):
+        parse_raw_response_capture(tampered, source="funding", expected_query={})
+    duplicate_query = {**capture, "query_json": '{"unexpected":"1","unexpected":"2"}'}
+    with pytest.raises(ProductionTransportError, match="query is malformed"):
+        parse_raw_response_capture(duplicate_query, source="funding", expected_query={})
+    with pytest.raises(ProductionTransportError, match="fixed read contract"):
+        parse_raw_response_capture(
+            capture,
+            source="order_page",
+            expected_query={"version": 2, "limit": 1, "offset": 0, "extra": "unexpected"},
+        )
+    oversized = {**capture, "body_bytes": 2 * 1024 * 1024 + 1}
+    with pytest.raises(ProductionTransportError, match="byte bound"):
+        parse_raw_response_capture(oversized, source="funding", expected_query={})
+    malformed = {
+        **capture,
+        "body_base64": base64.b64encode(b"not-json").decode("ascii"),
+        "body_bytes": 8,
+        "body_sha256": hashlib.sha256(b"not-json").hexdigest(),
+    }
+    with pytest.raises(ProductionTransportError, match="JSON body"):
+        parse_raw_response_capture(malformed, source="funding", expected_query={})
 
 
 @pytest.mark.asyncio

@@ -5,6 +5,7 @@ import { EvedexProdSdkGateway, safeProdError } from "./prod_sdk_gateway.js";
 import { serializeProdResponse } from "./prod_protocol.js";
 
 const MAX_LINE_BYTES = 1024 * 1024;
+const MAX_RAW_CAPTURE_BYTES = 2 * 1024 * 1024;
 let gateway;
 let apiKey;
 let queue = Promise.resolve();
@@ -61,6 +62,32 @@ function validate(value) {
     if (!Number.isInteger(payload.limit) || !Number.isInteger(payload.offset)) throw new TypeError("TP/SL page query is malformed");
     return { id: value.id, operation: value.operation, payload };
   }
+  if (value.operation === "fetch_raw_capture") {
+    const source = payload.source;
+    if (source === "account_identity" || source === "funding") {
+      exactKeys(payload, ["source"]);
+      return { id: value.id, operation: value.operation, payload };
+    }
+    if (source === "order_page") {
+      const allowed = ["source", "version", "limit", "offset", ...(Object.hasOwn(payload, "next_cursor") ? ["next_cursor"] : [])];
+      exactKeys(payload, allowed);
+      if (payload.version !== 2 || !Number.isInteger(payload.limit) || payload.limit < 1 || payload.limit > 100 ||
+          !Number.isInteger(payload.offset) || payload.offset < 0 || payload.offset > 10_000 ||
+          ("next_cursor" in payload && (typeof payload.next_cursor !== "string" || payload.next_cursor.length === 0 || payload.next_cursor.length > 500))) {
+        throw new TypeError("raw order page query is malformed");
+      }
+      return { id: value.id, operation: value.operation, payload };
+    }
+    if (source === "tpsl_page") {
+      exactKeys(payload, ["source", "limit", "offset"]);
+      if (!Number.isInteger(payload.limit) || payload.limit < 1 || payload.limit > 100 ||
+          !Number.isInteger(payload.offset) || payload.offset < 0 || payload.offset > 10_000) {
+        throw new TypeError("raw TP/SL page query is malformed");
+      }
+      return { id: value.id, operation: value.operation, payload };
+    }
+    throw new TypeError("raw capture source is outside the fixed account/history allowlist");
+  }
   throw new TypeError("production SDK operation is not supported");
 }
 
@@ -108,6 +135,10 @@ async function handle(line) {
       result = await gateway.fetchTpSlPage(request.payload);
     } else if (request.operation === "fetch_funding") {
       result = await gateway.fetchFunding();
+    } else if (request.operation === "fetch_raw_capture") {
+      const { source, next_cursor: next, ...query } = request.payload;
+      result = await gateway.fetchRawCapture({ source, ...query, ...(next === undefined ? {} : { next }) });
+      if (result.body_bytes > MAX_RAW_CAPTURE_BYTES) throw new Error("raw capture exceeded the fixed IPC payload bound");
     } else {
       throw new TypeError("production SDK operation is not supported");
     }

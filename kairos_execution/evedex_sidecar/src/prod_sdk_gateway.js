@@ -2,6 +2,7 @@ import { createRequire } from "node:module";
 import { Agent as HttpsAgent } from "node:https";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { createHash } from "node:crypto";
 
 const require = createRequire(import.meta.url);
 const evedex = require("@evedex/exchange-bot-sdk");
@@ -15,6 +16,7 @@ const PAGE_LIMIT = 100;
 const MAX_RECORDS = 10_000;
 const HTTP_TIMEOUT_MS = 20_000;
 const MAX_HTTP_BYTES = 4 * 1024 * 1024;
+const MAX_RAW_CAPTURE_BYTES = 2 * 1024 * 1024;
 const PROD_PROFILE = Object.freeze({
   exchangeURI: "https://trading-api.evedex.com",
   authURI: "https://auth-api.evedex.com",
@@ -64,11 +66,64 @@ export class PinnedProdRestClient extends RestClient {
     super({});
     this.adapter = adapter;
     this.httpsAgent = new HttpsAgent({ keepAlive: false, maxSockets: 8 });
+    this.rawCaptureExpected = undefined;
+    this.rawCapture = undefined;
+  }
+
+  beginRawCapture(expected) {
+    if (this.rawCaptureExpected || this.rawCapture) throw new Error("a raw HTTP capture is already active");
+    this.rawCaptureExpected = expected;
+  }
+
+  takeRawCapture() {
+    const capture = this.rawCapture;
+    this.rawCapture = undefined;
+    this.rawCaptureExpected = undefined;
+    if (!capture) throw new Error("the fixed raw HTTP read produced no response capture");
+    return capture;
+  }
+
+  #validateCaptureRequest(request, url) {
+    if (!this.rawCaptureExpected) return;
+    if (String(request.method).toUpperCase() !== "GET" || url.pathname !== this.rawCaptureExpected.path) {
+      throw new TypeError("raw capture request differs from its fixed GET route");
+    }
+    const actual = [...url.searchParams.entries()].sort(([a], [b]) => a.localeCompare(b));
+    const expected = Object.entries(this.rawCaptureExpected.query).map(([key, value]) => [key, String(value)])
+      .sort(([a], [b]) => a.localeCompare(b));
+    if (actual.length !== expected.length || actual.some(([key, value], index) =>
+      key !== expected[index][0] || value !== expected[index][1])) {
+      throw new TypeError("raw capture request query differs from its fixed read contract");
+    }
+  }
+
+  #retainRawCapture(request, url, response, requestedAt) {
+    if (!this.rawCaptureExpected) return;
+    const data = response?.data;
+    if (!(Buffer.isBuffer(data) || data instanceof Uint8Array || typeof data === "string")) {
+      throw new TypeError("raw HTTP capture requires original application response bytes");
+    }
+    const bytes = Buffer.from(data);
+    if (bytes.length > MAX_RAW_CAPTURE_BYTES) throw new Error("raw HTTP response exceeds the capture bound");
+    const receivedAt = new Date().toISOString();
+    const query = Object.fromEntries([...url.searchParams.entries()]);
+    this.rawCapture = {
+      source: this.rawCaptureExpected.source,
+      path: url.pathname,
+      query_json: JSON.stringify(query, Object.keys(query).sort()),
+      status: response.status,
+      requested_at: requestedAt,
+      received_at: receivedAt,
+      body_bytes: bytes.length,
+      body_sha256: createHash("sha256").update(bytes).digest("hex"),
+      body_base64: bytes.toString("base64"),
+    };
   }
 
   async authRequest(request) {
     // Check destination before the SDK adds the API-key header.
-    validateProdHttpUrl(request);
+    const url = validateProdHttpUrl(request);
+    this.#validateCaptureRequest(request, url);
     const session = this.getSession();
     if (!session || typeof session.apiKey !== "string" || Object.keys(session).length !== 1) {
       throw new TypeError("EVEDEX PROD HTTP client accepts API-key authentication only");
@@ -78,6 +133,9 @@ export class PinnedProdRestClient extends RestClient {
 
   async request(request) {
     const url = validateProdHttpUrl(request);
+    this.#validateCaptureRequest(request, url);
+    const requestedAt = new Date().toISOString();
+    const captureActive = this.rawCaptureExpected !== undefined;
     const config = {
       url: url.toString(),
       method: request.method,
@@ -86,14 +144,35 @@ export class PinnedProdRestClient extends RestClient {
       timeout: HTTP_TIMEOUT_MS,
       maxRedirects: 0,
       proxy: false,
-      maxContentLength: MAX_HTTP_BYTES,
+      ...(captureActive ? { responseType: "arraybuffer" } : {}),
+      maxContentLength: captureActive ? MAX_RAW_CAPTURE_BYTES : MAX_HTTP_BYTES,
       maxBodyLength: MAX_HTTP_BYTES,
       httpsAgent: this.httpsAgent,
       ...(this.adapter ? { adapter: this.adapter } : {}),
     };
     try {
-      return await axios.request(config);
-    } catch {
+      const response = await axios.request(config);
+      if (!captureActive) return response;
+      if (!(Buffer.isBuffer(response.data) || response.data instanceof Uint8Array || typeof response.data === "string")) {
+        throw new TypeError("raw HTTP capture requires original application response bytes");
+      }
+      const bytes = Buffer.from(response.data);
+      if (captureActive) this.#retainRawCapture(request, url, { ...response, data: bytes }, requestedAt);
+      let parsed;
+      try {
+        parsed = JSON.parse(bytes.toString("utf8"));
+      } catch {
+        throw new Error("EVEDEX PROD HTTP response was not valid JSON");
+      }
+      return { ...response, data: parsed };
+    } catch (error) {
+      if (captureActive && error?.response) {
+        try {
+          this.#retainRawCapture(request, url, error.response, requestedAt);
+        } catch {
+          // Raw evidence that exceeds the fixed bound is never returned.
+        }
+      }
       // The SDK's RequestError retains request headers, so never pass it through.
       throw new Error("EVEDEX PROD HTTP transport failed");
     }
@@ -213,6 +292,7 @@ export class EvedexProdSdkGateway {
     this.expectedAccountId = expectedAccountId;
     this.gatewayFactory = gatewayFactory ?? ((options) => new evedex.Gateway(options));
     this.axiosAdapter = axiosAdapter;
+    this.httpClient = undefined;
     this.gateway = undefined;
     this.account = undefined;
     this.authPromise = undefined;
@@ -226,17 +306,19 @@ export class EvedexProdSdkGateway {
     if (this.preflightFailed || this.preflightAttempted) throw new Error("EVEDEX PROD SDK preflight already failed; create a fresh client after reconciliation");
     this.preflightAttempted = true;
     this.authPromise = (async () => {
+      const httpClient = new PinnedProdRestClient({ adapter: this.axiosAdapter });
       const gateway = this.gatewayFactory({
         authURI: this.profile.authURI,
         exchangeURI: this.profile.exchangeURI,
         centrifuge: { uri: this.profile.centrifugeURI, prefix: this.profile.centrifugePrefix },
-        httpClient: new PinnedProdRestClient({ adapter: this.axiosAdapter }),
+        httpClient,
       });
       try {
         const account = await gateway.createApiKeyAccount({ apiKey: this.apiKey });
         const identity = account?.exchangeAccount;
         expectedAccount(identity, this.expectedAccountId);
         this.gateway = gateway;
+        this.httpClient = httpClient;
         this.account = account;
         this.authenticatedIdentity = identity;
         return identity;
@@ -342,10 +424,57 @@ export class EvedexProdSdkGateway {
     return this.account.exchangeGateway.getFunding();
   }
 
+  async fetchRawCapture({ source, version, limit, offset, next }) {
+    this.#requirePreflight();
+    let path;
+    let query;
+    let read;
+    if (source === "account_identity") {
+      path = "/api/user/me";
+      query = {};
+      read = () => this.account.exchangeGateway.me();
+    } else if (source === "funding") {
+      path = "/api/user/funding";
+      query = {};
+      read = () => this.account.exchangeGateway.getFunding();
+    } else if (source === "order_page") {
+      if (version !== 2 || !Number.isInteger(limit) || limit < 1 || limit > PAGE_LIMIT ||
+          !Number.isInteger(offset) || offset < 0 || offset > MAX_RECORDS ||
+          (next !== undefined && (typeof next !== "string" || next.length < 1 || next.length > 500))) {
+        throw new TypeError("raw order page query is malformed");
+      }
+      path = "/api/order";
+      const sdkQuery = { version, limit, offset, ...(next === undefined ? {} : { next }) };
+      // The pinned SDK always serializes this false/default field as an empty
+      // query parameter; bind it explicitly rather than infer extra parameters.
+      query = { ...sdkQuery, withTpSL: "" };
+      read = () => this.account.exchangeGateway.getOrders(sdkQuery);
+    } else if (source === "tpsl_page") {
+      if (!Number.isInteger(limit) || limit < 1 || limit > PAGE_LIMIT ||
+          !Number.isInteger(offset) || offset < 0 || offset > MAX_RECORDS) {
+        throw new TypeError("raw TP/SL page query is malformed");
+      }
+      path = "/api/tpsl";
+      query = { limit, offset };
+      read = () => this.account.exchangeGateway.getTpSl(query);
+    } else {
+      throw new TypeError("raw capture source is outside the fixed account/history allowlist");
+    }
+    this.httpClient.beginRawCapture({ source, path, query });
+    try {
+      await read();
+    } catch {
+      // An HTTP error response may still have a bounded captured body/status.
+      // Network and parse failures without a response remain failed reads.
+    }
+    return this.httpClient.takeRawCapture();
+  }
+
   async close() {
     const gateway = this.gateway;
     this.gateway = undefined;
     this.account = undefined;
+    this.httpClient = undefined;
     await gateway?.closeWsConnection?.();
   }
 }

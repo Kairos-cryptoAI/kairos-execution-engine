@@ -7,10 +7,15 @@ signs requests, retries mutations, or claims that an HTTP result is a fill.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import hashlib
 import json
 import math
 import os
 import re
+from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -75,6 +80,186 @@ class ProductionTransportError(RuntimeError):
 # a small JSON envelope, so the IPC frame budget includes 4 KiB of overhead.
 # asyncio's StreamReader limit counts the terminating newline as part of a line.
 MAX_IPC_RESPONSE_BYTES = 4 * 1024 * 1024 + 4 * 1024
+MAX_RAW_CAPTURE_BYTES = 2 * 1024 * 1024
+_RAW_CAPTURE_PATHS: dict[str, tuple[str, dict[str, int | str]]] = {
+    "account_identity": ("/api/user/me", {}),
+    "funding": ("/api/user/funding", {}),
+}
+
+
+def _raw_capture_request(
+    source: str,
+    *,
+    version: int | None,
+    limit: int | None,
+    offset: int | None,
+    next_cursor: str | None,
+) -> tuple[dict[str, Any], dict[str, int | str]]:
+    if source in _RAW_CAPTURE_PATHS:
+        if any(value is not None for value in (version, limit, offset, next_cursor)):
+            raise ProductionTransportError("raw capture parameters are not valid for this fixed source")
+        return {"source": source}, {}
+    if source == "order_page":
+        if (
+            type(version) is not int
+            or version != 2
+            or type(limit) is not int
+            or not 1 <= limit <= 100
+            or type(offset) is not int
+            or not 0 <= offset <= 10_000
+            or (next_cursor is not None and (not next_cursor or len(next_cursor) > 500))
+        ):
+            raise ProductionTransportError("raw order capture query is outside the fixed read contract")
+        query: dict[str, int | str] = {"version": version, "limit": limit, "offset": offset}
+        payload: dict[str, Any] = {"source": source, **query}
+        if next_cursor is not None:
+            query["next"] = next_cursor
+            payload["next_cursor"] = next_cursor
+        query["withTpSL"] = ""
+        return payload, query
+    if source == "tpsl_page":
+        if (
+            version is not None
+            or next_cursor is not None
+            or type(limit) is not int
+            or not 1 <= limit <= 100
+            or type(offset) is not int
+            or not 0 <= offset <= 10_000
+        ):
+            raise ProductionTransportError("raw TP/SL capture query is outside the fixed read contract")
+        query = {"limit": limit, "offset": offset}
+        return {"source": source, **query}, query
+    raise ProductionTransportError("raw capture source is outside the fixed account/history allowlist")
+
+
+def parse_raw_response_capture(
+    capture: dict[str, Any], *, source: str, expected_query: dict[str, int | str]
+) -> Any:
+    """Verify and losslessly parse a bounded pre-JSON HTTP body capture.
+
+    This authenticates only the locally retained response bytes and metadata;
+    it does not establish venue history completeness or account-state authority.
+    """
+    if not isinstance(capture, dict) or set(capture) != {
+        "source",
+        "path",
+        "query_json",
+        "status",
+        "requested_at",
+        "received_at",
+        "body_bytes",
+        "body_sha256",
+        "body_base64",
+    }:
+        raise ProductionTransportError("raw HTTP capture shape is malformed")
+    expected_path: tuple[str, dict[str, int | str]] | None
+    if source == "order_page":
+        if (
+            set(expected_query)
+            not in (
+                {"version", "limit", "offset", "withTpSL"},
+                {"version", "limit", "offset", "next", "withTpSL"},
+            )
+            or expected_query.get("withTpSL") != ""
+        ):
+            raise ProductionTransportError("raw order query is outside the fixed read contract")
+        next_cursor = expected_query.get("next")
+        if "next" in expected_query and not isinstance(next_cursor, str):
+            raise ProductionTransportError("raw order cursor is malformed")
+        version = expected_query.get("version")
+        limit = expected_query.get("limit")
+        offset = expected_query.get("offset")
+        if type(version) is not int or type(limit) is not int or type(offset) is not int:
+            raise ProductionTransportError("raw order query values are malformed")
+        _, authorized_query = _raw_capture_request(
+            source,
+            version=version,
+            limit=limit,
+            offset=offset,
+            next_cursor=next_cursor if isinstance(next_cursor, str) else None,
+        )
+        expected_path = ("/api/order", authorized_query)
+    elif source == "tpsl_page":
+        if set(expected_query) != {"limit", "offset"}:
+            raise ProductionTransportError("raw TP/SL query is outside the fixed read contract")
+        limit = expected_query.get("limit")
+        offset = expected_query.get("offset")
+        if type(limit) is not int or type(offset) is not int:
+            raise ProductionTransportError("raw TP/SL query values are malformed")
+        _, authorized_query = _raw_capture_request(
+            source,
+            version=None,
+            limit=limit,
+            offset=offset,
+            next_cursor=None,
+        )
+        expected_path = ("/api/tpsl", authorized_query)
+    else:
+        expected_path = _RAW_CAPTURE_PATHS.get(source)
+        if expected_query:
+            raise ProductionTransportError("raw capture query is outside the fixed read contract")
+    if expected_path is None or capture["source"] != source or capture["path"] != expected_path[0]:
+        raise ProductionTransportError("raw HTTP capture differs from the fixed read route")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate JSON object key")
+            value[key] = item
+        return value
+
+    try:
+        query = json.loads(capture["query_json"], object_pairs_hook=unique_object)
+    except (TypeError, ValueError):
+        raise ProductionTransportError("raw HTTP capture query is malformed") from None
+    expected_wire_query = {key: str(value) for key, value in expected_path[1].items()}
+    if not isinstance(query, dict) or query != expected_wire_query:
+        raise ProductionTransportError("raw HTTP capture query differs from the exact read request")
+    if type(capture["status"]) is not int or not 100 <= capture["status"] <= 599:
+        raise ProductionTransportError("raw HTTP capture status is malformed")
+    if type(capture["body_bytes"]) is not int or not 0 <= capture["body_bytes"] <= MAX_RAW_CAPTURE_BYTES:
+        raise ProductionTransportError("raw HTTP capture exceeds its byte bound")
+    digest = capture["body_sha256"]
+    body64 = capture["body_base64"]
+    if (
+        not isinstance(digest, str)
+        or re.fullmatch(r"[a-f0-9]{64}", digest) is None
+        or not isinstance(body64, str)
+        or len(body64) > ((MAX_RAW_CAPTURE_BYTES + 2) // 3) * 4
+    ):
+        raise ProductionTransportError("raw HTTP capture digest or body is malformed")
+    try:
+        body = base64.b64decode(body64, validate=True)
+    except (ValueError, binascii.Error):
+        raise ProductionTransportError("raw HTTP capture body is malformed base64") from None
+    if len(body) != capture["body_bytes"] or hashlib.sha256(body).hexdigest() != digest:
+        raise ProductionTransportError("raw HTTP capture body digest or length differs")
+    try:
+        requested = datetime.fromisoformat(capture["requested_at"].replace("Z", "+00:00"))
+        received = datetime.fromisoformat(capture["received_at"].replace("Z", "+00:00"))
+        if (
+            requested.tzinfo is None
+            or received.tzinfo is None
+            or requested.utcoffset() != UTC.utcoffset(requested)
+            or received.utcoffset() != UTC.utcoffset(received)
+            or received < requested
+        ):
+            raise ValueError
+        text = body.decode("utf-8", errors="strict")
+
+        def reject_constant(value: str) -> Any:
+            raise ValueError(value)
+
+        return json.loads(
+            text,
+            parse_int=Decimal,
+            parse_float=Decimal,
+            parse_constant=reject_constant,
+            object_pairs_hook=unique_object,
+        )
+    except (AttributeError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        raise ProductionTransportError("raw HTTP capture timestamps or JSON body are invalid") from None
 
 
 def _validate_signed_post(method: str, path: str, body: dict[str, Any]) -> tuple[str, str | None]:
@@ -238,6 +423,36 @@ class ProductionEvedexTransport:
     async def fetch_funding(self) -> dict[str, Any] | list[Any]:
         self._require_preflight()
         return await self.client.fetch_funding()
+
+    async def fetch_raw_capture(
+        self,
+        source: str,
+        *,
+        version: int | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+        next_cursor: str | None = None,
+    ) -> dict[str, Any]:
+        self._require_preflight()
+        payload, query = _raw_capture_request(
+            source,
+            version=version,
+            limit=limit,
+            offset=offset,
+            next_cursor=next_cursor,
+        )
+        capture = await self.client.fetch_raw_capture(payload)
+        if not isinstance(capture, dict):
+            raise ProductionTransportError("EVEDEX raw HTTP capture was not an object")
+        parsed = parse_raw_response_capture(capture, source=source, expected_query=query)
+        if not 200 <= capture["status"] < 300:
+            raise ProductionTransportError("raw EVEDEX HTTP response status is not successful")
+        if source == "account_identity" and (
+            not isinstance(parsed, dict)
+            or str(parsed.get("exchangeId", "")) != self.context.remote_account_id
+        ):
+            raise ProductionTransportError("raw account-identity capture differs from the bound PROD account")
+        return capture
 
     @staticmethod
     def _validate_cancel(*, effect_id: str, instrument: str, target_id: str) -> None:
@@ -504,6 +719,36 @@ class ProductionEvedexSdkClient:
 
     async def fetch_funding(self) -> dict[str, Any] | list[Any]:
         return await self._call("fetch_funding", {}, mutation=False)
+
+    async def fetch_raw_capture(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(payload, dict) or not isinstance(payload.get("source"), str):
+            raise ProductionTransportError("raw HTTP capture request is malformed")
+        source = payload["source"]
+        if source in _RAW_CAPTURE_PATHS:
+            if set(payload) != {"source"}:
+                raise ProductionTransportError("raw HTTP capture parameters differ from the fixed source")
+        elif source == "order_page":
+            allowed = {"source", "version", "limit", "offset", "next_cursor"}
+            if set(payload) not in (allowed - {"next_cursor"}, allowed):
+                raise ProductionTransportError("raw order capture fields differ from the fixed read contract")
+        elif source == "tpsl_page":
+            if set(payload) != {"source", "limit", "offset"}:
+                raise ProductionTransportError("raw TP/SL capture fields differ from the fixed read contract")
+        else:
+            raise ProductionTransportError(
+                "raw capture source is outside the fixed account/history allowlist"
+            )
+        payload, _ = _raw_capture_request(
+            source,
+            version=payload.get("version"),
+            limit=payload.get("limit"),
+            offset=payload.get("offset"),
+            next_cursor=payload.get("next_cursor"),
+        )
+        result = await self._call("fetch_raw_capture", payload, mutation=False)
+        if not isinstance(result, dict):
+            raise ProductionTransportError("EVEDEX raw HTTP capture was not an object")
+        return result
 
     async def _abort(self, process: asyncio.subprocess.Process) -> None:
         self._failed = True

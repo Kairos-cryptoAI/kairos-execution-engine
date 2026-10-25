@@ -214,6 +214,128 @@ test("read methods preserve raw SDK-parsed JSON and strict page query shapes", a
   await gateway.close();
 });
 
+test("raw capture returns bounded original application body bytes with exact GET metadata", async () => {
+  const body = Buffer.from('{"list":[{"quantity":12345678901234567890.123456789012345}],"count":1}', "utf8");
+  const requests = [];
+  const gateway = new EvedexProdSdkGateway({
+    apiKey: "api-key-test",
+    expectedAccountId: "acct-prod-1",
+    axiosAdapter: async (config) => {
+      requests.push(config);
+      const data = config.url.endsWith("/api/user/me")
+        ? { exchangeId: "acct-prod-1" }
+        : body;
+      return { data, status: 200, statusText: "OK", headers: {}, config };
+    },
+  });
+  await gateway.preflight();
+  const capture = await gateway.fetchRawCapture({ source: "order_page", version: 2, limit: 50, offset: 100 });
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].method.toUpperCase(), "GET");
+  assert.equal(requests[1].url, "https://trading-api.evedex.com/api/order?version=2&limit=50&offset=100&withTpSL=");
+  assert.equal(requests[1].maxRedirects, 0);
+  assert.equal(requests[1].proxy, false);
+  assert.equal(capture.source, "order_page");
+  assert.equal(capture.path, "/api/order");
+  assert.deepEqual(JSON.parse(capture.query_json), { version: "2", limit: "50", offset: "100", withTpSL: "" });
+  assert.equal(capture.status, 200);
+  assert.equal(Buffer.from(capture.body_base64, "base64").toString("utf8"), body.toString("utf8"));
+  assert.equal(capture.body_bytes, body.length);
+  assert.match(capture.body_sha256, /^[a-f0-9]{64}$/);
+  assert.ok(Date.parse(capture.received_at) >= Date.parse(capture.requested_at));
+  await gateway.close();
+});
+
+test("raw capture refuses non-allowlisted source, mismatched route/query and oversized body", async () => {
+  let attempts = 0;
+  const gateway = new EvedexProdSdkGateway({
+    apiKey: "api-key-test",
+    expectedAccountId: "acct-prod-1",
+    axiosAdapter: async (config) => {
+      attempts += 1;
+      const data = config.url.endsWith("/api/user/me")
+        ? { exchangeId: "acct-prod-1" }
+        : Buffer.alloc(2 * 1024 * 1024 + 1, 0x20);
+      return { data, status: 200, statusText: "OK", headers: {}, config };
+    },
+  });
+  await gateway.preflight();
+  const before = attempts;
+  await assert.rejects(gateway.fetchRawCapture({ source: "arbitrary", path: "/api/order" }), /outside the fixed/);
+  assert.equal(attempts, before);
+
+  const client = new PinnedProdRestClient({ adapter: async (config) => { attempts += 1; return { data: {}, status: 200, config }; } });
+  client.setSession({ apiKey: "api-key-test" });
+  client.beginRawCapture({ source: "funding", path: "/api/user/me", query: {} });
+  const mismatchedRequest = { method: "GET", url: "https://trading-api.evedex.com/api/user/funding", headers: {} };
+  await assert.rejects(client.authRequest(mismatchedRequest), /fixed GET route/);
+  assert.equal(mismatchedRequest.headers["x-api-key"], undefined);
+  assert.equal(attempts, before);
+
+  await assert.rejects(
+    gateway.fetchRawCapture({ source: "order_page", version: 2, limit: 1, offset: 0 }),
+    /no response capture/,
+  );
+  await gateway.close();
+});
+
+test("raw capture is limited to the other fixed account endpoints and retains HTTP status without headers", async () => {
+  const fundingBody = Buffer.from('[{"coin":"USDT","quantity":1.2300}]', "utf8");
+  const requests = [];
+  const gateway = new EvedexProdSdkGateway({
+    apiKey: "api-key-test",
+    expectedAccountId: "acct-prod-1",
+    axiosAdapter: async (config) => {
+      requests.push(config);
+      if (config.url.endsWith("/api/user/me")) {
+        const data = config.responseType === "arraybuffer"
+          ? Buffer.from('{"exchangeId":"acct-prod-1"}')
+          : { exchangeId: "acct-prod-1" };
+        return { data, status: 200, statusText: "OK", headers: {}, config };
+      }
+      if (config.url.endsWith("/api/user/funding")) {
+        const response = { data: fundingBody, status: 503, statusText: "Unavailable", headers: { "x-private": "discard" }, config };
+        throw new axios.AxiosError("private adapter detail", "ERR_BAD_RESPONSE", config, undefined, response);
+      }
+      const data = Buffer.from('{"count":0,"list":[]}');
+      return { data, status: 200, statusText: "OK", headers: {}, config };
+    },
+  });
+  await gateway.preflight();
+  const identity = await gateway.fetchRawCapture({ source: "account_identity" });
+  assert.equal(identity.path, "/api/user/me");
+  assert.equal(Buffer.from(identity.body_base64, "base64").toString("utf8"), '{"exchangeId":"acct-prod-1"}');
+  const funding = await gateway.fetchRawCapture({ source: "funding" });
+  assert.equal(funding.path, "/api/user/funding");
+  assert.equal(funding.status, 503);
+  assert.equal(Buffer.from(funding.body_base64, "base64").toString("utf8"), fundingBody.toString("utf8"));
+  assert.deepEqual(Object.keys(funding).sort(), [
+    "body_base64", "body_bytes", "body_sha256", "path", "query_json", "received_at", "requested_at", "source", "status",
+  ]);
+  const tpsl = await gateway.fetchRawCapture({ source: "tpsl_page", limit: 100, offset: 0 });
+  assert.equal(tpsl.path, "/api/tpsl");
+  assert.deepEqual(JSON.parse(tpsl.query_json), { limit: "100", offset: "0" });
+  assert.equal(requests[3].url, "https://trading-api.evedex.com/api/tpsl?limit=100&offset=0");
+  await gateway.close();
+});
+
+test("raw capture refuses parsed adapter objects instead of relabeling them as original response bytes", async () => {
+  const gateway = new EvedexProdSdkGateway({
+    apiKey: "api-key-test",
+    expectedAccountId: "acct-prod-1",
+    axiosAdapter: async (config) => ({
+      data: config.url.endsWith("/api/user/me") ? { exchangeId: "acct-prod-1" } : { quantity: 1.23 },
+      status: 200,
+      statusText: "OK",
+      headers: {},
+      config,
+    }),
+  });
+  await gateway.preflight();
+  await assert.rejects(gateway.fetchRawCapture({ source: "funding" }), /no response capture/);
+  await gateway.close();
+});
+
 test("SDK errors never expose error text or secret-bearing diagnostics", () => {
   const result = safeProdError(new Error("Authorization x-api-key=secret-1 url=https://api?token=secret-2"));
   assert.equal(JSON.stringify(result).includes("secret-1"), false);
