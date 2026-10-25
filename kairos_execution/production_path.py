@@ -7,6 +7,7 @@ owner arm, account truth, credentials, or a qualified EVEDEX history source.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -30,6 +31,22 @@ from .production_runtime import ProductionExecutionRuntime
 
 class ProductionPathError(PermissionError):
     """The composed path failed closed; partial evidence must not be renewed."""
+
+
+def _check_entry_interlock(interlock: Callable[[], bool] | None) -> None:
+    """Additional cancellation interlock, never a replacement for authority."""
+    if interlock is None:
+        return
+    try:
+        result = interlock()
+        if inspect.isawaitable(result):
+            if inspect.iscoroutine(result):
+                result.close()
+            raise ValueError
+        if result is not True:
+            raise ValueError
+    except Exception:
+        raise ProductionPathError("entry was cancelled or its execution interlock closed") from None
 
 
 class PreparedExitEvidenceProvider(Protocol):
@@ -198,8 +215,10 @@ class ProductionLiveLifecycleCoordinator:
         owner_arm: SignedManualArmRequestV1,
         expires_at: datetime,
         system_mode: SystemMode,
+        entry_interlock: Callable[[], bool] | None = None,
     ) -> ProductionLiveEntryResult:
         now = _time(self.engine.clock)
+        _check_entry_interlock(entry_interlock)
         auth = self.runtime.authorization
         try:
             _, owner_digest = _verify_owner_signed_arm(
@@ -225,6 +244,7 @@ class ProductionLiveLifecycleCoordinator:
             now=now,
             system_mode=system_mode,
         )
+        _check_entry_interlock(entry_interlock)
         await _inspect_staged(
             self.runtime,
             receipt.lifecycle_binding,
@@ -232,6 +252,7 @@ class ProductionLiveLifecycleCoordinator:
             started_at=now,
             valid_until=receipt.risk_geometry.valid_until,
         )
+        _check_entry_interlock(entry_interlock)
         # handle owns its own account/trade locks. Never reacquire them here.
         result = await self.engine.handle(receipt.evaluation.decision)
         return ProductionLiveEntryResult(risk_stage=receipt, execution_result=result)

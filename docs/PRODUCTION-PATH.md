@@ -93,6 +93,52 @@ explicitly synthetic fixtures; they are not a real-source or venue E2E pass.
 
 ## Compatibility and limits
 
+### Explicit service runner and cancellation boundary
+
+`factory.build_production_service` now builds `ProductionServiceDriver` only
+from the explicitly assembled coordinator above. `service.run_production_service`
+runs that driver with a stop event; it never selects the legacy adapter or its
+null signer. The settings-driven CLI still refuses LIVE. Missing deployment
+admission defaults to `REJECT_ALL`; a callback is only an additional interlock,
+not a replacement for account, owner, operator, Risk or signing authorization.
+
+The driver performs recovery before admission, serializes account work, bounds
+its queue, time limits and process-local identity fence, and delegates maintenance
+and closed-account reconciliation to the existing coordinator. Its status never
+claims readiness. A maintenance error latches entries closed; a later successful
+poll does not clear that latch. Service-local entry blocking does not bypass an
+underlying recovery-blocked FSM or guarantee that such an FSM can execute exits.
+
+Cancellation is rechecked under the account lock and at the coordinator's
+pre-Risk, post-staging and post-authority/pre-engine boundaries. Caller timeout
+or cancellation interrupts the worker. An effect already sent or a signer worker
+already running may have an unknown outcome: partial proofs/claims are retained,
+not renewed. Bounded shutdown reports unresolved tasks instead of claiming clean
+completion or allowing a replacement. Envelope IDs are process-local only;
+the existing durable trade/effect/signing identities remain restart fences.
+
+The native PostgreSQL production-path test now exercises both direct coordinator
+and service-driver paths through partial fill, separate SL/TP/timeout Risk,
+flat-account proof and one-time accounting release. The account/venue/signing
+facts in that test remain explicitly synthetic, not EVEDEX acceptance.
+
+### Original response bodies, without account-authority promotion
+
+The pinned PROD sidecar has a separate `fetch_raw_capture` operation restricted
+to four fixed GET sources: account identity, order page, TP/SL page and funding
+balance. It retains the decompressed application response body before JSON
+number conversion, exact route/query, original request/receive clocks, HTTP
+status and SHA-256. It does not retain headers or credentials. The body limit
+is 2 MiB within the existing IPC limit; redirects, proxying and retries remain
+disabled. Already-parsed objects cannot be relabelled as original bytes.
+
+Python validates the bounded capture and parses numbers as Decimal without
+discarding their original bytes. Non-2xx captures cannot be returned as a
+successful account source. Existing parsed SDK methods stay compatible. These
+bytes do not prove complete fills, account consistency, funding-payment coverage,
+settlement finality, a signing domain, or producer qualification; the existing
+history/exposure/account/exit verifier refusals remain unchanged.
+
 Legacy manually assembled lifecycle callers may omit the stager, preserving
 existing tests and PAPER behavior. The unified coordinator refuses that
 configuration, so its exits cannot silently fall back to caller-staged Risk.

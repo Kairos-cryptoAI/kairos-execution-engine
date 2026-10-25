@@ -29,6 +29,7 @@ from kairos_persistence import (
 )
 from kairos_risk.live import LiveRiskEvaluator, LiveRiskLimitsV1, LiveRiskScopeV1
 
+from kairos_execution.factory import build_production_service
 from kairos_execution.managed_signer import ManagedSignerBoundary
 from kairos_execution.production_accounting import (
     PostgresProductionAccounting,
@@ -59,6 +60,7 @@ from kairos_execution.production_reconciliation import (
 )
 from kairos_execution.production_risk import ProductionLiveRiskPublisher
 from kairos_execution.production_runtime import ProductionExecutionRuntime
+from kairos_execution.production_service import ProductionEntryEnvelope
 from kairos_execution.production_state import (
     AsyncPostgresProductionSigningStateSource,
     PostgresExposureStateWriter,
@@ -187,7 +189,10 @@ class _SyntheticVenue(_BaseSyntheticVenue):
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_native_synthetic_live_path_stages_entry_exits_closes_and_releases_once(monkeypatch):
+@pytest.mark.parametrize("use_service_driver", [False, True], ids=["coordinator", "service-driver"])
+async def test_native_synthetic_live_path_stages_entry_exits_closes_and_releases_once(
+    monkeypatch, use_service_driver
+):
     admin_dsn = os.getenv("KAIROS_PRODUCTION_ACCOUNTING_FIXTURE_ADMIN_DSN")
     if not admin_dsn:
         pytest.skip("explicit fresh disposable PostgreSQL fixture admin DSN required")
@@ -218,6 +223,7 @@ async def test_native_synthetic_live_path_stages_entry_exits_closes_and_releases
     connections = []
     pools = {}
     persistence = None
+    service_driver = None
     try:
         for role in roles.values():
             await admin.execute(f"CREATE ROLE \"{role}\" LOGIN NOINHERIT PASSWORD 'synthetic_fixture_only'")
@@ -613,6 +619,18 @@ async def test_native_synthetic_live_path_stages_entry_exits_closes_and_releases
         )
         await operator.append_operator_observation_async(disarmed)
         await operator.append_operator_observation_async(armed)
+        if use_service_driver:
+            # This local policy gate is explicitly synthetic. The real Risk,
+            # journals, claims, owner signatures and FSM still run below; no
+            # venue/account source is qualified by the fixture.
+            service_driver = build_production_service(
+                coordinator=coordinator,
+                entry_admission=lambda: True,
+                reconciliation_interval_s=60.0,
+            )
+            status = await service_driver.start()
+            assert status.recovery_complete and not status.entries_blocked
+            assert status.readiness is False
         # Refresh the entirely synthetic facts only after all DDL, recovery,
         # and component construction so the publisher sees a genuinely fresh
         # two-second quote window rather than a pre-setup timestamp.
@@ -640,7 +658,7 @@ async def test_native_synthetic_live_path_stages_entry_exits_closes_and_releases
         venue_quality = VenueQualityV1.model_validate(venue_data)
         allocation = allocation.model_copy(update={"produced_at": stage_now})
         deadline_at = datetime.fromtimestamp((now_ms + 1_950) / 1_000, tz=UTC)
-        entry_result = await coordinator.admit_and_handle_entry(
+        entry_inputs = dict(
             raw_account_evidence="synthetic-proof",
             raw_inputs_evidence="synthetic-input-proof",
             source_id=risk_fixtures.SOURCE,
@@ -653,6 +671,12 @@ async def test_native_synthetic_live_path_stages_entry_exits_closes_and_releases
             expires_at=deadline_at,
             system_mode=SystemMode.NORMAL,
         )
+        if service_driver is None:
+            entry_result = await coordinator.admit_and_handle_entry(**entry_inputs)
+        else:
+            entry_result = await service_driver.submit(
+                ProductionEntryEnvelope(envelope_id="synthetic-native-service-entry", **entry_inputs)
+            )
         decision = entry_result.risk_stage.evaluation.decision
         assert decision.approved and decision.trading_mode.value == "LIVE"
         assert any(
@@ -672,7 +696,10 @@ async def test_native_synthetic_live_path_stages_entry_exits_closes_and_releases
         assert trade is not None
         await asyncio.sleep(max(0.0, (trade.timeout_at - mutable_clock()).total_seconds() + 0.05))
         for _ in range(3):
-            await coordinator.reconcile_once()
+            if service_driver is None:
+                await coordinator.reconcile_once()
+            else:
+                await service_driver.reconcile_once()
             if "CLOSE" in venue.calls:
                 break
         assert "CLOSE" in venue.calls
@@ -753,13 +780,17 @@ async def test_native_synthetic_live_path_stages_entry_exits_closes_and_releases
         accounting = PostgresProductionAccounting(
             pools["accounting"], **common, accounting_role=roles["accounting"]
         )
-        release = await coordinator.reconcile_closed_account(
+        close_inputs = dict(
             trade_id=trade.trade_id,
             reconciler=reconciler,
             source_id=_TerminalVerifier.source_id,
             raw_venue_evidence="synthetic-terminal-proof",
             accounting=accounting,
         )
+        if service_driver is None:
+            release = await coordinator.reconcile_closed_account(**close_inputs)
+        else:
+            release = await service_driver.reconcile_closed_account(**close_inputs)
         assert release["reservation_released"] is True
         assert release["terminal_receipt"]["created"] is True
         assert (
@@ -824,6 +855,8 @@ async def test_native_synthetic_live_path_stages_entry_exits_closes_and_releases
         )
         assert {row["claim_kind"]: row["count"] for row in claims_after_restart_replay} == claims_before
     finally:
+        if service_driver is not None:
+            await service_driver.close()
         if persistence is not None:
             await persistence.close()
         for pool in pools.values():

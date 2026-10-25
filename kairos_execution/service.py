@@ -1,4 +1,4 @@
-"""Execution service with isolated legacy DRY_RUN and strict PAPER routes."""
+"""Default DRY_RUN/PAPER service and explicitly composed production runner."""
 
 from __future__ import annotations
 
@@ -25,8 +25,21 @@ from .paper_engine import (
     PaperExecutionEngine,
     PaperExecutionSafetyError,
 )
+from .production_service import ProductionServiceDriver
 
 log = get_logger("execution")
+
+
+async def run_production_service(driver: ProductionServiceDriver, *, stop: asyncio.Event) -> None:
+    """Run only the separately composed managed lifecycle, with no LIVE switch.
+
+    Imports, environment settings and this function never construct a signer,
+    load a key, qualify a producer, or issue an owner arm. The default CLI below
+    still uses the existing settings boundary and refuses LIVE startup.
+    """
+    if not isinstance(driver, ProductionServiceDriver) or not isinstance(stop, asyncio.Event):
+        raise TypeError("an explicitly composed production driver and stop event are required")
+    await driver.run(stop)
 
 
 class ExecutionService:

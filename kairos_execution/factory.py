@@ -2,9 +2,42 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import TYPE_CHECKING
+
 from .adapters.base import ExchangeAdapter
 from .config import ExecSettings
 from .profiles import TradingMode
+
+if TYPE_CHECKING:
+    from .production_path import ProductionLiveLifecycleCoordinator
+    from .production_service import ProductionServiceDriver
+
+
+def build_production_service(
+    *,
+    coordinator: ProductionLiveLifecycleCoordinator,
+    entry_admission: Callable[[], bool] | None = None,
+    queue_capacity: int = 8,
+    operation_timeout_s: float = 10.0,
+    reconciliation_interval_s: float = 2.0,
+) -> ProductionServiceDriver:
+    """Use the explicit managed path, never the legacy adapter/NullSigner.
+
+    The caller must independently assemble and qualify the coordinator's
+    account/input sources, persisted authority, custody and transport. This
+    function creates no such authority and defaults to blocked entries. The
+    ordinary settings-driven LIVE route remains refused below.
+    """
+    from .production_service import ProductionServiceDriver
+
+    return ProductionServiceDriver(
+        coordinator,
+        entry_admission=entry_admission,
+        queue_capacity=queue_capacity,
+        operation_timeout_s=operation_timeout_s,
+        reconciliation_interval_s=reconciliation_interval_s,
+    )
 
 
 def build_adapter(settings: ExecSettings) -> ExchangeAdapter:

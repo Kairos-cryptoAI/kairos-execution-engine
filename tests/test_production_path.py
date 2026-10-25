@@ -268,6 +268,40 @@ async def test_entry_expiry_after_authority_await_never_handles_or_dispatches():
     assert runtime.wire_calls == 0  # Inspection only; no dispatch method was called.
 
 
+@pytest.mark.asyncio
+async def test_entry_interlock_closing_during_authority_read_prevents_engine_handoff():
+    coordinator, owner, review, venue, allocation, writer, bindings, runtime, engine = _coordinator_shell()
+    allowed = True
+
+    async def inspected(request):
+        nonlocal allowed
+        binding = next(item for item in bindings.rows.values() if item.request == request)
+        allowed = False
+        return SimpleNamespace(
+            request_id=request.request_id,
+            decision_id=binding.risk_decision_id,
+            effect_id=binding.signing_effect_id,
+            valid_until=binding.request.expires_at,
+        )
+
+    runtime.inspect_authority = inspected
+    with pytest.raises(ProductionPathError, match="interlock closed"):
+        await coordinator.admit_and_handle_entry(
+            raw_account_evidence="synthetic-proof",
+            raw_inputs_evidence="synthetic-input-proof",
+            source_id=SOURCE,
+            review=review,
+            venue=venue,
+            allocation=allocation,
+            owner_arm=owner,
+            expires_at=NOW + timedelta(milliseconds=1_500),
+            system_mode=SystemMode.NORMAL,
+            entry_interlock=lambda: allowed,
+        )
+    assert writer.rows and bindings.rows  # Partial proofs remain, never renewed.
+    assert engine.handle_calls == 0
+
+
 def _exit_stager(provider: CaptureProvider, clock: Clock):
     publisher, _verifier, _trades, _effects, _risks, _exposures, _bindings, *_rest, effect = _exit_setup(
         "TIMEOUT_EXIT"
