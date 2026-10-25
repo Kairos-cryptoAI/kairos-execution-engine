@@ -301,8 +301,9 @@ class NativeUpstreamComposer:
     ) -> NativeUpstreamCompositionResult:
         """One bounded native composition; partial/unknown calls cannot be retried.
 
-        Supplied market/bars/macro context still require their independent raw
-        source witnesses. This method does not qualify their contents or invent
+        Market/bars must already have exact original receipts in the native
+        context store, before any claims/source/model work. Independent raw
+        source witnesses remain required. This method does not qualify their contents or invent
         an account, strategy intent, route override, model result or geometry.
         ``macro_context_json`` is retained only as a fail-closed compatibility
         argument: non-None refuses before spending. ``macro_trigger`` cannot
@@ -327,11 +328,36 @@ class NativeUpstreamComposer:
             raise NativeCompositionRefused("native strategy intent postdates composition")
         if market.symbol != intent.symbol or any(bar.symbol != intent.symbol for bar in bars):
             raise NativeCompositionRefused("native market/bar symbol differs from immutable strategy intent")
+        try:
+            market_receipt = c.context_store.require_retained_observation(
+                "market", market.model_dump(mode="json"), at_ms=now
+            )
+            bar_receipts = tuple(
+                c.context_store.require_retained_observation(
+                    "closed_bars", bar.model_dump(mode="json"), at_ms=now
+                )
+                for bar in bars
+            )
+        except (ValueError, AttributeError):
+            raise NativeCompositionRefused(
+                "original retained market/bar observations are missing, changed or expired"
+            ) from None
         attempt = hashlib.sha256(intent.canonical_intent_bytes()).hexdigest()
         async with asyncio.timeout((deadline - now) / 1_000):
             if await self._claim(self.composition_scope, (attempt,), attempt, deadline) != (attempt,):
                 raise NativeCompositionRefused("native composition already claimed; no blind renewal")
             records = [self._emit(intent, "INTENT_INPUT", intent.model_dump(mode="json"), deadline=deadline)]
+            records.append(
+                self._emit(
+                    intent,
+                    "MARKET_BAR_CONTEXT_SELECTION",
+                    {
+                        "market_receipt": market_receipt.model_dump(mode="json"),
+                        "bar_receipts": [receipt.model_dump(mode="json") for receipt in bar_receipts],
+                    },
+                    deadline=deadline,
+                )
+            )
             raw = []
             for source in c.text_sources:
                 self._check(deadline)
@@ -384,13 +410,6 @@ class NativeUpstreamComposer:
             records.append(
                 self._emit(intent, "ROUTER_OUTPUT", route.model_dump(mode="json"), deadline=deadline)
             )
-            c.context_store.ingest(
-                "market", market.model_dump(mode="json"), received_at_ms=self._check(deadline)
-            )
-            for bar in bars:
-                c.context_store.ingest(
-                    "closed_bars", bar.model_dump(mode="json"), received_at_ms=self._check(deadline)
-                )
             captured = self._check(deadline)
             context = c.context_store.build(route, cutoff_ms=captured, captured_at_ms=captured)
             allocation = _allocation_from_context(context)

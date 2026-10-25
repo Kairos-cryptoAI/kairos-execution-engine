@@ -285,6 +285,11 @@ def _native(monkeypatch, *, news_after_intent=False):
         context_store=CandidateContextStore(settings),
         reviewer=CandidateReviewBrain(budgeted, clock_ms=clock),
     )
+    # Explicit synthetic original source deliveries, retained before composition.
+    # Composition may select these receipts, never manufacture new receive times.
+    components.context_store.ingest("market", market.model_dump(mode="json"), received_at_ms=now - 50)
+    for bar in bars:
+        components.context_store.ingest("closed_bars", bar.model_dump(mode="json"), received_at_ms=now - 40)
     interlock = [True]
     composer = NativeUpstreamComposer(
         components=components,
@@ -303,6 +308,43 @@ def _native(monkeypatch, *, news_after_intent=False):
         macro_trigger=next(iter(StrategicTrigger)),
     )
     return composer, kwargs, sink, claims, gateway, interlock
+
+
+@pytest.mark.parametrize("change", ["missing", "market-substitution", "bar-substitution", "quarantine"])
+async def test_unretained_or_changed_market_bars_refuse_before_claims_or_models(monkeypatch, change):
+    composer, kwargs, sink, claims, gateway, _interlock = _native(monkeypatch)
+    if change == "missing":
+        composer.components.context_store._entries.clear()
+    elif change == "market-substitution":
+        kwargs["market"] = MarketSnapshot.model_validate(
+            {**kwargs["market"].model_dump(mode="json"), "mid_price": 101.0}
+        )
+    elif change == "bar-substitution":
+        data = kwargs["bars"][0].model_dump(mode="json")
+        data.update(quote_volume=data["quote_volume"] + 1.0, bar_sha256=None)
+        kwargs["bars"] = (ClosedBarEventV1.model_validate(data),)
+    else:
+        composer.components.context_store.quarantined_kinds.add("market")
+    with pytest.raises(NativeCompositionRefused, match="original retained"):
+        await composer.compose(**kwargs)
+    assert not claims.claimed and not gateway.calls and not sink.records
+
+
+async def test_native_market_bar_selection_preserves_original_receive_receipts(monkeypatch):
+    composer, kwargs, sink, _claims, _gateway, _interlock = _native(monkeypatch)
+    original_market_time = composer.clock_ms() - 50
+    original_bar_time = composer.clock_ms() - 40
+    result = await composer.compose(**kwargs)
+    selection = next(
+        json.loads(raw)["payload"]
+        for raw in sink.records.values()
+        if json.loads(raw).get("stage") == "MARKET_BAR_CONTEXT_SELECTION"
+    )
+    assert selection["market_receipt"]["received_at_ms"] == original_market_time
+    assert selection["bar_receipts"][0]["received_at_ms"] == original_bar_time
+    for kind, original_time in (("market", original_market_time), ("closed_bars", original_bar_time)):
+        source = next(source for source in result.context.sources if source.kind == kind)
+        assert source.receipts[0].received_at_ms == original_time
 
 
 async def test_actual_native_sequence_retains_sources_outputs_and_never_promotes_live(monkeypatch):

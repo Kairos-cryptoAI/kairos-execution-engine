@@ -39,6 +39,17 @@ or qualify an exchange source.
    Fresh state-v3 accounting releases reservations only after exact independent
    terminal/account evidence, once; a transport ACK is never a fill or release.
 
+An ordinary complete negative LIVE Risk evaluation returns
+`ProductionLiveEntryRefusal` through the coordinator and service, before any
+Risk/binding append or engine call. VETO, defensive allocation, exhausted risk
+or unavailable verified inputs are no-entry outcomes, not unknown execution
+effects. The original envelope identity remains fenced; only a genuinely new
+candidate may be evaluated later. Only the exact reviewed publisher, evaluator
+and coordinator implementations may attest this no-effect branch. Scope
+substitution, malformed evaluations, unknown writes, cancellation and transport
+effects still latch admission closed and require recovery; a subclass cannot
+write and then hide its outcome as a safe refusal.
+
 Runtime, stager and FSM share the same explicit clock callable. When the FSM's
 clock argument is omitted it adopts the configured stager clock; a divergent
 runtime clock is refused. The stager's callback must not call the FSM's locked APIs (`handle`,
@@ -158,6 +169,16 @@ emitted synchronously before a composition result is exposed. Review evidence
 accepts the exact actual native combined sentiment/context references, not
 arbitrary additions; legacy context-only engineering references remain compatible.
 
+Market and closed-bar DTOs must already match exact retained observations in
+the actual `CandidateContextStore`. Its read-only
+`require_retained_observation` returns the original first-receive receipt and
+refuses missing, evicted, quarantined, substituted, future or expired inputs
+before composition claims, RSS work or model calls. Composition no longer
+inserts those DTOs with its current clock. `MARKET_BAR_CONTEXT_SELECTION`
+retains those original receipts; it is not a raw HTTP source witness or a new
+delivery timestamp. The existing native source consumer must retain inputs
+before invoking composition.
+
 This does **not** close native capture qualification. Macro context, market/bar
 and venue raw sources still need their independent complete source witnesses;
 source/native session linkage and signed deployment acceptance remain required.
@@ -167,6 +188,24 @@ and composition results remain `live_ready=False` / `REJECT_ALL`. Tests using
 real native components and synthetic offline transport/model/budget fixtures
 establish engineering traversal only, not provider or real-venue acceptance.
 No real-source or paid-provider call is part of those tests.
+
+## Automatic dollar budget proposals
+
+The existing `LiveRiskEvaluator.propose_capital_budget` uses its registered
+account verifier before calculating dollar ceilings. The pure proposal uses
+the original fresh, reconciled LIVE/PROD account and scoped starting ceiling,
+explicit bounded percentage policy and supplied venue minimum-notional metadata.
+Stop risk and aggregate notional are separate limits: `aggregate_dollar_cap_usd`
+caps portfolio notional, while `aggregate_open_risk_fraction` caps stop risk.
+
+Amounts round conservatively; smaller balances shrink ceilings, and deposits or
+profits cannot implicitly raise the scoped starting cap. Unknown/stale account
+facts and amounts below actual venue minimums refuse. A synthetic $50 example
+passes through the actual evaluator in offline tests; it is not a balance or
+venue qualification claim. The result is `NON_AUTHORITY_PROPOSAL`: no verifier
+registration, scope mutation, reservation, manual arm or order is created.
+Changed limits require an independently admitted scope and fresh account
+verification. The pinned EVEDEX verifier still refuses unqualified account facts.
 
 ## Compatibility and limits
 
