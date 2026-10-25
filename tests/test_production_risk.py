@@ -26,6 +26,7 @@ from kairos_execution.production_lifecycle_store import PostgresLifecycleBinding
 from kairos_execution.production_readiness import ProductionContextV1, canonical_digest
 from kairos_execution.production_risk import (
     PinnedEvedexLiveAccountVerifier,
+    ProductionLiveRiskEntryRefused,
     ProductionLiveRiskError,
     ProductionLiveRiskPublisher,
 )
@@ -295,8 +296,10 @@ async def test_reserved_risk_is_evaluated_and_never_defaulted_to_zero():
     review, venue, allocation, verifier, writer, bindings, publisher, *_ = _inputs()
     verifier.metrics["reserved_open_risk_usd"] = 250.0
 
-    with pytest.raises(ProductionLiveRiskError, match="rejected or outside"):
+    with pytest.raises(ProductionLiveRiskEntryRefused, match="rejected or outside") as refused:
         await _stage(publisher, review, venue, allocation)
+    assert refused.value.evaluation.decision.rejection_reasons
+    assert not refused.value.evaluation.decision.approved
     assert not writer.rows and not bindings.rows
 
 

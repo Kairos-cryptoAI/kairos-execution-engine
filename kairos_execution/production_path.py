@@ -9,12 +9,13 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from kairos_core.contracts import CandidateReviewV1, StrategicAllocation, VenueQualityV1
 from kairos_core.enums import SystemMode
+from kairos_risk.live import LiveRiskEvaluationV1, LiveRiskEvaluator  # type: ignore[import-untyped]
 
 from .paper_engine import PaperExecutionResult
 from .production_exit_risk import ProductionExitRiskStageReceiptV1, ProductionLiveExitRiskPublisher
@@ -25,7 +26,11 @@ from .production_readiness import (
     SignedManualArmRequestV1,
     _verify_owner_signed_arm,
 )
-from .production_risk import ProductionLiveRiskPublisher, ProductionLiveRiskStageReceiptV1
+from .production_risk import (
+    ProductionLiveRiskEntryRefused,
+    ProductionLiveRiskPublisher,
+    ProductionLiveRiskStageReceiptV1,
+)
 from .production_runtime import ProductionExecutionRuntime
 
 
@@ -175,6 +180,20 @@ class ProductionLiveEntryResult:
     execution_result: PaperExecutionResult
 
 
+@dataclass(frozen=True, slots=True)
+class ProductionLiveEntryRefusal:
+    """Normal no-entry result; not a staging receipt or an executable decision."""
+
+    evaluation: LiveRiskEvaluationV1
+    mutation_started: Literal[False] = field(default=False, init=False)
+
+    def __post_init__(self) -> None:
+        checked = LiveRiskEvaluationV1.model_validate_json(self.evaluation.model_dump_json())
+        if checked.decision.approved or not checked.decision.rejection_reasons:
+            raise ValueError("a no-entry result requires the complete negative evaluation")
+        object.__setattr__(self, "evaluation", checked)
+
+
 class ProductionLiveLifecycleCoordinator:
     """Single raw-proof entry API using actual Risk and the protected PROD FSM."""
 
@@ -216,7 +235,7 @@ class ProductionLiveLifecycleCoordinator:
         expires_at: datetime,
         system_mode: SystemMode,
         entry_interlock: Callable[[], bool] | None = None,
-    ) -> ProductionLiveEntryResult:
+    ) -> ProductionLiveEntryResult | ProductionLiveEntryRefusal:
         now = _time(self.engine.clock)
         _check_entry_interlock(entry_interlock)
         auth = self.runtime.authorization
@@ -232,18 +251,27 @@ class ProductionLiveLifecycleCoordinator:
             )
         except Exception:
             raise ProductionPathError("owner signature/scope is invalid for this entry") from None
-        receipt = await self.entry_risk.evaluate_and_stage_entry(
-            raw_account_evidence=raw_account_evidence,
-            raw_inputs_evidence=raw_inputs_evidence,
-            source_id=source_id,
-            review=review,
-            venue=venue,
-            allocation=allocation,
-            manual_request_sha256=owner_digest,
-            expires_at=expires_at,
-            now=now,
-            system_mode=system_mode,
-        )
+        try:
+            receipt = await self.entry_risk.evaluate_and_stage_entry(
+                raw_account_evidence=raw_account_evidence,
+                raw_inputs_evidence=raw_inputs_evidence,
+                source_id=source_id,
+                review=review,
+                venue=venue,
+                allocation=allocation,
+                manual_request_sha256=owner_digest,
+                expires_at=expires_at,
+                now=now,
+                system_mode=system_mode,
+            )
+        except ProductionLiveRiskEntryRefused as refusal:
+            if (
+                type(self.entry_risk) is not ProductionLiveRiskPublisher
+                or type(self.entry_risk.evaluator) is not LiveRiskEvaluator
+            ):
+                raise ProductionPathError("unreviewed publisher cannot attest a no-effect refusal") from None
+            _check_entry_interlock(entry_interlock)
+            return ProductionLiveEntryRefusal(refusal.evaluation)
         _check_entry_interlock(entry_interlock)
         await _inspect_staged(
             self.runtime,

@@ -20,7 +20,11 @@ from typing import Any, Literal
 from kairos_core.contracts import CandidateReviewV1, StrategicAllocation, VenueQualityV1
 from kairos_core.enums import SystemMode
 
-from .production_path import ProductionLiveEntryResult, ProductionLiveLifecycleCoordinator
+from .production_path import (
+    ProductionLiveEntryRefusal,
+    ProductionLiveEntryResult,
+    ProductionLiveLifecycleCoordinator,
+)
 from .production_readiness import SignedManualArmRequestV1
 
 
@@ -68,7 +72,7 @@ class ProductionServiceStatus:
 @dataclass(slots=True)
 class _QueuedEntry:
     envelope: ProductionEntryEnvelope
-    result: asyncio.Future[ProductionLiveEntryResult]
+    result: asyncio.Future[ProductionLiveEntryResult | ProductionLiveEntryRefusal]
 
 
 def _bounded_seconds(value: float, *, maximum: float) -> float:
@@ -164,7 +168,9 @@ class ProductionServiceDriver:
         )
         return self.status
 
-    async def submit(self, envelope: ProductionEntryEnvelope) -> ProductionLiveEntryResult:
+    async def submit(
+        self, envelope: ProductionEntryEnvelope
+    ) -> ProductionLiveEntryResult | ProductionLiveEntryRefusal:
         if not isinstance(envelope, ProductionEntryEnvelope):
             raise TypeError("the exact production entry envelope is required")
         if not self._started or self._closing or self._entries_blocked:
@@ -175,7 +181,9 @@ class ProductionServiceDriver:
             self._entries_blocked = True
             raise ProductionServiceError("process admission capacity exhausted; no identities are evicted")
         self._seen_envelope_ids.add(envelope.envelope_id)
-        future: asyncio.Future[ProductionLiveEntryResult] = asyncio.get_running_loop().create_future()
+        future: asyncio.Future[ProductionLiveEntryResult | ProductionLiveEntryRefusal] = (
+            asyncio.get_running_loop().create_future()
+        )
         try:
             self._queue.put_nowait(_QueuedEntry(envelope, future))
         except asyncio.QueueFull:
@@ -250,6 +258,11 @@ class ProductionServiceDriver:
                             system_mode=item.envelope.system_mode,
                             entry_interlock=entry_interlock,
                         )
+                        if (
+                            isinstance(result, ProductionLiveEntryRefusal)
+                            and type(self.coordinator) is not ProductionLiveLifecycleCoordinator
+                        ):
+                            raise ProductionServiceError("unreviewed coordinator cannot attest no effects")
                 except asyncio.CancelledError:
                     self._unknown("ENTRY_WORKER_CANCELLED")
                     if not item.result.done():

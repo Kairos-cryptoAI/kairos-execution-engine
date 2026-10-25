@@ -9,7 +9,11 @@ from types import SimpleNamespace
 import pytest
 from kairos_core.enums import SystemMode
 
-from kairos_execution.production_path import ProductionLiveEntryResult, ProductionLiveLifecycleCoordinator
+from kairos_execution.production_path import (
+    ProductionLiveEntryRefusal,
+    ProductionLiveEntryResult,
+    ProductionLiveLifecycleCoordinator,
+)
 from kairos_execution.production_service import (
     ProductionEntryEnvelope,
     ProductionServiceDriver,
@@ -20,10 +24,11 @@ from kairos_execution.production_service import (
 class SyntheticCoordinator(ProductionLiveLifecycleCoordinator):
     """Synthetic in-memory double: no venue, signing, DB, or authority evidence."""
 
-    def __init__(self, *, recovery=(), entry_error=None):
+    def __init__(self, *, recovery=(), entry_error=None, entry_result=None):
         self.calls = []
         self.recovery = recovery
         self.entry_error = entry_error
+        self.entry_result = entry_result
         self.entered = asyncio.Event()
         self.allow_entry = asyncio.Event()
         self.engine = SimpleNamespace(clock=lambda: datetime.now(UTC), recovery_blocked=False)
@@ -42,6 +47,8 @@ class SyntheticCoordinator(ProductionLiveLifecycleCoordinator):
         await self.allow_entry.wait()
         if self.entry_error is not None:
             raise self.entry_error
+        if self.entry_result is not None:
+            return self.entry_result
         return ProductionLiveEntryResult(risk_stage=object(), execution_result=object())
 
     async def reconcile_closed_account(self, **kwargs):
@@ -129,6 +136,91 @@ async def test_unknown_entry_outcome_latches_admission_closed_and_never_retries(
         with pytest.raises(ProductionServiceError, match="entries are blocked"):
             await driver.submit(envelope("e-2"))
         assert sum(call[0] == "entry" for call in coordinator.calls) == 1
+    finally:
+        await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_negative_pure_risk_result_does_not_latch_service_or_release_identity():
+    from tests.test_production_path import _coordinator_shell
+    from tests.test_production_risk import NOW, SOURCE
+
+    coordinator, owner, review, venue, allocation, writer, bindings, runtime, engine = _coordinator_shell()
+    engine._recovery_blockers = ()
+
+    async def recovered():
+        return ()
+
+    async def maintenance():
+        return []
+
+    async def inspected(request):
+        binding = next(value for value in bindings.rows.values() if value.request == request)
+        return SimpleNamespace(
+            request_id=request.request_id,
+            decision_id=binding.risk_decision_id,
+            effect_id=binding.signing_effect_id,
+            valid_until=request.expires_at,
+        )
+
+    coordinator.initialize_recovery = recovered
+    coordinator.reconcile_once = maintenance
+    runtime.inspect_authority = inspected
+
+    def item(identity, mode):
+        return ProductionEntryEnvelope(
+            envelope_id=identity,
+            raw_account_evidence="synthetic-proof",
+            raw_inputs_evidence="synthetic-input-proof",
+            source_id=SOURCE,
+            review=review,
+            venue=venue,
+            allocation=allocation,
+            owner_arm=owner,
+            expires_at=NOW + timedelta(milliseconds=1_500),
+            system_mode=mode,
+        )
+
+    driver = ProductionServiceDriver(coordinator, entry_admission=lambda: True)
+    await driver.start()
+    try:
+        refusal = await driver.submit(item("no-entry", SystemMode.LOCAL_QUANT_MODE))
+        assert isinstance(refusal, ProductionLiveEntryRefusal) and not refusal.mutation_started
+        assert driver.status.recovery_complete and not driver.status.entries_blocked
+        assert driver.status.readiness is False
+        assert not writer.rows and not bindings.rows and engine.handle_calls == 0
+        with pytest.raises(ProductionServiceError, match="already seen"):
+            await driver.submit(item("no-entry", SystemMode.LOCAL_QUANT_MODE))
+        result = await driver.submit(item("next-independent-candidate", SystemMode.NORMAL))
+        assert isinstance(result, ProductionLiveEntryResult)
+        assert engine.handle_calls == 1
+    finally:
+        await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_substitute_coordinator_cannot_claim_safe_no_entry():
+    from tests.test_production_risk import NOW, SOURCE, _inputs
+
+    review, venue, allocation, _verifier, _writer, _bindings, publisher, *_ = _inputs()
+    evaluation = publisher.evaluator.evaluate(
+        "synthetic-proof",
+        source_id=SOURCE,
+        review=review,
+        venue=venue,
+        allocation=allocation,
+        decided_at_ms=int(NOW.timestamp() * 1_000),
+        system_mode=SystemMode.LOCAL_QUANT_MODE,
+        raw_inputs_evidence="synthetic-input-proof",
+    )
+    coordinator = SyntheticCoordinator(entry_result=ProductionLiveEntryRefusal(evaluation))
+    coordinator.allow_entry.set()
+    driver = ProductionServiceDriver(coordinator, entry_admission=lambda: True)
+    await driver.start()
+    try:
+        with pytest.raises(ProductionServiceError, match="outcome unresolved"):
+            await driver.submit(envelope())
+        assert driver.status.entries_blocked and not driver.status.recovery_complete
     finally:
         await driver.close()
 

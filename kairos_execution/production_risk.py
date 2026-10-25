@@ -15,7 +15,7 @@ from decimal import Decimal
 from typing import Any, Literal
 from uuid import UUID
 
-from kairos_core.contracts import CandidateReviewV1, StrategicAllocation, VenueQualityV1
+from kairos_core.contracts import CandidateReviewV1, StrategicAllocation, VenueQualityV1, canonical_sha256
 from kairos_core.enums import EvedexProfile, Side, SystemMode, TradingMode
 from kairos_risk.live import (  # type: ignore[import-untyped]
     LiveRiskEvaluationV1,
@@ -41,6 +41,21 @@ from .state_machine import client_order_id
 
 class ProductionLiveRiskError(PermissionError):
     """LIVE risk staging failed closed; no execution authority is implied."""
+
+
+class ProductionLiveRiskEntryRefused(ProductionLiveRiskError):
+    """A complete negative pure evaluation, before any staging write or effect.
+
+    Unknown evaluation/writer outcomes and scope mismatches use the parent
+    error instead. This distinction grants no authority to retry an identity.
+    """
+
+    def __init__(self, evaluation: LiveRiskEvaluationV1) -> None:
+        checked = LiveRiskEvaluationV1.model_validate_json(evaluation.model_dump_json())
+        if checked.decision.approved or not checked.decision.rejection_reasons:
+            raise ValueError("a complete rejected LIVE Risk evaluation is required")
+        self.evaluation = checked
+        super().__init__("LIVE evaluation is rejected or outside the frozen PROD scope")
 
 
 class ProductionLiveRiskStageReceiptV1(StrictRecord):
@@ -195,9 +210,7 @@ class ProductionLiveRiskPublisher:
 
         decision = evaluation.decision
         if (
-            not decision.approved
-            or decision.rejection_reasons
-            or decision.trading_mode is not TradingMode.LIVE
+            decision.trading_mode is not TradingMode.LIVE
             or decision.evedex_profile is not EvedexProfile.PROD
             or decision.intent.contract_version == "strategy-intent.observed-sim.v2"
             or decision.intent.strategy_id != self.scope.strategy_id
@@ -207,6 +220,17 @@ class ProductionLiveRiskPublisher:
             or decision.account_id != self.context.remote_account_id
             or decision.intent.strategy_id != self.context.adaptive_system_id
             or self.scope.venue_symbol_for(decision.intent.symbol) != decision.venue_symbol
+            or decision.intent.canonical_intent_bytes() != review.intent.canonical_intent_bytes()
+            or canonical_sha256(decision.review) != canonical_sha256(review)
+            or canonical_sha256(decision.venue_quality) != canonical_sha256(venue)
+        ):
+            raise ProductionLiveRiskError("LIVE evaluation is rejected or outside the frozen PROD scope")
+        if not decision.approved:
+            # The evaluator is pure. No Risk/binding append, signer, dispatcher
+            # or reservation mutation has occurred at this boundary.
+            raise ProductionLiveRiskEntryRefused(evaluation)
+        if (
+            decision.rejection_reasons
             or decision.decision_id is None
             or decision.trade_id is None
             or decision.leverage != 1.0

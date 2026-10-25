@@ -23,6 +23,7 @@ from kairos_execution.production_lifecycle import (
 from kairos_execution.production_lifecycle_adapter import ManagedProductionLifecycleAdapter
 from kairos_execution.production_observation import PROD_EXCHANGE_ORIGIN
 from kairos_execution.production_path import (
+    ProductionLiveEntryRefusal,
     ProductionLiveLifecycleCoordinator,
     ProductionPathError,
     ProductionPreparedExitRiskStager,
@@ -35,7 +36,7 @@ from kairos_execution.production_readiness import (
     SignedManualArmRequestV1,
     canonical_digest,
 )
-from kairos_execution.production_risk import ProductionLiveRiskError
+from kairos_execution.production_risk import ProductionLiveRiskEntryRefused, ProductionLiveRiskPublisher
 from kairos_execution.production_runtime import ProductionExecutionRuntime
 from kairos_execution.profiles import profile_params
 from tests.test_production_exit_risk import NOW as EXIT_NOW
@@ -210,20 +211,78 @@ async def test_invalid_signed_owner_arm_refuses_before_any_risk_write():
 )
 async def test_account_or_upstream_proof_refusal_never_reaches_engine(account_proof, inputs_proof):
     coordinator, owner, review, venue, allocation, writer, bindings, _runtime, engine = _coordinator_shell()
-    with pytest.raises(ProductionLiveRiskError):
+    result = await coordinator.admit_and_handle_entry(
+        raw_account_evidence=account_proof,
+        raw_inputs_evidence=inputs_proof,
+        source_id=SOURCE,
+        review=review,
+        venue=venue,
+        allocation=allocation,
+        owner_arm=owner,
+        expires_at=NOW + timedelta(milliseconds=1_500),
+        system_mode=SystemMode.NORMAL,
+    )
+    assert isinstance(result, ProductionLiveEntryRefusal)
+    assert result.mutation_started is False
+    assert not result.evaluation.decision.approved
+    assert not writer.rows and not bindings.rows
+    assert engine.handle_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_normal_risk_no_entry_never_inspects_or_enters_execution():
+    coordinator, owner, review, venue, allocation, writer, bindings, runtime, engine = _coordinator_shell()
+
+    async def forbidden_inspection(_request):
+        raise AssertionError("negative Risk must not reach managed authorization")
+
+    runtime.inspect_authority = forbidden_inspection
+    result = await coordinator.admit_and_handle_entry(
+        raw_account_evidence="synthetic-proof",
+        raw_inputs_evidence="synthetic-input-proof",
+        source_id=SOURCE,
+        review=review,
+        venue=venue,
+        allocation=allocation,
+        owner_arm=owner,
+        expires_at=NOW + timedelta(milliseconds=1_500),
+        system_mode=SystemMode.LOCAL_QUANT_MODE,
+    )
+    assert isinstance(result, ProductionLiveEntryRefusal)
+    assert result.evaluation.decision.rejection_reasons
+    assert result.mutation_started is False
+    assert not writer.rows and not bindings.rows and engine.handle_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_unreviewed_publisher_cannot_hide_a_write_behind_no_entry():
+    coordinator, owner, review, venue, allocation, writer, bindings, _runtime, engine = _coordinator_shell()
+
+    class UnreviewedPublisher(ProductionLiveRiskPublisher):
+        async def evaluate_and_stage_entry(self, **kwargs):
+            try:
+                return await super().evaluate_and_stage_entry(**kwargs)
+            except ProductionLiveRiskEntryRefused:
+                writer.rows["synthetic-partial-write"] = object()
+                raise
+
+    substitute = object.__new__(UnreviewedPublisher)
+    substitute.__dict__.update(coordinator.entry_risk.__dict__)
+    coordinator.entry_risk = substitute
+    with pytest.raises(ProductionPathError, match="cannot attest a no-effect refusal"):
         await coordinator.admit_and_handle_entry(
-            raw_account_evidence=account_proof,
-            raw_inputs_evidence=inputs_proof,
+            raw_account_evidence="synthetic-proof",
+            raw_inputs_evidence="synthetic-input-proof",
             source_id=SOURCE,
             review=review,
             venue=venue,
             allocation=allocation,
             owner_arm=owner,
             expires_at=NOW + timedelta(milliseconds=1_500),
-            system_mode=SystemMode.NORMAL,
+            system_mode=SystemMode.LOCAL_QUANT_MODE,
         )
-    assert not writer.rows and not bindings.rows
-    assert engine.handle_calls == 0
+    assert "synthetic-partial-write" in writer.rows
+    assert not bindings.rows and engine.handle_calls == 0
 
 
 @pytest.mark.asyncio
