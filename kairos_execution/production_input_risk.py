@@ -47,6 +47,7 @@ def build_opt_in_production_live_risk_evaluator(
         checked_limits,
         account_verifiers={account_verifier.source_id: account_verifier},
         input_verifier=input_verifier,
+        require_instrument_rules=True,
     )
 
 

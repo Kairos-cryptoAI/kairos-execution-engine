@@ -84,7 +84,7 @@ override-dependencies = [
 [tool.uv.sources]
 kairos-core = { git = "https://github.com/Kairos-cryptoAI/kairos-core.git", rev = "ff3af7592cbd47be985d794d8d9903aaa8e5df07" }
 kairos-persistence = { git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git", rev = "506628fc8686ff7373d72f37ac032e53a47b233f" }
-kairos-risk-manager = { git = "https://github.com/Kairos-cryptoAI/kairos-risk-manager.git", rev = "0da885aac20c5bae0173bf2d2ca81d528c458777" }
+kairos-risk-manager = { git = "https://github.com/Kairos-cryptoAI/kairos-risk-manager.git", rev = "d8c031eb35ae54263c355ee6ad9c4f7719d306d2" }
 kairos-quant-scouts = { git = "https://github.com/Kairos-cryptoAI/kairos-quant-scouts.git", rev = "0a7c3b69bf2b2e55ab23d5c23da8ca884c06b301" }
 kairos-text-scouts = { git = "https://github.com/Kairos-cryptoAI/kairos-text-scouts.git", rev = "a8dbd889383fbe76e9429272eccfdff93e414dd3" }
 kairos-macro-strategist = { git = "https://github.com/Kairos-cryptoAI/kairos-macro-strategist.git", rev = "edca44241f43a050363eeab4e89e480c9afb4dcc" }

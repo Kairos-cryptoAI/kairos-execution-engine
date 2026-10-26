@@ -267,8 +267,10 @@ facts in that test remain explicitly synthetic, not EVEDEX acceptance.
 ### Original response bodies, without account-authority promotion
 
 The pinned PROD sidecar has a separate `fetch_raw_capture` operation restricted
-to four fixed GET sources: account identity, order page, TP/SL page and funding
-balance. It retains the decompressed application response body before JSON
+to fixed GET sources: account identity, order/TP-SL pages, funding balance,
+available balance, positions, open orders, instruments, depth and explicitly
+requested fills/funding-transfer history. It retains the decompressed
+application response body before JSON
 number conversion, exact route/query, original request/receive clocks, HTTP
 status and SHA-256. It does not retain headers or credentials. The body limit
 is 2 MiB within the existing IPC limit; redirects, proxying and retries remain
@@ -280,6 +282,66 @@ successful account source. Existing parsed SDK methods stay compatible. These
 bytes do not prove complete fills, account consistency, funding-payment coverage,
 settlement finality, a signing domain, or producer qualification; the existing
 history/exposure/account/exit verifier refusals remain unchanged.
+
+### Native PROD reader and authenticated instrument rules
+
+`ProductionEvedexReads` now supplies the existing lifecycle read DTOs through
+the actual PROD SDK client. The managed adapter requires its exact client to
+be the same one used by the signed transport, with the same account/context.
+The balance projection mirrors the existing SDK mapping from native `position`
+and `openOrder` arrays, without replacing missing summaries with zero/empty data.
+It retains exact decimals, native currency and original bodies separately.
+
+Per-order fills and explicit fill/funding-transfer pages use documented fixed
+GET paths. History intervals are explicit UTC milliseconds, bounded to 24 hours;
+these page methods do not automatically run on every lifecycle poll. Funding
+rows have no fabricated provider IDs, trade links or finality. Native TP/SL
+records are not relabelled as entry-parent evidence. REST reads do not establish
+a recoverable event stream: `drain_events` explicitly refuses instead of
+returning an invented empty list.
+
+The PROD HTTP boundary now enforces the existing `LocalMutationBudget` before
+every actual POST/DELETE. A failed/unknown request consumes its slot; reads,
+preflight and replay never refund/reset it. `read_health` reports this actual
+counter, not an assumed venue quota. Authentication age derives from the exact
+successful original user-info HTTP capture. Venue quota/expiry may remain
+unknown. The separate durable account-scoped FSM budget is preserved.
+
+An optional signed `EVEDEX_INSTRUMENT` stage joins the exact original HTTP
+metadata capture to the upstream-input envelope. The registered verifier
+derives the Risk instrument rules from those bytes, exact symbol and original
+clocks, rather than accepting a caller's rules DTO. The PROD Risk builder
+requires this stage. Risk rounds quantity down by the actual venue increment,
+checks minimum/maximum quantities/notional and immutable entry/stop/target tick
+geometry before constructing the decision. It never repairs an already
+reviewed intent or rounds an already approved order. Captured metadata remains
+fresh for at most five seconds; `updatedAt` is retained as the rule revision
+time, not retimed as a fetch clock. The FSM independently joins its current
+metadata projection back to original captured bytes and receipt freshness.
+
+### One explicit assembly, with accounting fixed into the path
+
+`production_assembly.build_production_assembly` constructs the existing concrete
+read, Risk, cancellation, exit, lifecycle, coordinator, reconciliation-v2 and
+accounting components from explicitly supplied pre-provisioned resources. It
+checks shared context, database UUID, pools/roles, clock, symbol map and required
+instrument rules before I/O. Its only start method delegates to the existing
+seven-proof manual technical-canary entry; a synchronous one-attempt latch
+prevents concurrent starts or retry/adoption after cancellation/failure.
+Running waits for stop and closes that already-started driver without starting
+it twice. Terminal reconciliation goes through the driver's account lock with
+the attached accounting store mandatory; it cannot silently omit reservation
+release accounting.
+
+Actual-constructor tests use synthetic pool/provider handles and no I/O. This
+assembly does not provide the still-unqualified account/exit/cancellation/terminal
+source implementations, provision databases, register producers, select a
+strategy, start a source consumer, mint safety receipts or arm a real account.
+The ordinary LIVE CLI/Compose rejection is unchanged. Real private-event
+authentication/recovery, fee/funding finality and current signing-domain and
+order-semantics acceptance remain external source-contract requirements.
+In particular, official order documentation describes limit orders as GTC;
+unsigned IOC metadata is not accepted here as a cryptographic venue guarantee.
 
 Legacy manually assembled lifecycle callers may omit the stager, preserving
 existing tests and PAPER behavior. The unified coordinator refuses that

@@ -16,6 +16,7 @@ import binascii
 import hashlib
 import json
 from collections.abc import Iterable, Mapping
+from datetime import UTC, datetime
 from typing import Literal
 
 from kairos_core.contracts import (
@@ -29,11 +30,16 @@ from kairos_core.contracts import (
     canonical_sha256,
 )
 from kairos_core.contracts.decision_context import DecisionContextV1
-from kairos_core.enums import SystemMode
-from kairos_risk.live import LiveRiskScopeV1, VerifiedLiveInputsV1  # type: ignore[import-untyped]
+from kairos_core.enums import EvedexProfile, SystemMode
+from kairos_risk.live import (  # type: ignore[import-untyped]
+    LiveRiskScopeV1,
+    VerifiedLiveInputsV1,
+    VerifiedLiveInstrumentRulesV1,
+)
 from pydantic import Field, model_validator
 
 from .production_readiness import StrictRecord
+from .production_transport import parse_raw_response_capture
 
 _DOMAIN = b"kairos.live-inputs-producer-envelope.v1\x00"
 _MAX_RECEIPTS = 32
@@ -119,6 +125,7 @@ class LiveInputStageReceiptV1(StrictRecord):
         "VENUE_QUALITY",
         "BINANCE_REFERENCE",
         "EVEDEX_BOOK",
+        "EVEDEX_INSTRUMENT",
         "MODEL_PROMPT",
         "MODEL_RESPONSE",
         "MODEL_ATTEMPT_RECORD",
@@ -157,7 +164,13 @@ class LiveInputStageReceiptV1(StrictRecord):
         if self.status == "CAPTURED":
             if self.content_sha256 is None or self.content_base64 is None:
                 raise ValueError("captured stages require raw bytes and their content digest")
-            if self.stage in {"TEXT_SOURCE", "MACRO_SOURCE", "BINANCE_REFERENCE", "EVEDEX_BOOK"}:
+            if self.stage in {
+                "TEXT_SOURCE",
+                "MACRO_SOURCE",
+                "BINANCE_REFERENCE",
+                "EVEDEX_BOOK",
+                "EVEDEX_INSTRUMENT",
+            }:
                 requested = self.requested_at_ms
                 received = self.received_at_ms
                 persisted = self.persisted_at_ms
@@ -303,6 +316,8 @@ class SignedLiveInputsEnvelopeV1(StrictRecord):
         for stage in _SINGLETON_STAGES:
             if sum(receipt.stage == stage for receipt in self.stages) != 1:
                 raise ValueError(f"{stage} must have exactly one explicit stage receipt")
+        if sum(receipt.stage == "EVEDEX_INSTRUMENT" for receipt in self.stages) > 1:
+            raise ValueError("EVEDEX_INSTRUMENT may have at most one explicit stage receipt")
         model_artifacts = [
             stage
             for stage in self.stages
@@ -672,6 +687,19 @@ class LiveInputsSourceVerifier:
         if any(clock > decided_at_ms or decided_at_ms - clock > _VENUE_TTL_MS for clock in venue_clocks):
             raise ValueError("native venue/reference/book clocks exceed the unchanged two-second TTL")
         evidence_sha256 = hashlib.sha256(_DOMAIN + envelope.signed_payload()).hexdigest()
+        instrument_rules = None
+        if "EVEDEX_INSTRUMENT" in by_stage:
+            receipt = by_stage["EVEDEX_INSTRUMENT"][0]
+            if receipt.status != "CAPTURED":
+                raise ValueError("present instrument stage must contain original raw HTTP capture")
+            instrument_rules = self._instrument_rules(
+                content_by_stage_id[receipt.receipt_id],
+                receipt=receipt,
+                envelope=envelope,
+                expected_scope=expected_scope,
+                evidence_sha256=evidence_sha256,
+                decided_at_ms=decided_at_ms,
+            )
         return VerifiedLiveInputsV1(
             source_id=trust.source_id,
             scope_sha256=expected_scope.scope_sha256,
@@ -681,6 +709,90 @@ class LiveInputsSourceVerifier:
             allocation_sha256=canonical_sha256(allocation.model_dump(mode="json")) if allocation else None,
             system_mode=system_mode,
             observed_at_ms=observed_at,
+            instrument_rules=instrument_rules,
+        )
+
+    @staticmethod
+    def _instrument_rules(
+        raw: bytes,
+        *,
+        receipt: LiveInputStageReceiptV1,
+        envelope: SignedLiveInputsEnvelopeV1,
+        expected_scope: LiveRiskScopeV1,
+        evidence_sha256: str,
+        decided_at_ms: int,
+    ) -> VerifiedLiveInstrumentRulesV1:
+        """Derive exact rule facts from authenticated original HTTP bytes only."""
+
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate raw HTTP capture object key")
+                result[key] = value
+            return result
+
+        capture = json.loads(raw, object_pairs_hook=unique_object)
+        payload = parse_raw_response_capture(
+            capture, source="instruments", expected_query={"fields": "metrics"}
+        )
+        if receipt.source_name != "instruments" or not 200 <= capture["status"] < 300:
+            raise ValueError("instrument HTTP capture identity/status is invalid")
+
+        def timestamp_ms(value):
+            if not isinstance(value, str):
+                raise ValueError("instrument source timestamp must be original ISO UTC text")
+            stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if stamp.utcoffset() != UTC.utcoffset(stamp) or stamp.microsecond % 1_000:
+                raise ValueError("instrument source timestamp must be exact UTC milliseconds")
+            delta = stamp - datetime(1970, 1, 1, tzinfo=UTC)
+            return (delta.days * 86_400 + delta.seconds) * 1_000 + delta.microseconds // 1_000
+
+        requested_ms = timestamp_ms(capture["requested_at"])
+        received_ms = timestamp_ms(capture["received_at"])
+        if (
+            receipt.requested_at_ms != requested_ms
+            or receipt.received_at_ms != received_ms
+            or receipt.source_timestamp_ms != received_ms
+            or not 0 <= decided_at_ms - received_ms <= _FIVE_SECONDS_MS
+            or received_ms > envelope.observed_at_ms
+        ):
+            raise ValueError("instrument original HTTP clocks differ, are future-dated, or stale")
+        instruments = payload.get("list") if isinstance(payload, dict) else payload
+        if not isinstance(instruments, list) or any(not isinstance(item, dict) for item in instruments):
+            raise ValueError("instrument source must preserve the native list response")
+        matches = [item for item in instruments if item.get("name") == envelope.venue.symbol]
+        if len(matches) != 1:
+            raise ValueError("instrument metadata is missing or duplicated for the exact PROD symbol")
+        instrument = matches[0]
+        if (
+            instrument.get("trading") != "all"
+            or instrument.get("visibility") != "all"
+            or instrument.get("marketState") != "OPEN"
+        ):
+            raise ValueError("instrument is not open, visible, and tradeable")
+        updated_ms = timestamp_ms(instrument.get("updatedAt"))
+        if updated_ms > received_ms:
+            raise ValueError("instrument rule-change timestamp postdates original capture")
+        return VerifiedLiveInstrumentRulesV1(
+            source_id=envelope.source_id,
+            scope_sha256=expected_scope.scope_sha256,
+            evidence_sha256=evidence_sha256,
+            venue_symbol=envelope.venue.symbol,
+            profile=EvedexProfile.PROD,
+            observed_at_ms=received_ms,
+            rules_updated_at_ms=updated_ms,
+            price_increment=instrument.get("priceIncrement"),
+            quantity_increment=instrument.get("quantityIncrement"),
+            min_price=instrument.get("minPrice"),
+            max_price=instrument.get("maxPrice"),
+            min_quantity=instrument.get("minQuantity"),
+            max_quantity=instrument.get("maxQuantity"),
+            min_notional_usd=instrument.get("minVolume"),
+            # No maximum-notional meaning is inferred from an undocumented field.
+            max_notional_usd=None,
+            lot_size=instrument.get("lotSize"),
+            multiplier=instrument.get("multiplier"),
         )
 
     @staticmethod
