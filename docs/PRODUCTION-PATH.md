@@ -209,6 +209,32 @@ verification. The pinned EVEDEX verifier still refuses unqualified account facts
 
 ## Compatibility and limits
 
+### Explicit technical canary, not full research qualification
+
+`technical_canary_readiness.TechnicalCanaryPreconditionsVerifier` is a separate
+fixed seven-gate profile: recovery, security, custody, delivered alerts, global
+operator control, PROD account pairing and signed production limits. It retains
+the independent issuer pin, original signed proofs and exact account/source
+scope. It does not label alpha or LIVE readiness as established. The full
+production verifier still requires its existing research and other gates.
+
+`technical_canary_service.start_technical_canary_service` rechecks those exact
+proofs and a current owner-signed arm before consuming its nonce in the same
+isolated durable claims store as the existing production runtime. A refused,
+unknown or expired nonce commit cannot be retried or released. This opt-in
+deployment API starts the existing driver, not a second runtime implementation.
+It permits at most one candidate admission per signed session, within at most
+600 seconds, and binds every envelope to that exact signed arm. Even a no-entry
+result consumes that admission. This is not a global account-flatness assertion:
+authoritative recovery, current account exposure and all existing Risk gates
+still apply independently.
+
+Entry expiry leaves protective lifecycle/reconciliation maintenance available;
+it is not a forced close or a claim of successful shutdown. Recovery blockers
+remain blockers. No owner arm, real venue qualification, keys, account facts or
+operational receipts are manufactured by this API. No settings-driven LIVE
+fallback is enabled. A synthetic startup test is not a real-money acceptance.
+
 ### Explicit service runner and cancellation boundary
 
 `factory.build_production_service` now builds `ProductionServiceDriver` only

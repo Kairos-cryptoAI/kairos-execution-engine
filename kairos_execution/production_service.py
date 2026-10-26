@@ -25,7 +25,7 @@ from .production_path import (
     ProductionLiveEntryResult,
     ProductionLiveLifecycleCoordinator,
 )
-from .production_readiness import SignedManualArmRequestV1
+from .production_readiness import SignedManualArmRequestV1, canonical_digest
 
 
 class ProductionServiceError(RuntimeError):
@@ -102,6 +102,7 @@ class ProductionServiceDriver:
         reconciliation_interval_s: float = 2.0,
         maximum_admissions: int = 10_000,
         shutdown_timeout_s: float = 5.0,
+        bound_owner_arm_sha256: str | None = None,
     ) -> None:
         if not isinstance(coordinator, ProductionLiveLifecycleCoordinator):
             raise TypeError("an explicitly composed production lifecycle coordinator is required")
@@ -111,6 +112,11 @@ class ProductionServiceDriver:
             raise ValueError("finite process admission capacity is required")
         if entry_admission is not None and not callable(entry_admission):
             raise TypeError("entry admission must be a synchronous deployment interlock")
+        if bound_owner_arm_sha256 is not None and (
+            not isinstance(bound_owner_arm_sha256, str)
+            or re.fullmatch(r"[a-f0-9]{64}", bound_owner_arm_sha256) is None
+        ):
+            raise ValueError("a bound owner arm must be an exact SHA-256 digest")
         self.coordinator = coordinator
         self._entry_admission = entry_admission
         self._queue: asyncio.Queue[_QueuedEntry] = asyncio.Queue(maxsize=queue_capacity)
@@ -118,6 +124,7 @@ class ProductionServiceDriver:
         self._reconciliation_interval_s = _bounded_seconds(reconciliation_interval_s, maximum=60)
         self._shutdown_timeout_s = _bounded_seconds(shutdown_timeout_s, maximum=5)
         self._maximum_admissions = maximum_admissions
+        self._bound_owner_arm_sha256 = bound_owner_arm_sha256
         self._account_lock = asyncio.Lock()
         self._worker_task: asyncio.Task[None] | None = None
         self._lifecycle_task: asyncio.Task[None] | None = None
@@ -232,6 +239,11 @@ class ProductionServiceDriver:
                     async with asyncio.timeout(self._operation_timeout_s), self._account_lock:
                         if not self._admitted(item):
                             raise ProductionServiceError("entry admission is blocked or cancelled")
+                        if self._bound_owner_arm_sha256 is not None and (
+                            not isinstance(item.envelope.owner_arm, SignedManualArmRequestV1)
+                            or canonical_digest(item.envelope.owner_arm) != self._bound_owner_arm_sha256
+                        ):
+                            raise ProductionServiceError("entry differs from the session's exact owner arm")
                         now = self.coordinator.engine.clock()
                         if (
                             not isinstance(now, datetime)
