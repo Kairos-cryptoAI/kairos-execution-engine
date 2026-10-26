@@ -24,7 +24,9 @@ from .production_lifecycle_binding import (
     compare_entry_risk_to_decision,
 )
 from .production_readiness import canonical_digest
+from .production_reads import ProductionEvedexReads
 from .production_runtime import ProductionExecutionRuntime
+from .production_transport import ProductionEvedexTransport
 
 
 class ProductionLifecycleRefused(PermissionError):
@@ -50,8 +52,18 @@ class ManagedProductionLifecycleAdapter:
 
         if not isinstance(runtime, ProductionExecutionRuntime):
             raise TypeError("an exact managed production runtime is required")
-        if not isinstance(reads, EvedexSidecarAdapter):
-            raise TypeError("the existing EVEDEX SDK read adapter is required")
+        if not isinstance(reads, EvedexSidecarAdapter) and type(reads) is not ProductionEvedexReads:
+            raise TypeError("the reviewed EVEDEX SDK read adapter is required")
+        if type(reads) is ProductionEvedexReads:
+            transport = getattr(getattr(runtime.dispatcher, "sender", None), "__self__", None)
+            if (
+                type(transport) is not ProductionEvedexTransport
+                or transport.client is not reads.client
+                or transport.context != runtime.context
+                or transport.custody_binding != runtime.binding
+                or reads.expected_account_id != runtime.context.remote_account_id
+            ):
+                raise ValueError("PROD reads and writes must share the exact transport client/account")
         if not isinstance(bindings, PostgresLifecycleBindingStore):
             raise TypeError("the durable create-only lifecycle binding store is required")
         if not isinstance(cancellations, ProductionCancellationVerifier):
@@ -73,6 +85,9 @@ class ManagedProductionLifecycleAdapter:
         self.runtime = runtime
         self.context = runtime.context
         self.reads = reads
+        # A REST projection cannot inherit the old adapter's authoritative
+        # protection-parent flag. Unsupported source facts remain unavailable.
+        self.protective_stop_lookup_authoritative = reads.protective_stop_lookup_authoritative
         self.bindings = bindings
         self.trades = trades
         self.effects = effects

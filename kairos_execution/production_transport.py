@@ -84,7 +84,52 @@ MAX_RAW_CAPTURE_BYTES = 2 * 1024 * 1024
 _RAW_CAPTURE_PATHS: dict[str, tuple[str, dict[str, int | str]]] = {
     "account_identity": ("/api/user/me", {}),
     "funding": ("/api/user/funding", {}),
+    "available_balance": ("/api/market/available-balance", {}),
+    "positions": ("/api/position", {}),
+    "open_orders": ("/api/order/opened", {}),
+    "instruments": ("/api/market/instrument", {"fields": "metrics"}),
 }
+FUNDING_TRANSFER_TYPES = frozenset(
+    {
+        "deposit",
+        "withdraw",
+        "faucet",
+        "faucetLiquidity",
+        "realizedPnl",
+        "orderFillFee",
+        "fundingRate",
+        "liquidationFee",
+        "bonusRefund",
+        "yieldReward",
+        "copyTradingFee",
+    }
+)
+# These exact GET routes/fields are published in the current official OpenAPI.
+# They are intentionally not inferred from the older pinned SDK method list.
+PROD_HISTORY_OPENAPI_SOURCE = "https://exchange-api.evedex.com/api/openapi.json"
+
+
+def _history_interval(after: str | None, before: str | None) -> tuple[str, str]:
+    """Require explicit canonical millisecond UTC bounds, at most one day apart."""
+    try:
+        if not isinstance(after, str) or not isinstance(before, str):
+            raise ValueError
+        if any(
+            not isinstance(value, str)
+            or re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z", value)
+            is None
+            for value in (after, before)
+        ):
+            raise ValueError
+        start = datetime.fromisoformat(after.replace("Z", "+00:00"))
+        end = datetime.fromisoformat(before.replace("Z", "+00:00"))
+        if not 0 < (end - start).total_seconds() <= 86_400:
+            raise ValueError
+    except (AttributeError, TypeError, ValueError):
+        raise ProductionTransportError(
+            "history requires an explicit increasing UTC interval of at most one day"
+        ) from None
+    return str(after), str(before)
 
 
 def _raw_capture_request(
@@ -94,11 +139,83 @@ def _raw_capture_request(
     limit: int | None,
     offset: int | None,
     next_cursor: str | None,
+    instrument: str | None = None,
+    max_level: int | None = None,
+    order_id: str | None = None,
+    after: str | None = None,
+    before: str | None = None,
+    transfer_type: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, int | str]]:
+    if source == "order_fills":
+        if (
+            not isinstance(order_id, str)
+            or re.fullmatch(r"[0-9]{5}:[0-9A-Fa-f]{26}", order_id) is None
+            or any(
+                value is not None
+                for value in (
+                    version,
+                    limit,
+                    offset,
+                    next_cursor,
+                    instrument,
+                    max_level,
+                    after,
+                    before,
+                    transfer_type,
+                )
+            )
+        ):
+            raise ProductionTransportError("order fills require one exact V2 order ID")
+        return {"source": source, "order_id": order_id}, {"version": 2}
+    if source in {"funding_transfers", "fill_history"}:
+        after, before = _history_interval(after, before)
+        if (
+            type(limit) is not int
+            or not 1 <= limit <= 100
+            or type(offset) is not int
+            or not 0 <= offset <= 10_000
+            or any(value is not None for value in (version, next_cursor, max_level, order_id))
+            or (source == "funding_transfers" and instrument is not None)
+            or (source == "fill_history" and transfer_type is not None)
+            or (transfer_type is not None and transfer_type not in FUNDING_TRANSFER_TYPES)
+            or (
+                instrument is not None
+                and (not isinstance(instrument, str) or re.fullmatch(r"[A-Z0-9]{1,32}", instrument) is None)
+            )
+        ):
+            raise ProductionTransportError("history page query is outside the fixed read contract")
+        history_query: dict[str, int | str] = {
+            "after": after,
+            "before": before,
+            "limit": limit,
+            "offset": offset,
+        }
+        history_payload: dict[str, Any] = {"source": source, **history_query}
+        if transfer_type is not None:
+            history_query["type"] = transfer_type
+            history_payload["transfer_type"] = transfer_type
+        if instrument is not None:
+            history_query["instrument"] = instrument
+            history_payload["instrument"] = instrument
+        return history_payload, history_query
+    if any(value is not None for value in (order_id, after, before, transfer_type)):
+        raise ProductionTransportError("history parameters are not valid for this fixed source")
+    if source == "depth":
+        if (
+            not isinstance(instrument, str)
+            or re.fullmatch(r"[A-Z0-9]{1,32}", instrument) is None
+            or type(max_level) is not int
+            or not 1 <= max_level <= 100
+            or any(value is not None for value in (version, limit, offset, next_cursor))
+        ):
+            raise ProductionTransportError("raw depth query is outside the fixed read contract")
+        return {"source": source, "instrument": instrument, "max_level": max_level}, {"maxLevel": max_level}
+    if instrument is not None or max_level is not None:
+        raise ProductionTransportError("raw capture instrument/depth fields are not valid for this source")
     if source in _RAW_CAPTURE_PATHS:
         if any(value is not None for value in (version, limit, offset, next_cursor)):
             raise ProductionTransportError("raw capture parameters are not valid for this fixed source")
-        return {"source": source}, {}
+        return {"source": source}, dict(_RAW_CAPTURE_PATHS[source][1])
     if source == "order_page":
         if (
             type(version) is not int
@@ -133,7 +250,12 @@ def _raw_capture_request(
 
 
 def parse_raw_response_capture(
-    capture: dict[str, Any], *, source: str, expected_query: dict[str, int | str]
+    capture: dict[str, Any],
+    *,
+    source: str,
+    expected_query: dict[str, int | str],
+    instrument: str | None = None,
+    order_id: str | None = None,
 ) -> Any:
     """Verify and losslessly parse a bounded pre-JSON HTTP body capture.
 
@@ -153,7 +275,67 @@ def parse_raw_response_capture(
     }:
         raise ProductionTransportError("raw HTTP capture shape is malformed")
     expected_path: tuple[str, dict[str, int | str]] | None
-    if source == "order_page":
+    if source == "order_fills":
+        if expected_query != {"version": 2}:
+            raise ProductionTransportError("raw order fills query differs from the fixed read contract")
+        _, authorized_query = _raw_capture_request(
+            source,
+            version=None,
+            limit=None,
+            offset=None,
+            next_cursor=None,
+            order_id=order_id,
+        )
+        expected_path = (f"/api/order/{order_id}/fill", authorized_query)
+    elif source in {"funding_transfers", "fill_history"}:
+        allowed = {"after", "before", "limit", "offset"}
+        optional = "type" if source == "funding_transfers" else "instrument"
+        if set(expected_query) not in (allowed, allowed | {optional}):
+            raise ProductionTransportError("raw history query differs from the fixed read contract")
+        page_limit, page_offset = expected_query.get("limit"), expected_query.get("offset")
+        history_after, history_before = expected_query.get("after"), expected_query.get("before")
+        history_type, history_instrument = expected_query.get("type"), expected_query.get("instrument")
+        if (
+            type(page_limit) is not int
+            or type(page_offset) is not int
+            or not isinstance(history_after, str)
+            or not isinstance(history_before, str)
+            or (history_type is not None and not isinstance(history_type, str))
+            or (history_instrument is not None and not isinstance(history_instrument, str))
+        ):
+            raise ProductionTransportError("raw history query values are malformed")
+        _, authorized_query = _raw_capture_request(
+            source,
+            version=None,
+            limit=page_limit,
+            offset=page_offset,
+            next_cursor=None,
+            after=history_after,
+            before=history_before,
+            transfer_type=history_type,
+            instrument=history_instrument,
+        )
+        expected_path = (
+            "/api/user/funding-transfer" if source == "funding_transfers" else "/api/fill",
+            authorized_query,
+        )
+    elif source == "depth":
+        if set(expected_query) != {"maxLevel"}:
+            raise ProductionTransportError("raw depth query is outside the fixed read contract")
+        max_level = expected_query["maxLevel"]
+        if type(max_level) is not int:
+            raise ProductionTransportError("raw depth maximum level must be an exact integer")
+        _, authorized_query = _raw_capture_request(
+            source,
+            version=None,
+            limit=None,
+            offset=None,
+            next_cursor=None,
+            instrument=instrument,
+            max_level=max_level,
+        )
+        expected_path = (f"/api/market/{instrument}/deep", authorized_query)
+    elif source == "order_page":
         if (
             set(expected_query)
             not in (
@@ -196,7 +378,7 @@ def parse_raw_response_capture(
         expected_path = ("/api/tpsl", authorized_query)
     else:
         expected_path = _RAW_CAPTURE_PATHS.get(source)
-        if expected_query:
+        if expected_path is not None and expected_query != expected_path[1]:
             raise ProductionTransportError("raw capture query is outside the fixed read contract")
     if expected_path is None or capture["source"] != source or capture["path"] != expected_path[0]:
         raise ProductionTransportError("raw HTTP capture differs from the fixed read route")
@@ -655,6 +837,64 @@ class ProductionEvedexSdkClient:
         self._preflight_complete = True
         return identity
 
+    async def read_health(self) -> dict[str, Any]:
+        """Read actual process-local HTTP budget and original authentication clock."""
+        health = await self._call("read_health", {}, mutation=False)
+        if not isinstance(health, dict) or any(
+            key not in health or health[key] != value
+            for key, value in {
+                "ok": True,
+                "profile": "PROD",
+                "chain_id": 42161,
+                "exchange_url": "https://trading-api.evedex.com",
+                "auth_url": "https://auth-api.evedex.com",
+                "sdk_version": "1.2.11",
+                "account_id": self.expected_account_id,
+                "local_mutation_rate_limit_observable": True,
+                "local_mutation_rate_limit_capacity": 30,
+                "local_mutation_rate_limit_window_ms": 60_000,
+                "local_mutation_compensation_reserve": 4,
+                "local_mutation_entry_min_reserve": 7,
+                "auth_expires_in_ms": None,
+                "venue_rate_limit_observable": False,
+                "venue_rate_limit_reserve": None,
+            }.items()
+        ):
+            raise ProductionTransportError("PROD HTTP health differs from its fixed enforced profile")
+        for field in ("ok", "local_mutation_rate_limit_observable", "venue_rate_limit_observable"):
+            if type(health[field]) is not bool:
+                raise ProductionTransportError("PROD HTTP health observability must be an exact boolean")
+        for field in (
+            "chain_id",
+            "auth_age_ms",
+            "local_mutation_rate_limit_reserve",
+            "local_mutation_rate_limit_capacity",
+            "local_mutation_rate_limit_window_ms",
+            "local_mutation_compensation_reserve",
+            "local_mutation_entry_min_reserve",
+        ):
+            if type(health.get(field)) is not int or health[field] < 0:
+                raise ProductionTransportError(
+                    "PROD HTTP health telemetry is not a nonnegative exact integer"
+                )
+        if health["local_mutation_rate_limit_reserve"] > health["local_mutation_rate_limit_capacity"]:
+            raise ProductionTransportError("PROD HTTP health budget exceeds enforced capacity")
+        capture = health.get("preflight_capture")
+        if not isinstance(capture, dict):
+            raise ProductionTransportError("PROD health lacks an original native authentication capture")
+        identity = parse_raw_response_capture(
+            capture,
+            source="account_identity",
+            expected_query={},
+        )
+        if (
+            not isinstance(identity, dict)
+            or str(identity.get("exchangeId", "")) != self.expected_account_id
+            or not 200 <= capture["status"] < 300
+        ):
+            raise ProductionTransportError("PROD health lacks successful exact native authentication capture")
+        return health
+
     async def send_signed_post(self, *, method: str, path: str, body: dict[str, Any]) -> dict[str, Any]:
         _validate_signed_post(method, path, body)
         return await self._call(
@@ -734,6 +974,17 @@ class ProductionEvedexSdkClient:
         elif source == "tpsl_page":
             if set(payload) != {"source", "limit", "offset"}:
                 raise ProductionTransportError("raw TP/SL capture fields differ from the fixed read contract")
+        elif source == "depth":
+            if set(payload) != {"source", "instrument", "max_level"}:
+                raise ProductionTransportError("raw depth capture fields differ from the fixed read contract")
+        elif source == "order_fills":
+            if set(payload) != {"source", "order_id"}:
+                raise ProductionTransportError("raw order fills fields differ from the fixed read contract")
+        elif source in {"funding_transfers", "fill_history"}:
+            allowed = {"source", "after", "before", "limit", "offset"}
+            optional = "transfer_type" if source == "funding_transfers" else "instrument"
+            if set(payload) not in (allowed, allowed | {optional}):
+                raise ProductionTransportError("raw history fields differ from the fixed read contract")
         else:
             raise ProductionTransportError(
                 "raw capture source is outside the fixed account/history allowlist"
@@ -744,6 +995,12 @@ class ProductionEvedexSdkClient:
             limit=payload.get("limit"),
             offset=payload.get("offset"),
             next_cursor=payload.get("next_cursor"),
+            instrument=payload.get("instrument"),
+            max_level=payload.get("max_level"),
+            order_id=payload.get("order_id"),
+            after=payload.get("after"),
+            before=payload.get("before"),
+            transfer_type=payload.get("transfer_type"),
         )
         result = await self._call("fetch_raw_capture", payload, mutation=False)
         if not isinstance(result, dict):

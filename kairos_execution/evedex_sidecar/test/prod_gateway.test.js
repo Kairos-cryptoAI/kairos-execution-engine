@@ -48,11 +48,16 @@ function fixture({ exchangeId = "acct-prod-1", orderRecord = null, tpslPage = nu
   const gateway = new EvedexProdSdkGateway({
     apiKey: "api-key-test",
     expectedAccountId: "acct-prod-1",
+    axiosAdapter: async (config) => ({
+      data: Buffer.from(JSON.stringify({ exchangeId })), status: 200, statusText: "OK", headers: {}, config,
+    }),
     gatewayFactory: (options) => {
       optionsSeen.push(options);
       return {
         createApiKeyAccount: async (apiKey) => {
           assert.deepEqual(apiKey, { apiKey: "api-key-test" });
+          options.httpClient.setSession(apiKey);
+          await options.httpClient.authRequest({ method: "GET", url: "https://trading-api.evedex.com/api/user/me", headers: {} });
           return account;
         },
         closeWsConnection: async () => { closed += 1; },
@@ -97,7 +102,7 @@ test("real pinned SDK Gateway uses isolated bounded HTTPS transport and x-api-ke
   const adapter = async (config) => {
     requests.push(config);
     const data = config.url.endsWith("/api/user/me")
-      ? { exchangeId: "acct-prod-1" }
+      ? Buffer.from('{"exchangeId":"acct-prod-1"}')
       : { id: "entry-1", status: "NEW" };
     return { data, status: 200, statusText: "OK", headers: {}, config };
   };
@@ -117,7 +122,7 @@ test("real pinned SDK Gateway uses isolated bounded HTTPS transport and x-api-ke
     assert.equal(request.maxRedirects, 0);
     assert.equal(request.proxy, false);
     assert.equal(request.timeout, 20_000);
-    assert.equal(request.maxContentLength, 4 * 1024 * 1024);
+    assert.equal(request.maxContentLength, request.responseType === "arraybuffer" ? 2 * 1024 * 1024 : 4 * 1024 * 1024);
     assert.equal(request.maxBodyLength, 4 * 1024 * 1024);
     assert.ok(request.httpsAgent);
     assert.equal(request.headers.get("x-api-key"), "api-key-test");
@@ -223,7 +228,7 @@ test("raw capture returns bounded original application body bytes with exact GET
     axiosAdapter: async (config) => {
       requests.push(config);
       const data = config.url.endsWith("/api/user/me")
-        ? { exchangeId: "acct-prod-1" }
+        ? Buffer.from('{"exchangeId":"acct-prod-1"}')
         : body;
       return { data, status: 200, statusText: "OK", headers: {}, config };
     },
@@ -254,7 +259,7 @@ test("raw capture refuses non-allowlisted source, mismatched route/query and ove
     axiosAdapter: async (config) => {
       attempts += 1;
       const data = config.url.endsWith("/api/user/me")
-        ? { exchangeId: "acct-prod-1" }
+        ? Buffer.from('{"exchangeId":"acct-prod-1"}')
         : Buffer.alloc(2 * 1024 * 1024 + 1, 0x20);
       return { data, status: 200, statusText: "OK", headers: {}, config };
     },
@@ -324,7 +329,7 @@ test("raw capture refuses parsed adapter objects instead of relabeling them as o
     apiKey: "api-key-test",
     expectedAccountId: "acct-prod-1",
     axiosAdapter: async (config) => ({
-      data: config.url.endsWith("/api/user/me") ? { exchangeId: "acct-prod-1" } : { quantity: 1.23 },
+      data: config.url.endsWith("/api/user/me") ? Buffer.from('{"exchangeId":"acct-prod-1"}') : { quantity: 1.23 },
       status: 200,
       statusText: "OK",
       headers: {},

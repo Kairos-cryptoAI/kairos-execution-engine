@@ -50,6 +50,7 @@ from .production_readiness import (
     canonical_digest,
 )
 from .production_reconciliation import ProductionReservationReconciler, ReservationTradeBindingV1
+from .production_transport import parse_raw_response_capture
 from .profiles import profile_params
 
 
@@ -465,9 +466,34 @@ class ProductionLifecycleEngine(_EvedexProtectedExecutionEngine):
             or str(instrument.get("marketState", "")).upper() != "OPEN"
         ):
             raise PaperExecutionSafetyError("PROD instrument is not currently open and tradeable")
-        updated = self._iso_timestamp_ms(instrument.get("updatedAt"), "PROD instrument updatedAt")
         now_ms = int(self.clock().astimezone(UTC).timestamp() * 1000)
-        if updated > now_ms or now_ms - updated > 5 * 60 * 1000:
+        updated = self._iso_timestamp_ms(instrument.get("updatedAt"), "PROD instrument updatedAt")
+        if "native_read_captures" in venue:
+            try:
+                capture = venue["native_read_captures"]["instruments"]
+                original = parse_raw_response_capture(
+                    capture, source="instruments", expected_query={"fields": "metrics"}
+                )
+                received = self._iso_timestamp_ms(capture["received_at"], "instrument HTTP received_at")
+                original_instruments = self._list(original)
+                if (
+                    not 200 <= capture["status"] < 300
+                    or original_instruments != self._list(venue.get("instruments"))
+                    or not 0 <= now_ms - received <= 5_000
+                    or updated > received
+                ):
+                    raise ValueError("instrument capture/projection is stale or inconsistent")
+            except Exception:
+                raise PaperExecutionSafetyError(
+                    "PROD instrument rules need the exact fresh original HTTP capture"
+                ) from None
+            # updatedAt is the resource revision time, not a fabricated fetch
+            # timestamp. Current freshness belongs to the retained HTTP receipt.
+            self._operational_telemetry["evedex_prod_instrument_received_at_ms"] = str(received)
+            self._operational_telemetry["evedex_prod_instrument_body_sha256"] = capture["body_sha256"]
+        elif updated > now_ms or now_ms - updated > 5 * 60 * 1000:
+            # Preserve legacy explicit/test callers, without relabeling their
+            # historical revision timestamp as a new capture witness.
             raise PaperExecutionSafetyError("PROD instrument rule snapshot is stale or future-dated")
         price_increment = self._positive_decimal(instrument.get("priceIncrement"), "priceIncrement")
         quantity_increment = self._positive_decimal(instrument.get("quantityIncrement"), "quantityIncrement")

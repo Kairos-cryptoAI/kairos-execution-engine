@@ -1,7 +1,7 @@
 import { createInterface } from "node:readline";
 import { readFileSync } from "node:fs";
 
-import { EvedexProdSdkGateway, safeProdError } from "./prod_sdk_gateway.js";
+import { EvedexProdSdkGateway, safeProdError, validateProdHistoryRead } from "./prod_sdk_gateway.js";
 import { serializeProdResponse } from "./prod_protocol.js";
 
 const MAX_LINE_BYTES = 1024 * 1024;
@@ -30,7 +30,7 @@ function validate(value) {
     }
     return { id: value.id, operation: value.operation, payload };
   }
-  if (value.operation === "preflight") {
+  if (value.operation === "preflight" || value.operation === "read_health") {
     exactKeys(payload, []);
     return { id: value.id, operation: value.operation, payload };
   }
@@ -64,8 +64,20 @@ function validate(value) {
   }
   if (value.operation === "fetch_raw_capture") {
     const source = payload.source;
-    if (source === "account_identity" || source === "funding") {
+    if (["order_fills", "funding_transfers", "fill_history"].includes(source)) {
+      validateProdHistoryRead(payload);
+      return { id: value.id, operation: value.operation, payload };
+    }
+    if (["account_identity", "funding", "available_balance", "positions", "open_orders", "instruments"].includes(source)) {
       exactKeys(payload, ["source"]);
+      return { id: value.id, operation: value.operation, payload };
+    }
+    if (source === "depth") {
+      exactKeys(payload, ["source", "instrument", "max_level"]);
+      if (typeof payload.instrument !== "string" || !/^[A-Z0-9]{1,32}$/.test(payload.instrument) ||
+          !Number.isInteger(payload.max_level) || payload.max_level < 1 || payload.max_level > 100) {
+        throw new TypeError("raw depth query is malformed");
+      }
       return { id: value.id, operation: value.operation, payload };
     }
     if (source === "order_page") {
@@ -121,6 +133,8 @@ async function handle(line) {
     let result;
     if (request.operation === "preflight") {
       result = await gateway.preflight();
+    } else if (request.operation === "read_health") {
+      result = gateway.readHealth();
     } else if (request.operation === "send_signed_post") {
       result = await gateway.sendSignedPost(request.payload);
     } else if (request.operation === "cancel_order") {

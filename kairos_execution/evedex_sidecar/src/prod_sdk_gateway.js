@@ -4,6 +4,10 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createHash } from "node:crypto";
 
+// Importing this module only defines the existing budget/helper classes. No
+// DEV gateway, wallet, signer, network connection or container is constructed.
+import { LocalMutationBudget } from "./sdk_gateway.js";
+
 const require = createRequire(import.meta.url);
 const evedex = require("@evedex/exchange-bot-sdk");
 const sdkEntry = require.resolve("@evedex/exchange-bot-sdk");
@@ -26,6 +30,41 @@ const PROD_PROFILE = Object.freeze({
 });
 
 const HTTP_ORIGINS = new Set([new URL(PROD_PROFILE.exchangeURI).origin, new URL(PROD_PROFILE.authURI).origin]);
+export const PROD_HISTORY_OPENAPI_SOURCE = "https://exchange-api.evedex.com/api/openapi.json";
+const FUNDING_TRANSFER_TYPES = new Set([
+  "deposit", "withdraw", "faucet", "faucetLiquidity", "realizedPnl", "orderFillFee",
+  "fundingRate", "liquidationFee", "bonusRefund", "yieldReward", "copyTradingFee",
+]);
+
+export function validateProdHistoryRead(payload) {
+  const source = payload.source;
+  const required = source === "order_fills" ? ["source", "order_id"] : ["source", "after", "before", "limit", "offset"];
+  const optional = source === "funding_transfers" ? "transfer_type" : "instrument";
+  const expected = [...required, ...(source !== "order_fills" && Object.hasOwn(payload, optional) ? [optional] : [])].sort();
+  const keys = Object.keys(payload).sort();
+  if (!["order_fills", "funding_transfers", "fill_history"].includes(source) ||
+      keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
+    throw new TypeError("raw documented history fields are not exact");
+  }
+  if (source === "order_fills") {
+    if (typeof payload.order_id !== "string" || !/^[0-9]{5}:[0-9A-Fa-f]{26}$/.test(payload.order_id)) {
+      throw new TypeError("order fills require one exact V2 order ID");
+    }
+    return;
+  }
+  const times = [payload.after, payload.before];
+  if (times.some((value) => typeof value !== "string" ||
+      !/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$/.test(value) ||
+      !Number.isFinite(Date.parse(value)) || new Date(value).toISOString() !== value) ||
+      Date.parse(payload.before) <= Date.parse(payload.after) ||
+      Date.parse(payload.before) - Date.parse(payload.after) > 86_400_000 ||
+      !Number.isInteger(payload.limit) || payload.limit < 1 || payload.limit > 100 ||
+      !Number.isInteger(payload.offset) || payload.offset < 0 || payload.offset > 10_000 ||
+      (Object.hasOwn(payload, "transfer_type") && !FUNDING_TRANSFER_TYPES.has(payload.transfer_type)) ||
+      (Object.hasOwn(payload, "instrument") && (typeof payload.instrument !== "string" || !/^[A-Z0-9]{1,32}$/.test(payload.instrument)))) {
+    throw new TypeError("raw documented history query is outside its bounded UTC read contract");
+  }
+}
 
 function validateProdHttpUrl(request) {
   if (typeof request?.url !== "string") throw new TypeError("EVEDEX HTTP URL is missing");
@@ -47,11 +86,19 @@ function validateProdHttpUrl(request) {
     "GET /api/user/funding",
     "GET /api/order",
     "GET /api/tpsl",
+    "GET /api/market/available-balance",
+    "GET /api/position",
+    "GET /api/order/opened",
+    "GET /api/market/instrument",
+    "GET /api/user/funding-transfer",
+    "GET /api/fill",
     "POST /api/v2/order/limit",
     "POST /api/v2/order/market",
     "POST /api/v2/order/stop-limit",
   ]);
-  if (!allowed.has(route) && !/^GET \/api\/order\/[A-Za-z0-9_.:-]{1,160}$/.test(route) &&
+  if (!allowed.has(route) && !/^GET \/api\/market\/[A-Z0-9]{1,32}\/deep$/.test(route) &&
+      !/^GET \/api\/order\/[0-9]{5}:[0-9A-Fa-f]{26}\/fill$/.test(route) &&
+      !/^GET \/api\/order\/[A-Za-z0-9_.:-]{1,160}$/.test(route) &&
       !/^DELETE \/api\/order\/[A-Za-z0-9_.:-]{1,160}$/.test(route) &&
       !/^POST \/api\/v2\/position\/[A-Z0-9]{1,32}\/close$/.test(route) &&
       !/^POST \/api\/tpsl\/[A-Z0-9]{1,32}$/.test(route) &&
@@ -62,9 +109,11 @@ function validateProdHttpUrl(request) {
 }
 
 export class PinnedProdRestClient extends RestClient {
-  constructor({ adapter } = {}) {
+  constructor({ adapter, clock = () => Date.now() } = {}) {
     super({});
     this.adapter = adapter;
+    this.clock = clock;
+    this.mutationBudget = new LocalMutationBudget({ clock });
     this.httpsAgent = new HttpsAgent({ keepAlive: false, maxSockets: 8 });
     this.rawCaptureExpected = undefined;
     this.rawCapture = undefined;
@@ -105,7 +154,7 @@ export class PinnedProdRestClient extends RestClient {
     }
     const bytes = Buffer.from(data);
     if (bytes.length > MAX_RAW_CAPTURE_BYTES) throw new Error("raw HTTP response exceeds the capture bound");
-    const receivedAt = new Date().toISOString();
+    const receivedAt = new Date(this.clock()).toISOString();
     const query = Object.fromEntries([...url.searchParams.entries()]);
     this.rawCapture = {
       source: this.rawCaptureExpected.source,
@@ -134,7 +183,7 @@ export class PinnedProdRestClient extends RestClient {
   async request(request) {
     const url = validateProdHttpUrl(request);
     this.#validateCaptureRequest(request, url);
-    const requestedAt = new Date().toISOString();
+    const requestedAt = new Date(this.clock()).toISOString();
     const captureActive = this.rawCaptureExpected !== undefined;
     const config = {
       url: url.toString(),
@@ -150,6 +199,20 @@ export class PinnedProdRestClient extends RestClient {
       httpsAgent: this.httpsAgent,
       ...(this.adapter ? { adapter: this.adapter } : {}),
     };
+    const method = String(request.method).toUpperCase();
+    if (method === "POST" || method === "DELETE") {
+      let operation;
+      if (/^\/api\/v2\/order\/(limit|stop-limit)$/.test(url.pathname)) operation = "place_limit";
+      else if (url.pathname === "/api/v2/order/market") operation = "place_market";
+      else if (/^\/api\/v2\/position\/[A-Z0-9]{1,32}\/close$/.test(url.pathname)) operation = "close_position";
+      else if (method === "POST" && /^\/api\/tpsl\//.test(url.pathname)) operation = "create_tpsl";
+      else if (method === "DELETE" && /^\/api\/tpsl\//.test(url.pathname)) operation = "cancel_tpsl";
+      else if (method === "DELETE" && /^\/api\/order\//.test(url.pathname)) operation = "cancel_order";
+      else throw new TypeError("PROD mutation has no enforced local budget classification");
+      // Reserve at the single actual HTTP-send boundary, not at SDK dispatch
+      // or authentication. Failed/ambiguous sends are spent, never refunded.
+      this.mutationBudget.reserve(operation);
+    }
     try {
       const response = await axios.request(config);
       if (!captureActive) return response;
@@ -282,7 +345,7 @@ function expectedAccount(account, expectedAccountId) {
 }
 
 export class EvedexProdSdkGateway {
-  constructor({ apiKey, expectedAccountId, gatewayFactory, axiosAdapter } = {}) {
+  constructor({ apiKey, expectedAccountId, gatewayFactory, axiosAdapter, clock = () => Date.now() } = {}) {
     this.profile = assertPinnedProdProfile();
     if (typeof apiKey !== "string" || apiKey.length === 0) throw new Error("EVEDEX_PROD_API_KEY is required");
     if (typeof expectedAccountId !== "string" || expectedAccountId.length === 0) {
@@ -292,6 +355,7 @@ export class EvedexProdSdkGateway {
     this.expectedAccountId = expectedAccountId;
     this.gatewayFactory = gatewayFactory ?? ((options) => new evedex.Gateway(options));
     this.axiosAdapter = axiosAdapter;
+    this.clock = clock;
     this.httpClient = undefined;
     this.gateway = undefined;
     this.account = undefined;
@@ -306,7 +370,7 @@ export class EvedexProdSdkGateway {
     if (this.preflightFailed || this.preflightAttempted) throw new Error("EVEDEX PROD SDK preflight already failed; create a fresh client after reconciliation");
     this.preflightAttempted = true;
     this.authPromise = (async () => {
-      const httpClient = new PinnedProdRestClient({ adapter: this.axiosAdapter });
+      const httpClient = new PinnedProdRestClient({ adapter: this.axiosAdapter, clock: this.clock });
       const gateway = this.gatewayFactory({
         authURI: this.profile.authURI,
         exchangeURI: this.profile.exchangeURI,
@@ -314,13 +378,20 @@ export class EvedexProdSdkGateway {
         httpClient,
       });
       try {
+        httpClient.beginRawCapture({ source: "account_identity", path: "/api/user/me", query: {} });
         const account = await gateway.createApiKeyAccount({ apiKey: this.apiKey });
         const identity = account?.exchangeAccount;
         expectedAccount(identity, this.expectedAccountId);
+        const preflightCapture = httpClient.takeRawCapture();
+        if (preflightCapture.status < 200 || preflightCapture.status >= 300) {
+          throw new Error("PROD authentication did not produce a successful native response");
+        }
         this.gateway = gateway;
         this.httpClient = httpClient;
         this.account = account;
         this.authenticatedIdentity = identity;
+        this.preflightCapture = preflightCapture;
+        this.authenticatedAtMs = Date.parse(preflightCapture.received_at);
         return identity;
       } catch (error) {
         this.preflightFailed = true;
@@ -339,6 +410,27 @@ export class EvedexProdSdkGateway {
   #requirePreflight() {
     assertPinnedProdProfile();
     if (!this.account || this.preflightFailed) throw new Error("EVEDEX PROD SDK preflight is required before any operation");
+  }
+
+  readHealth() {
+    this.#requirePreflight();
+    const age = this.clock() - this.authenticatedAtMs;
+    if (!Number.isSafeInteger(age) || age < 0) throw new Error("PROD authentication clock is invalid");
+    const budget = this.httpClient.mutationBudget;
+    return {
+      ok: true, profile: "PROD", chain_id: Number(this.profile.chainId),
+      exchange_url: this.profile.exchangeURI, auth_url: this.profile.authURI,
+      sdk_version: SDK_VERSION, account_id: this.expectedAccountId,
+      auth_age_ms: age, auth_expires_in_ms: null,
+      local_mutation_rate_limit_observable: true,
+      local_mutation_rate_limit_reserve: budget.remaining(),
+      local_mutation_rate_limit_capacity: budget.capacity,
+      local_mutation_rate_limit_window_ms: budget.windowMs,
+      local_mutation_compensation_reserve: budget.entryCompensationReserve,
+      local_mutation_entry_min_reserve: budget.entryCompensationReserve + 3,
+      venue_rate_limit_observable: false, venue_rate_limit_reserve: null,
+      preflight_capture: { ...this.preflightCapture },
+    };
   }
 
   async sendSignedPost({ method, path, body }) {
@@ -424,12 +516,30 @@ export class EvedexProdSdkGateway {
     return this.account.exchangeGateway.getFunding();
   }
 
-  async fetchRawCapture({ source, version, limit, offset, next }) {
+  async fetchRawCapture({ source, version, limit, offset, next, instrument, max_level,
+    order_id, after, before, transfer_type }) {
     this.#requirePreflight();
     let path;
     let query;
     let read;
-    if (source === "account_identity") {
+    if (["order_fills", "funding_transfers", "fill_history"].includes(source)) {
+      const payload = source === "order_fills" ? { source, order_id } : {
+        source, after, before, limit, offset,
+        ...(transfer_type === undefined ? {} : { transfer_type }),
+        ...(instrument === undefined ? {} : { instrument }),
+      };
+      validateProdHistoryRead(payload);
+      path = source === "order_fills" ? `/api/order/${order_id}/fill`
+        : source === "funding_transfers" ? "/api/user/funding-transfer" : "/api/fill";
+      query = source === "order_fills" ? { version: 2 } : {
+        after, before, limit, offset,
+        ...(transfer_type === undefined ? {} : { type: transfer_type }),
+        ...(instrument === undefined ? {} : { instrument }),
+      };
+      // The current official OpenAPI documents these GETs, but SDK 1.2.11 has
+      // no named method. Use its existing authenticated GET, never a new client.
+      read = () => this.account.exchangeGateway.authGet(path, new URLSearchParams(query).toString());
+    } else if (source === "account_identity") {
       path = "/api/user/me";
       query = {};
       read = () => this.account.exchangeGateway.me();
@@ -437,6 +547,30 @@ export class EvedexProdSdkGateway {
       path = "/api/user/funding";
       query = {};
       read = () => this.account.exchangeGateway.getFunding();
+    } else if (source === "available_balance") {
+      path = "/api/market/available-balance";
+      query = {};
+      read = () => this.account.exchangeGateway.getAvailableBalance();
+    } else if (source === "positions") {
+      path = "/api/position";
+      query = {};
+      read = () => this.account.exchangeGateway.getPositions();
+    } else if (source === "open_orders") {
+      path = "/api/order/opened";
+      query = {};
+      read = () => this.account.exchangeGateway.getOpenedOrders();
+    } else if (source === "instruments") {
+      path = "/api/market/instrument";
+      query = { fields: "metrics" };
+      read = () => this.account.exchangeGateway.getInstrumentsMetrics();
+    } else if (source === "depth") {
+      if (typeof instrument !== "string" || !/^[A-Z0-9]{1,32}$/.test(instrument) ||
+          !Number.isInteger(max_level) || max_level < 1 || max_level > 100) {
+        throw new TypeError("raw depth query is malformed");
+      }
+      path = `/api/market/${instrument}/deep`;
+      query = { maxLevel: max_level };
+      read = () => this.account.exchangeGateway.getMarketDepth({ instrument, maxLevel: max_level });
     } else if (source === "order_page") {
       if (version !== 2 || !Number.isInteger(limit) || limit < 1 || limit > PAGE_LIMIT ||
           !Number.isInteger(offset) || offset < 0 || offset > MAX_RECORDS ||
