@@ -19,8 +19,8 @@ BEFORE = "2026-10-27T01:00:00.000Z"
 
 def fixture(*, bodies=None):
     client = ProductionEvedexSdkClient(
-        node_executable=Path("D:/offline/node.exe"),
-        api_key_file=Path("D:/offline/not-read.key"),
+        node_executable=Path(__file__).resolve().parent / "fixtures" / "node.exe",
+        api_key_file=Path(__file__).resolve().parent / "fixtures" / "not-read.key",
         expected_account_id="acct-prod-1",
     )
     defaults = {

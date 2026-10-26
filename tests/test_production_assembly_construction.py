@@ -136,8 +136,8 @@ def concrete_resources(*, require_instrument_rules=True, approved_symbols=None):
         authorization=authorization,
     )
     client = ProductionEvedexSdkClient(
-        node_executable=Path("D:/offline/node.exe"),
-        api_key_file=Path("D:/offline/must-not-be-read.key"),
+        node_executable=Path(__file__).resolve().parent / "fixtures" / "node.exe",
+        api_key_file=Path(__file__).resolve().parent / "fixtures" / "must-not-be-read.key",
         expected_account_id=context.remote_account_id,
     )
     transport = ProductionEvedexTransport(

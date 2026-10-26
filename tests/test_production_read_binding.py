@@ -26,8 +26,8 @@ def assembly(*, different_client=False):
 
     def client():
         return ProductionEvedexSdkClient(
-            node_executable=Path("D:/synthetic/node.exe"),
-            api_key_file=Path("D:/synthetic/not-read.key"),
+            node_executable=Path(__file__).resolve().parent / "fixtures" / "node.exe",
+            api_key_file=Path(__file__).resolve().parent / "fixtures" / "not-read.key",
             expected_account_id=CONTEXT.remote_account_id,
         )
 
