@@ -556,9 +556,12 @@ async def test_fresh_v3_native_accounting_receipts_concurrency_and_loss_floor():
                 flush=True,
             )
             return
+        # Prepare sequentially: both fixtures audit immutable Risk rows through
+        # the same owner connection, which cannot run overlapping operations.
+        # Each prepare still races its independently pooled publication replays.
+        pairs = [await prepare(3), await prepare(4)]
         # Actual same-account concurrent reservations: exactly one fits. Risk
         # and notional totals are serialized under the shared account lock.
-        pairs = await asyncio.gather(prepare(3), prepare(4))
         outcomes = await asyncio.gather(*(reserve(pair) for pair in pairs), return_exceptions=True)
         assert sum(value is None for value in outcomes) == 1
         assert sum(isinstance(value, ProductionStateError) for value in outcomes) == 1
