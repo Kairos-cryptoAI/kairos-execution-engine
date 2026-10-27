@@ -47,6 +47,25 @@ from tests.test_production_risk import _inputs
 TEST_SEED = bytes(range(32))  # Existing deterministic test-only vector; never a deployment key.
 
 
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"content_base64": None},
+        {"source_timestamp_ms": 200},
+        {"requested_at_ms": 200},
+        {"persisted_at_ms": 200},
+        {"parent_receipt_ids": ["same-parent", "same-parent"]},
+        {"output_origin": "NATIVE_MODEL"},
+    ],
+)
+def test_stage_model_itself_keeps_original_content_clock_and_origin_guards(updates):
+    """New helper functions must not detach the original Pydantic validator."""
+    payload = _receipt("BINANCE_REFERENCE", b"{}", 100, 130).model_dump(mode="json")
+    payload.update(updates)
+    with pytest.raises(ValueError):
+        LiveInputStageReceiptV1.model_validate(payload)
+
+
 def _trust(scope):
     return LiveInputProducerTrustV1(
         producer_id="synthetic-producer",
@@ -553,6 +572,35 @@ def test_each_required_stage_must_be_present(missing_stage):
     incomplete = _resign(proof.model_copy(update={"stages": remaining}))
     with pytest.raises(ValueError, match="required upstream stages"):
         _verify(verifier, incomplete, review, venue, scope, decided_ms)
+
+
+def test_current_native_quant_profile_refuses_signed_envelope_without_raw_lineage_stages():
+    _verifier_unused, proof, _context, review, venue, scope, decided_ms = _signed_fixture()
+    base_trust = _trust(scope)
+    replay_profile = {
+        "price_window": 200,
+        "depth_levels": 10,
+        "snapshot_interval_ms": 5_000,
+        "kline_finality_delay_ms": 5_000,
+        "maximum_binance_future_skew_ms": 2_000,
+        "book_stale_after_ms": 10_000,
+        "kline_stale_after_ms": 90_000,
+        "derivatives_stale_after_ms": 180_000,
+    }
+    current_trust = base_trust.model_copy(
+        update={
+            "native_market_sources_required": True,
+            "native_quant_replay_profile": replay_profile,
+        }
+    )
+    private = Ed25519PrivateKey.from_private_bytes(TEST_SEED)
+    public = private.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    verifier = LiveInputsSourceVerifier(trust=current_trust, public_key=public)
+    with pytest.raises(ValueError, match="requires exactly one captured MARKET_SOURCE"):
+        _verify(verifier, proof, review, venue, scope, decided_ms)
 
 
 def test_text_source_original_30_minute_ttl_is_checked_at_capture_not_retimed():

@@ -402,8 +402,48 @@ macro/onchain factors stay unavailable. Native model output is joined back to
 the exact original context prompt and native response transform.
 
 These APIs do not solve the remaining real source admission. Raw market/bar
-authentication, independently accepted producer identity, account/exposure,
+authentication and acceptance, independently accepted producer identity, account/exposure,
 protective lineage, fee/funding finality, real private-event recovery and accepted
 PROD signing/order semantics remain required. No default LIVE CLI/Compose route,
 database, consumer, retired CURRENT owner, real order or paid model is activated.
 Strategy selection is deliberately not part of this wiring change.
+
+### Current Quant source lineage and pre-model checks
+
+The optional Quant capture path now retains original bounded Binance REST
+entities and WebSocket text before parsing, plus the exact emitted closed-bar
+and market DTOs. Closed bars keep both distinct REST confirmation records;
+their finality cut is the original second response receipt. A separate derived
+output clock records publication after the raw records are persisted; neither
+the original receive clock nor Core's bar-close timestamp is rewritten.
+
+The source projector reads the complete original parent closure and uses the
+existing Quant collector/SnapshotBuilder replay. It requires the captured bar
+prefix since builder reset, not a guessed indicator state from a truncated
+window. Missing restart history, reconnect lineage conflicts, altered metadata,
+post-output persistence, incomplete parents and oversized bundles refuse. OI
+exchange-sample age and local response freshness remain distinct checks under
+the existing collector policy.
+
+For this explicit current profile, deployment must pin
+`native_market_sources_required=true` and the exact
+`native_quant_replay_profile` in the producer trust. The independent input
+verifier requires both self-contained `MARKET_SOURCE` and `CLOSED_BAR_SOURCE`
+bundles and replays their signed raw ancestry against the exact consumer DTOs.
+Legacy profiles retain their old contract; they do not silently acquire this
+new qualification.
+
+The actual composer must receive
+`make_native_market_bar_preflight(reader, profile)` before `compose`: this
+checks original market/bar lineage before claims or Text/model work. The new
+preparer requires its exact selection digest and rechecks the sources before
+returning an unsigned envelope. A generic composer without that hook is not a
+deployed current-profile pre-model gate. The broad composer fixture explicitly
+mocks numerical replay over synthetic inputs; it tests wiring/signatures, not
+real source truth or trading. Quant's numerical replay and any separate bounded
+public-source observation are distinct evidence.
+
+No producer identity, source acceptance, strategy, owner arm, account authority,
+continuous service, real order or paid model call is created by this change.
+In particular, the refused IOC-limit contract and unqualified EVEDEX private
+recovery/settlement/signing requirements still block real-money deployment.

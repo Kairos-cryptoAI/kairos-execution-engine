@@ -37,6 +37,7 @@ from .production_native_inputs import (
     prepare_native_input_envelope,
     read_native_budgeted_call,
 )
+from .production_native_market_sources import project_native_market_bar_stages
 from .production_native_source_stages import (
     NativeMacroStageProjection,
     NativeSourceStageProjection,
@@ -123,6 +124,7 @@ class NativeProductionInputPreparer:
         trust: LiveInputProducerTrustV1,
         scope: LiveRiskScopeV1,
         venue_policy: VenueGatePolicy,
+        quant_replay_profile: dict[str, int],
         clock_ms: Any,
     ) -> None:
         from kairos_quant.runtime_venue_gate import VenueGatePolicy
@@ -132,8 +134,23 @@ class NativeProductionInputPreparer:
             or type(reader) is not NativeCaptureSessionReader
             or sink.directory != reader.directory
             or type(trust) is not LiveInputProducerTrustV1
+            or trust.native_market_sources_required is not True
+            or trust.native_quant_replay_profile != quant_replay_profile
             or type(scope) is not LiveRiskScopeV1
             or type(venue_policy) is not VenueGatePolicy
+            or not isinstance(quant_replay_profile, dict)
+            or set(quant_replay_profile)
+            != {
+                "price_window",
+                "depth_levels",
+                "snapshot_interval_ms",
+                "kline_finality_delay_ms",
+                "maximum_binance_future_skew_ms",
+                "book_stale_after_ms",
+                "kline_stale_after_ms",
+                "derivatives_stale_after_ms",
+            }
+            or any(type(value) is not int or value <= 0 for value in quant_replay_profile.values())
             or not callable(clock_ms)
         ):
             raise TypeError("exact native store, pinned trust/scope, venue policy and clock are required")
@@ -142,6 +159,7 @@ class NativeProductionInputPreparer:
         self.trust = trust
         self.scope = scope
         self.venue_policy = venue_policy
+        self.quant_replay_profile = dict(quant_replay_profile)
         self.clock_ms = clock_ms
         self._last_ms: int | None = None
         self._validate_trust_scope()
@@ -207,6 +225,13 @@ class NativeProductionInputPreparer:
             or any(type(pair) is not NativeCallRecordPair for pair in calls)
         ):
             raise TypeError("exact native composition, capture selection and explicit mode are required")
+        if (
+            not isinstance(composition.native_market_bar_preflight_sha256, str)
+            or len(composition.native_market_bar_preflight_sha256) != 64
+        ):
+            raise NativeProducerPreparationError(
+                "original Quant market/bar lineage must pass the pre-model composition preflight"
+            )
         intent = composition.review.intent
         venue_symbol = self.scope.venue_symbol_for(intent.symbol)
         from kairos_quant.runtime_venue_gate import PROD_SYMBOL_MAP
@@ -242,6 +267,15 @@ class NativeProductionInputPreparer:
             observation_id=selection.binance_observation_id,
             expected_symbol=binance_symbol,
         )
+        market_bar_projection = project_native_market_bar_stages(
+            reader=self.reader,
+            context=composition.context,
+            expected_replay_profile=self.quant_replay_profile,
+        )
+        if composition.native_market_bar_preflight_sha256 != market_bar_projection.selection_sha256:
+            raise NativeProducerPreparationError(
+                "pre-model Quant source selection differs from the post-composition replay"
+            )
 
         macro_projection: NativeMacroStageProjection | None = None
         if composition.allocation is None:
@@ -263,7 +297,7 @@ class NativeProductionInputPreparer:
         binance_capture = self._read_selected(selection.binance_observation_id)
         evedex_book, evedex_elapsed = self._evedex_book(evedex_capture.record, venue_symbol)
         binance_book, binance_elapsed = self._binance_book(binance_capture.record, binance_symbol)
-        raw_source_stages = (*source_projection.stages, binance_stage)
+        raw_source_stages = (*source_projection.stages, binance_stage, *market_bar_projection.stages)
         pre_venue_projection = project_native_composition_stages(
             composition=composition,
             reader=self.reader,

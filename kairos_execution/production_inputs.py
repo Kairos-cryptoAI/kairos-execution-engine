@@ -15,6 +15,7 @@ import base64
 import binascii
 import hashlib
 import json
+import re
 from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from typing import Literal
@@ -22,7 +23,9 @@ from typing import Literal
 from kairos_core.contracts import (
     CandidateReviewV1,
     CandidateRouteV1,
+    ClosedBarEventV1,
     EvidenceReferenceV1,
+    MarketSnapshot,
     SentimentSignal,
     StrategicAllocation,
     VenueQualityV1,
@@ -31,6 +34,7 @@ from kairos_core.contracts import (
 )
 from kairos_core.contracts.decision_context import DecisionContextV1
 from kairos_core.enums import EvedexProfile, SystemMode
+from kairos_core.topics import Topics
 from kairos_risk.live import (  # type: ignore[import-untyped]
     LiveRiskScopeV1,
     VerifiedLiveInputsV1,
@@ -52,6 +56,18 @@ _VENUE_TTL_MS = 2_000
 _TEXT_TTL_MS = 30 * 60 * 1_000
 _TEXT_PLANNING_TTL_MS = 10 * 60 * 1_000
 _ALLOCATION_TTL_MS = 26 * 60 * 60 * 1_000
+_NATIVE_QUANT_REPLAY_PROFILE_FIELDS = {
+    "price_window",
+    "depth_levels",
+    "snapshot_interval_ms",
+    "kline_finality_delay_ms",
+    "maximum_binance_future_skew_ms",
+    "book_stale_after_ms",
+    "kline_stale_after_ms",
+    "derivatives_stale_after_ms",
+}
+_QUANT_RAW_DOMAIN = b"kairos.quant-source-capture.v1\x00"
+_QUANT_OUTPUT_DOMAIN = b"kairos.quant-derived-market-event.v1\x00"
 _REQUIRED_STAGES = {
     "TEXT_SOURCE",
     "TEXT_AGGREGATE",
@@ -101,6 +117,10 @@ class LiveInputProducerTrustV1(StrictRecord):
     capture_implementation_id: str = Field(min_length=1, max_length=160, pattern=r"^[A-Za-z0-9_.:-]+$")
     capture_implementation_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     registration_id: str = Field(min_length=1, max_length=160, pattern=r"^[A-Za-z0-9_.:-]+$")
+    # Historical v1 source profiles retain their existing contract. New native
+    # Quant capture profiles must explicitly require and pin this lineage.
+    native_market_sources_required: bool = False
+    native_quant_replay_profile: dict[str, int] | None = None
 
     @model_validator(mode="after")
     def validate_text_sources(self) -> LiveInputProducerTrustV1:
@@ -108,6 +128,25 @@ class LiveInputProducerTrustV1(StrictRecord):
             raise ValueError("pinned Text source names must be normalized")
         if len(set(self.expected_text_source_names)) != len(self.expected_text_source_names):
             raise ValueError("pinned Text source names cannot repeat")
+        if self.native_market_sources_required != (self.native_quant_replay_profile is not None):
+            raise ValueError("native market source requirement and replay profile must be paired")
+        profile = self.native_quant_replay_profile
+        if profile is not None and (
+            set(profile) != _NATIVE_QUANT_REPLAY_PROFILE_FIELDS
+            or any(type(value) is not int or value < 0 for value in profile.values())
+            or any(
+                profile[key] <= 0
+                for key in (
+                    "price_window",
+                    "depth_levels",
+                    "snapshot_interval_ms",
+                    "book_stale_after_ms",
+                    "kline_stale_after_ms",
+                    "derivatives_stale_after_ms",
+                )
+            )
+        ):
+            raise ValueError("pinned native Quant replay profile is malformed")
         return self
 
 
@@ -130,6 +169,11 @@ class LiveInputStageReceiptV1(StrictRecord):
         "MODEL_RESPONSE",
         "MODEL_ATTEMPT_RECORD",
         "MODEL_COMPLETION_RECORD",
+        # Optional native-only lineage stages. Historical v1 envelopes remain
+        # valid without them; NativeProductionInputPreparer requires them before
+        # it creates any new preparation from Quant captures.
+        "MARKET_SOURCE",
+        "CLOSED_BAR_SOURCE",
     ]
     receipt_id: str = Field(min_length=1, max_length=160, pattern=r"^[A-Za-z0-9_.:-]+$")
     source_name: str | None = Field(default=None, min_length=1, max_length=160)
@@ -252,6 +296,443 @@ class LiveInputStageReceiptV1(StrictRecord):
         if self.stage not in {"TEXT_AGGREGATE", "MACRO_ALLOCATION"} and self.parent_receipt_ids:
             raise ValueError("only aggregate/allocation stages can reference source receipt parents")
         return self
+
+
+def _validate_native_market_source_stages(
+    *,
+    envelope: SignedLiveInputsEnvelopeV1,
+    by_stage: Mapping[str, list[LiveInputStageReceiptV1]],
+    content_by_stage_id: Mapping[str, bytes],
+    trust: LiveInputProducerTrustV1,
+) -> None:
+    """Require current native Quant profile stages and exact context linkage.
+
+    The producer-side NativeCaptureSessionReader performs full raw-parent replay
+    before signing. This downstream check independently binds those replay
+    outputs and their declared ancestry to the exact first-received consumer
+    DTOs; the pinned trust profile keeps historical v1 registrations intact.
+    """
+    names = {"MARKET_SOURCE", "CLOSED_BAR_SOURCE"}
+    if not trust.native_market_sources_required:
+        if any(stage.stage in names for stage in envelope.stages):
+            raise ValueError("native market stages require an explicitly pinned native source profile")
+        return
+    if trust.native_quant_replay_profile is None:
+        raise ValueError("current native source profile lacks its pinned Quant replay settings")
+
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate native market lineage field")
+            value[key] = item
+        return value
+
+    def stage_bundle(name: str) -> tuple[LiveInputStageReceiptV1, dict[str, object]]:
+        values = by_stage.get(name, [])
+        if len(values) != 1 or values[0].status != "CAPTURED":
+            raise ValueError(f"current native source profile requires exactly one captured {name} stage")
+        receipt = values[0]
+        if receipt.source_name != "BINANCE_UM_NATIVE_REPLAY":
+            raise ValueError(f"{name} source identity differs from the fixed native Quant replay")
+        raw = content_by_stage_id[receipt.receipt_id]
+        try:
+            bundle = json.loads(raw, object_pairs_hook=unique_object)
+        except (TypeError, ValueError, UnicodeError) as exc:
+            raise ValueError(f"{name} lineage bundle is malformed") from exc
+        if (
+            not isinstance(bundle, dict)
+            or canonical_json_bytes(bundle) != raw
+            or set(bundle) != {"version", "outputs", "parent_records", "consumer_receipts"}
+            or bundle.get("version") != "kairos.native-market-bar-lineage.v1"
+            or not isinstance(bundle.get("outputs"), list)
+            or not isinstance(bundle.get("parent_records"), list)
+            or not isinstance(bundle.get("consumer_receipts"), list)
+            or receipt.receipt_id != f"native-{name.lower()}-{hashlib.sha256(raw).hexdigest()[:32]}"
+        ):
+            raise ValueError(f"{name} lineage bundle identity/schema is invalid")
+        return receipt, bundle
+
+    def source_record_map(bundle: dict[str, object]) -> dict[str, dict[str, object]]:
+        parent_records = bundle.get("parent_records")
+        if not isinstance(parent_records, list) or len(parent_records) > 2_000:
+            raise ValueError("native Quant source closure is missing or exceeds its fixed bound")
+        result: dict[str, dict[str, object]] = {}
+        for item in parent_records:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"observation_id", "record", "persistence_witness"}
+                or not isinstance(item["observation_id"], str)
+                or re.fullmatch(r"[a-f0-9]{32}", item["observation_id"]) is None
+                or not isinstance(item["record"], dict)
+                or not isinstance(item["persistence_witness"], dict)
+            ):
+                raise ValueError("native Quant parent evidence has an unexpected shape")
+            observation_id, record, witness = (
+                item["observation_id"],
+                item["record"],
+                item["persistence_witness"],
+            )
+            schema = record.get("schema_version")
+            if schema == "kairos.quant-source-capture.v1":
+                expected_id = hashlib.sha256(_QUANT_RAW_DOMAIN + canonical_json_bytes(record)).hexdigest()[
+                    :32
+                ]
+                received_at = record.get("received_at_ms")
+                expected_ack = received_at
+            elif schema == "kairos.quant-derived-market-event.v1":
+                kind, event_id = record.get("event_kind"), record.get("event_id")
+                expected_id = (
+                    hashlib.sha256(_QUANT_OUTPUT_DOMAIN + f"{kind}:{event_id}".encode()).hexdigest()[:32]
+                    if isinstance(kind, str) and isinstance(event_id, str)
+                    else ""
+                )
+                expected_ack = record.get("output_observed_at_ms")
+            else:
+                raise ValueError("native Quant parent has an unsupported record schema")
+            encoded = canonical_json_bytes(record)
+            if (
+                expected_id != observation_id
+                or set(witness)
+                != {
+                    "version",
+                    "purpose",
+                    "storage_layout",
+                    "observation_id",
+                    "record_sha256",
+                    "record_bytes",
+                    "acknowledged_at_ms",
+                }
+                or witness.get("observation_id") != observation_id
+                or witness.get("record_sha256") != hashlib.sha256(encoded).hexdigest()
+                or witness.get("record_bytes") != len(encoded)
+                or type(witness.get("acknowledged_at_ms")) is not int
+                or type(expected_ack) is not int
+                or witness["acknowledged_at_ms"] < expected_ack
+                or observation_id in result
+            ):
+                raise ValueError("native Quant parent identity or local persistence witness is invalid")
+            result[observation_id] = record
+        return result
+
+    def source_items(kind: str) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        source = next(item for item in envelope.context.sources if item.kind == kind)
+        if source.availability != "AVAILABLE" or source.payloads_json is None:
+            raise ValueError(f"current native source profile requires available {kind} consumer inputs")
+        try:
+            payload = json.loads(source.payloads_json, object_pairs_hook=unique_object)
+        except (TypeError, ValueError, UnicodeError) as exc:
+            raise ValueError(f"native DecisionContext {kind} payload is malformed") from exc
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"items"}
+            or not isinstance(payload["items"], list)
+        ):
+            raise ValueError(f"native DecisionContext {kind} payload has an unexpected shape")
+        if canonical_json_bytes(payload).decode("utf-8") != source.payloads_json:
+            raise ValueError(f"native DecisionContext {kind} payload is not canonical JSON")
+        if len(payload["items"]) != len(source.receipts):
+            raise ValueError(f"native DecisionContext {kind} receipts do not cover its DTOs")
+        return payload["items"], [receipt.model_dump(mode="json") for receipt in source.receipts]
+
+    def receipt_received_at(receipt: dict[str, object]) -> int:
+        value = receipt.get("received_at_ms")
+        if type(value) is not int:
+            raise ValueError("native consumer receipt receive clock is malformed")
+        return value
+
+    def output_record(entry: object) -> dict[str, object]:
+        if not isinstance(entry, dict) or not isinstance(entry.get("record"), dict):
+            raise ValueError("native market output record is malformed")
+        return entry["record"]
+
+    def output_observed_at(record: dict[str, object]) -> int:
+        value = record.get("output_observed_at_ms")
+        if type(value) is not int:
+            raise ValueError("native Quant output clock is malformed")
+        return value
+
+    def parent_records(bundle: dict[str, object]) -> list[dict[str, object]]:
+        values = bundle.get("parent_records")
+        if not isinstance(values, list) or any(not isinstance(value, dict) for value in values):
+            raise ValueError("native Quant parent records are malformed")
+        return values
+
+    def parent_witness(item: dict[str, object]) -> tuple[str, int]:
+        observation_id = item.get("observation_id")
+        witness = item.get("persistence_witness")
+        if not isinstance(observation_id, str) or not isinstance(witness, dict):
+            raise ValueError("native Quant parent persistence witness is malformed")
+        acknowledged_at = witness.get("acknowledged_at_ms")
+        if type(acknowledged_at) is not int:
+            raise ValueError("native Quant parent acknowledgement clock is malformed")
+        return observation_id, acknowledged_at
+
+    def verify_output(
+        entry: object,
+        *,
+        event_kind: str,
+        expected_payload: dict[str, object],
+        consumer_receipt: dict[str, object],
+    ) -> str:
+        if not isinstance(entry, dict) or set(entry) != {"observation_id", "record", "persistence_witness"}:
+            raise ValueError("native market output proof has an unexpected shape")
+        observation_id = entry["observation_id"]
+        record = entry["record"]
+        witness = entry["persistence_witness"]
+        output_observed_at_ms = record.get("output_observed_at_ms") if isinstance(record, dict) else None
+        consumer_received_at_ms = consumer_receipt.get("received_at_ms")
+        if (
+            not isinstance(observation_id, str)
+            or re.fullmatch(r"[a-f0-9]{32}", observation_id) is None
+            or not isinstance(record, dict)
+            or not isinstance(witness, dict)
+            or set(record)
+            != {
+                "schema_version",
+                "capture_scope",
+                "event_kind",
+                "event_id",
+                "event_sha256",
+                "event_payload",
+                "output_observed_at_ms",
+                "parents",
+                "replay_profile",
+            }
+            or record["schema_version"] != "kairos.quant-derived-market-event.v1"
+            or record["capture_scope"] != "native-quant-derived-output-not-authority"
+            or record["event_kind"] != event_kind
+            or record["event_payload"] != expected_payload
+            or record["event_sha256"] != hashlib.sha256(canonical_json_bytes(expected_payload)).hexdigest()
+            or type(output_observed_at_ms) is not int
+            or type(consumer_received_at_ms) is not int
+            or consumer_received_at_ms < output_observed_at_ms
+        ):
+            raise ValueError("Quant output does not bind the exact original consumer DTO/receive receipt")
+        event_id = (
+            expected_payload.get("message_id")
+            if event_kind == "MARKET_SNAPSHOT"
+            else expected_payload.get("bar_sha256")
+        )
+        if (
+            not isinstance(event_id, str)
+            or record["event_id"] != event_id
+            or observation_id
+            != hashlib.sha256(_QUANT_OUTPUT_DOMAIN + f"{event_kind}:{event_id}".encode()).hexdigest()[:32]
+        ):
+            raise ValueError("Quant output ID differs from its exact native event identity")
+        message: MarketSnapshot | ClosedBarEventV1
+        if event_kind == "MARKET_SNAPSHOT":
+            message = MarketSnapshot.model_validate(expected_payload)
+            event_at_ms = int(message.produced_at.timestamp() * 1_000)
+        else:
+            message = ClosedBarEventV1.model_validate(expected_payload)
+            event_at_ms = message.close_time_ms
+        produced_at_ms = int(message.produced_at.timestamp() * 1_000)
+        expected_topic = Topics.MARKET_SNAPSHOT if event_kind == "MARKET_SNAPSHOT" else Topics.CLOSED_BAR
+        consumer_ttl_ms = consumer_receipt.get("ttl_ms", 0)
+        if (
+            consumer_receipt.get("message_id") != message.message_id
+            or consumer_receipt.get("source") != message.source
+            or consumer_receipt.get("topic") != expected_topic
+            or consumer_receipt.get("content_sha256") != canonical_sha256(message)
+            or consumer_receipt.get("event_at_ms") != event_at_ms
+            or consumer_receipt.get("produced_at_ms") != produced_at_ms
+            or event_at_ms > produced_at_ms
+            or type(consumer_received_at_ms) is not int
+            or produced_at_ms > consumer_received_at_ms
+            or consumer_received_at_ms > envelope.context.captured_at_ms
+            or type(consumer_ttl_ms) is not int
+            or consumer_ttl_ms <= 0
+        ):
+            raise ValueError("native consumer receipt does not bind the exact original Quant DTO clocks")
+        if record["replay_profile"] != trust.native_quant_replay_profile:
+            raise ValueError("Quant output transform profile differs from pinned producer trust")
+        parents = record["parents"]
+        expected_parent_keys = (
+            {"depth_frame", "funding_source", "open_interest_source", "force_order_frames", "confirmed_bars"}
+            if event_kind == "MARKET_SNAPSHOT"
+            else {"rest_confirmations"}
+        )
+        if not isinstance(parents, dict) or set(parents) != expected_parent_keys:
+            raise ValueError("Quant output lacks its exact declared raw-source parent set")
+        if event_kind == "CLOSED_BAR":
+            confirmations = parents["rest_confirmations"]
+            if (
+                not isinstance(confirmations, list)
+                or len(confirmations) != 2
+                or len(set(confirmations)) != 2
+                or any(
+                    not isinstance(value, str) or re.fullmatch(r"[a-f0-9]{32}", value) is None
+                    for value in confirmations
+                )
+            ):
+                raise ValueError("closed-bar output does not retain two exact source confirmations")
+        else:
+
+            def ids(value: object, *, allow_empty: bool = False) -> list[str]:
+                values = [value] if isinstance(value, str) else value
+                if (
+                    not isinstance(values, list)
+                    or (not allow_empty and not values)
+                    or len(values) > 2_000
+                    or any(
+                        not isinstance(item, str) or re.fullmatch(r"[a-f0-9]{32}", item) is None
+                        for item in values
+                    )
+                    or len(values) != len(set(values))
+                ):
+                    raise ValueError("market output has malformed source parent IDs")
+                return values
+
+            ids(parents["depth_frame"])
+            ids(parents["funding_source"])
+            ids(parents["open_interest_source"])
+            ids(parents["force_order_frames"], allow_empty=True)
+            ids(parents["confirmed_bars"])
+        if (
+            set(witness)
+            != {
+                "version",
+                "purpose",
+                "storage_layout",
+                "observation_id",
+                "record_sha256",
+                "record_bytes",
+                "acknowledged_at_ms",
+            }
+            or witness["observation_id"] != observation_id
+            or witness["record_sha256"] != hashlib.sha256(canonical_json_bytes(record)).hexdigest()
+            or witness["record_bytes"] != len(canonical_json_bytes(record))
+            or type(witness["acknowledged_at_ms"]) is not int
+            or witness["acknowledged_at_ms"] < record["output_observed_at_ms"]
+            or type(consumer_received_at_ms) is not int
+            or witness["acknowledged_at_ms"] > consumer_received_at_ms
+        ):
+            raise ValueError("Quant output persistence witness is invalid")
+        return observation_id
+
+    market_source, market_bundle = stage_bundle("MARKET_SOURCE")
+    bar_source, bar_bundle = stage_bundle("CLOSED_BAR_SOURCE")
+    market_items, market_receipts = source_items("market")
+    bar_items, bar_receipts = source_items("closed_bars")
+    if (
+        market_bundle["consumer_receipts"] != market_receipts
+        or bar_bundle["consumer_receipts"] != bar_receipts
+    ):
+        raise ValueError("native source stages do not preserve the first consumer receipt clocks")
+    market_outputs = market_bundle["outputs"]
+    bar_outputs = bar_bundle["outputs"]
+    if (
+        not isinstance(market_outputs, list)
+        or not isinstance(bar_outputs, list)
+        or len(market_items) != 1
+        or len(market_outputs) != 1
+        or len(bar_items) != len(bar_outputs)
+    ):
+        raise ValueError("native source stages do not cover the exact market/bar context inputs")
+    market_id = verify_output(
+        market_outputs[0],
+        event_kind="MARKET_SNAPSHOT",
+        expected_payload=market_items[0],
+        consumer_receipt=market_receipts[0],
+    )
+    bar_ids = tuple(
+        verify_output(
+            entry,
+            event_kind="CLOSED_BAR",
+            expected_payload=payload,
+            consumer_receipt=receipt,
+        )
+        for entry, payload, receipt in zip(bar_outputs, bar_items, bar_receipts, strict=True)
+    )
+    market_output_entry = market_outputs[0]
+    if not isinstance(market_output_entry, dict) or not isinstance(market_output_entry.get("record"), dict):
+        raise ValueError("native market output record is malformed")
+    market_record = market_output_entry["record"]
+    market_parents = market_record.get("parents")
+    if not isinstance(market_parents, dict):
+        raise ValueError("native market output parents are malformed")
+    confirmed = market_parents.get("confirmed_bars")
+    if (
+        not isinstance(confirmed, list)
+        or len(bar_ids) > len(confirmed)
+        or confirmed[-len(bar_ids) :] != list(bar_ids)
+    ):
+        raise ValueError("market source parent history does not end with the exact consumer bar tail")
+    if (
+        market_source.received_at_ms != max(receipt_received_at(receipt) for receipt in market_receipts)
+        or bar_source.received_at_ms != max(receipt_received_at(receipt) for receipt in bar_receipts)
+        or market_source.source_timestamp_ms != market_record["output_observed_at_ms"]
+        or market_source.source_name != "BINANCE_UM_NATIVE_REPLAY"
+    ):
+        raise ValueError("native source stage clocks differ from original outputs/consumer receipts")
+    # Replay the same read-only Quant pipeline from the signed, create-only
+    # parent records. This means a valid producer signature alone cannot hide
+    # an omitted or substituted source capture under the current pinned profile.
+    try:
+        from kairos_quant.native_replay import (  # type: ignore[import-not-found,import-untyped]
+            replay_native_quant_event,
+        )
+
+        market_output = market_record
+        market_sources = source_record_map(market_bundle)
+        if any(
+            acknowledged_at > output_observed_at(market_output)
+            for item in parent_records(market_bundle)
+            for _observation_id, acknowledged_at in (parent_witness(item),)
+        ):
+            raise ValueError("native market ancestry was not durably persisted before snapshot publication")
+        market_sources[market_id] = market_output
+        if (
+            replay_native_quant_event(
+                event_kind="MARKET_SNAPSHOT",
+                expected_payload=market_items[0],
+                source_records=market_sources,
+                output_record=market_output,
+            )
+            != market_items[0]
+        ):
+            raise ValueError("native Quant market replay differs from its consumer DTO")
+        for item, payload in zip(bar_outputs, bar_items, strict=True):
+            output = output_record(item)
+            if not isinstance(item, dict) or not isinstance(item.get("observation_id"), str):
+                raise ValueError("native closed-bar output identity is malformed")
+            output_id = item["observation_id"]
+            bar_sources = source_record_map(bar_bundle)
+            output_parents = output.get("parents")
+            if not isinstance(output_parents, dict):
+                raise ValueError("native closed-bar output parents are malformed")
+            confirmation_ids = output_parents.get("rest_confirmations")
+            if not isinstance(confirmation_ids, list) or any(
+                not isinstance(value, str) for value in confirmation_ids
+            ):
+                raise ValueError("native closed-bar confirmation IDs are malformed")
+            parent_witnesses = {
+                observation_id: acknowledged_at
+                for parent in parent_records(bar_bundle)
+                for observation_id, acknowledged_at in (parent_witness(parent),)
+            }
+            if any(
+                parent_witnesses.get(parent_id, output_observed_at(output) + 1) > output_observed_at(output)
+                for parent_id in confirmation_ids
+            ):
+                raise ValueError("native closed-bar confirmations were not durable before publication")
+            bar_sources[output_id] = output
+            if (
+                replay_native_quant_event(
+                    event_kind="CLOSED_BAR",
+                    expected_payload=payload,
+                    source_records=bar_sources,
+                    output_record=output,
+                )
+                != payload
+            ):
+                raise ValueError("native Quant closed-bar replay differs from its consumer DTO")
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("current native Quant sources could not be independently replayed") from exc
 
 
 class SignedLiveInputsEnvelopeV1(StrictRecord):
@@ -602,6 +1083,12 @@ class LiveInputsSourceVerifier:
                 except (TypeError, json.JSONDecodeError) as exc:
                     raise ValueError("text aggregate is not a valid native Text output") from exc
             content_by_stage_id[stage.receipt_id] = raw
+        _validate_native_market_source_stages(
+            envelope=envelope,
+            by_stage=by_stage,
+            content_by_stage_id=content_by_stage_id,
+            trust=trust,
+        )
         context_macro = next(source for source in envelope.context.sources if source.kind == "macro")
         if allocation is None:
             if context_macro.availability != "UNAVAILABLE":

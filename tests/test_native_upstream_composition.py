@@ -170,7 +170,7 @@ def _native_calls(sink):
     return groups
 
 
-def _native(monkeypatch, *, news_after_intent=False):
+def _native(monkeypatch, *, news_after_intent=False, market_bar_preflight=None, emission_sink=None):
     _verifier, _proof, original_context, review, _venue, _scope, _old_now = _signed_fixture()
     # Explicit synthetic closed-minute clock: native intent/context contracts
     # require the decision to be the exact minute close, never a made-up tail.
@@ -261,7 +261,7 @@ def _native(monkeypatch, *, news_after_intent=False):
             return Response()
 
     monkeypatch.setattr("kairos_text.sources.rss.aiohttp.ClientSession", Session)
-    sink, claims, gateway = _Sink(), _Claims(), _ScriptedGateway()
+    sink, claims, gateway = emission_sink or _Sink(), _Claims(), _ScriptedGateway()
 
     def clock():
         return now
@@ -297,6 +297,7 @@ def _native(monkeypatch, *, news_after_intent=False):
         emission_sink=sink,
         clock_ms=clock,
         entry_interlock=lambda: interlock[0],
+        market_bar_preflight=market_bar_preflight,
         composition_scope="synthetic-composition",
         text_scope="synthetic-text",
     )
@@ -345,6 +346,18 @@ async def test_native_market_bar_selection_preserves_original_receive_receipts(m
     for kind, original_time in (("market", original_market_time), ("closed_bars", original_bar_time)):
         source = next(source for source in result.context.sources if source.kind == kind)
         assert source.receipts[0].received_at_ms == original_time
+
+
+async def test_market_source_preflight_refusal_happens_before_claims_or_model_calls(monkeypatch):
+    def refuse_preflight(*_args):
+        raise NativeCompositionRefused("synthetic raw-source lineage refusal")
+
+    composer, kwargs, sink, claims, gateway, _interlock = _native(
+        monkeypatch, market_bar_preflight=refuse_preflight
+    )
+    with pytest.raises(NativeCompositionRefused, match="synthetic raw-source lineage refusal"):
+        await composer.compose(**kwargs)
+    assert not claims.claimed and not gateway.calls and not sink.records
 
 
 async def test_actual_native_sequence_retains_sources_outputs_and_never_promotes_live(monkeypatch):

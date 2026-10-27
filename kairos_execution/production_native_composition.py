@@ -85,6 +85,9 @@ class NativeUpstreamCompositionResult:
     allocation: StrategicAllocation | None
     text_signals: tuple[SentimentSignal, ...]
     emission_records: tuple[bytes, ...]
+    # Exact raw Quant source replay performed before claims/model work; not a
+    # readiness or authority receipt.
+    native_market_bar_preflight_sha256: str | None = None
     # Engineering composition is not producer acceptance or execution authority.
     live_ready: Literal[False] = field(default=False, init=False)
     policy: Literal["REJECT_ALL"] = field(default="REJECT_ALL", init=False)
@@ -144,6 +147,7 @@ class NativeUpstreamComposer:
         emission_sink: NativeEmissionSink,
         clock_ms: Callable[[], int],
         entry_interlock: Callable[[], bool],
+        market_bar_preflight: Callable[..., str] | None = None,
         composition_scope: str,
         text_scope: str,
     ) -> None:
@@ -195,6 +199,7 @@ class NativeUpstreamComposer:
             or composition_scope == text_scope
             or not callable(clock_ms)
             or not callable(entry_interlock)
+            or (market_bar_preflight is not None and not callable(market_bar_preflight))
             or not callable(getattr(claims, "claim_batch", None))
             or not callable(getattr(claims, "complete_batch", None))
             or not callable(getattr(emission_sink, "create_only", None))
@@ -213,6 +218,7 @@ class NativeUpstreamComposer:
         self.sink = emission_sink
         self.clock_ms = clock_ms
         self.interlock = entry_interlock
+        self.market_bar_preflight = market_bar_preflight
         self.composition_scope = composition_scope
         self.text_scope = text_scope
         self._previous_ms: int | None = None
@@ -342,6 +348,29 @@ class NativeUpstreamComposer:
             raise NativeCompositionRefused(
                 "original retained market/bar observations are missing, changed or expired"
             ) from None
+        preflight_sha256 = None
+        if self.market_bar_preflight is not None:
+            preflight_sha256 = self.market_bar_preflight(
+                market,
+                bars,
+                market_receipt,
+                bar_receipts,
+                now,
+            )
+            if inspect.isawaitable(preflight_sha256):
+                close = getattr(preflight_sha256, "close", None)
+                if callable(close):
+                    close()
+                raise NativeCompositionRefused("native Quant source preflight must be local and synchronous")
+            if (
+                not isinstance(preflight_sha256, str)
+                or len(preflight_sha256) != 64
+                or any(character not in "0123456789abcdef" for character in preflight_sha256)
+            ):
+                raise NativeCompositionRefused(
+                    "native Quant source preflight returned no exact selection digest"
+                )
+            self._check(deadline)
         attempt = hashlib.sha256(intent.canonical_intent_bytes()).hexdigest()
         async with asyncio.timeout((deadline - now) / 1_000):
             if await self._claim(self.composition_scope, (attempt,), attempt, deadline) != (attempt,):
@@ -460,6 +489,7 @@ class NativeUpstreamComposer:
                 allocation,
                 signals,
                 tuple(records),
+                preflight_sha256,
             )
 
 
