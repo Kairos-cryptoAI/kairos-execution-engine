@@ -340,8 +340,12 @@ strategy, start a source consumer, mint safety receipts or arm a real account.
 The ordinary LIVE CLI/Compose rejection is unchanged. Real private-event
 authentication/recovery, fee/funding finality and current signing-domain and
 order-semantics acceptance remain external source-contract requirements.
-In particular, official order documentation describes limit orders as GTC;
-unsigned IOC metadata is not accepted here as a cryptographic venue guarantee.
+In particular, [official order documentation](https://docs.evedex.com/developers/developers/order_creation)
+describes limit orders as GTC and says that this cannot be changed via API.
+The PROD Python and SDK-sidecar mutation boundaries now refuse the existing
+IOC-limit payload before invoking the SDK. They do not translate it to GTC or
+market IOC; this closes an unsupported dispatch path, not the broader
+order-semantics or LIVE-readiness gate.
 
 Legacy manually assembled lifecycle callers may omit the stager, preserving
 existing tests and PAPER behavior. The unified coordinator refuses that

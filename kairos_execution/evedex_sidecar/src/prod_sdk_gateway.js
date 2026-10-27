@@ -325,6 +325,9 @@ function validateBody(path, body) {
   if (!/^0x[0-9a-fA-F]{130}$/.test(body.signature)) throw new TypeError("signed body signature is malformed");
   if (!/^[A-Z0-9]{1,32}$/.test(text(body.instrument, "instrument"))) throw new TypeError("instrument is malformed");
   if ("chainId" in body && body.chainId !== 42161) throw new TypeError("signed message chain differs from the pinned EVEDEX production chain");
+  if (path === "/api/v2/order/limit" && body.timeInForce === "IOC") {
+    throw new TypeError("official EVEDEX limit orders are GTC and cannot be changed via API; IOC limit dispatch is unsupported");
+  }
   if ("side" in body && !["BUY", "SELL"].includes(body.side)) throw new TypeError("signed side is malformed");
   if ("timeInForce" in body && body.timeInForce !== "IOC") throw new TypeError("only the pinned IOC policy is supported");
   for (const field of ["quantity", "limitPrice", "stopPrice", "cashQuantity", "price"]) {

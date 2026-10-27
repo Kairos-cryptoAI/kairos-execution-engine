@@ -293,6 +293,40 @@ async def test_transport_refuses_account_context_mismatch_and_chain_mismatch():
 
 
 @pytest.mark.asyncio
+async def test_transport_rejects_unsupported_limit_ioc_but_keeps_market_ioc():
+    client = FakeClient()
+    transport = ProductionEvedexTransport(context=CONTEXT, custody_binding=BINDING, client=client)
+    await transport.preflight()
+    market = {
+        "id": "market-1",
+        "instrument": "BTCUSD",
+        "side": "BUY",
+        "timeInForce": "IOC",
+        "leverage": 1,
+        "cashQuantity": "5",
+        "chainId": 42161,
+        "signature": "0x" + "12" * 65,
+    }
+    await transport.send_signed_post(method="POST", path="/api/v2/order/market", body=market)
+    assert client.calls[-1][0] == "signed"
+    calls_before_limit = len(client.calls)
+    limit = {
+        "id": "limit-1",
+        "instrument": "BTCUSD",
+        "side": "BUY",
+        "leverage": 1,
+        "quantity": "0.25",
+        "limitPrice": "60000",
+        "chainId": 42161,
+        "timeInForce": "IOC",
+        "signature": "0x" + "12" * 65,
+    }
+    with pytest.raises(ProductionTransportError, match="limit orders are GTC.*IOC limit.*unsupported"):
+        await transport.send_signed_post(method="POST", path="/api/v2/order/limit", body=limit)
+    assert len(client.calls) == calls_before_limit
+
+
+@pytest.mark.asyncio
 async def test_sdk_process_is_latched_after_unknown_transport_outcome():
     client = ProductionEvedexSdkClient(
         node_executable=Path(__file__).resolve().parent / "not-installed/node.exe",

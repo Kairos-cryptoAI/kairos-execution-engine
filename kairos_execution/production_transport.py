@@ -465,6 +465,11 @@ def _validate_signed_post(method: str, path: str, body: dict[str, Any]) -> tuple
         raise ProductionTransportError(
             "signed message chain does not match the pinned EVEDEX PROD chain 42161"
         )
+    if path == "/api/v2/order/limit" and body.get("timeInForce") == "IOC":
+        raise ProductionTransportError(
+            "official EVEDEX limit orders are GTC and cannot be changed via API; "
+            "IOC limit dispatch is unsupported"
+        )
     body_instrument = body.get("instrument")
     if not isinstance(body_instrument, str) or re.fullmatch(r"[A-Z0-9]{1,32}", body_instrument) is None:
         raise ProductionTransportError("signed instrument is malformed")

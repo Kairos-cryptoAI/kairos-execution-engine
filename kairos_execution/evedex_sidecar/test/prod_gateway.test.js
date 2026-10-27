@@ -9,8 +9,8 @@ const evedex = require("@evedex/exchange-bot-sdk");
 const axios = require("axios");
 
 const SIGNATURE = `0x${"12".repeat(65)}`;
+const limitIocCase = ["/api/v2/order/limit", { id: "entry-1", instrument: "BTCUSD", side: "BUY", leverage: 1, quantity: "0.25", limitPrice: "60000", chainId: 42161, timeInForce: "IOC", signature: SIGNATURE }, "createLimitOrderV2"];
 const cases = [
-  ["/api/v2/order/limit", { id: "entry-1", instrument: "BTCUSD", side: "BUY", leverage: 1, quantity: "0.25", limitPrice: "60000", chainId: 42161, timeInForce: "IOC", signature: SIGNATURE }, "createLimitOrderV2"],
   ["/api/v2/order/market", { id: "market-1", instrument: "BTCUSD", side: "BUY", timeInForce: "IOC", leverage: 1, cashQuantity: "100", chainId: 42161, signature: SIGNATURE }, "createMarketOrderV2"],
   ["/api/v2/order/stop-limit", { id: "stop-1", instrument: "BTCUSD", side: "BUY", leverage: 1, quantity: "0.25", limitPrice: "60000", stopPrice: "59000", chainId: 42161, signature: SIGNATURE }, "createStopLimitOrderV2"],
   ["/api/v2/position/BTCUSD/close", { id: "close-1", instrument: "BTCUSD", leverage: 1, quantity: "0.25", chainId: 42161, signature: SIGNATURE }, "closePositionV2"],
@@ -117,7 +117,7 @@ test("real pinned SDK Gateway uses isolated bounded HTTPS transport and x-api-ke
 
   assert.equal(requests.length, 2);
   assert.equal(requests[0].url, "https://trading-api.evedex.com/api/user/me");
-  assert.equal(requests[1].url, "https://trading-api.evedex.com/api/v2/order/limit");
+  assert.equal(requests[1].url, "https://trading-api.evedex.com/api/v2/order/market");
   for (const request of requests) {
     assert.equal(request.maxRedirects, 0);
     assert.equal(request.proxy, false);
@@ -176,6 +176,17 @@ test("passes exact pre-signed bodies through the corresponding SDK API method", 
     assert.equal(calls.at(-1)[1].signature, SIGNATURE);
   }
   assert.equal(calls.length, cases.length);
+  await gateway.close();
+});
+
+test("rejects unsupported limit IOC before invoking the SDK method", async () => {
+  const { gateway, calls } = fixture();
+  await gateway.preflight();
+  await assert.rejects(
+    gateway.sendSignedPost({ method: "POST", path: limitIocCase[0], body: limitIocCase[1] }),
+    /limit orders are GTC.*IOC limit.*unsupported/,
+  );
+  assert.deepEqual(calls, []);
   await gateway.close();
 });
 
