@@ -410,9 +410,12 @@ Strategy selection is deliberately not part of this wiring change.
 
 ### Current Quant source lineage and pre-model checks
 
-The optional Quant capture path now retains original bounded Binance REST
-entities and WebSocket text before parsing, plus the exact emitted closed-bar
-and market DTOs. Closed bars keep both distinct REST confirmation records;
+The optional Quant capture path retains original bounded Binance REST entities
+before parsing. Original WebSocket text is held in bounded memory before
+parsing; only the exact frame parents actually used by a snapshot are fsynced,
+before constructing/publishing that DTO. Unselected frames are not a durable
+complete-feed tape. The exact emitted closed-bar and market DTOs are also
+retained. Closed bars keep both distinct REST confirmation records;
 their finality cut is the original second response receipt. A separate derived
 output clock records publication after the raw records are persisted; neither
 the original receive clock nor Core's bar-close timestamp is rewritten.
