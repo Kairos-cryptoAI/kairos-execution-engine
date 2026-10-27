@@ -22,6 +22,7 @@ from kairos_execution.production_assembly import (
 )
 from kairos_execution.production_claims import PostgresProductionClaims
 from kairos_execution.production_dispatch import ProductionEffectDispatcher
+from kairos_execution.production_host import ProductionHost, build_production_host
 from kairos_execution.production_readiness import canonical_digest
 from kairos_execution.production_runtime import ProductionExecutionRuntime
 from kairos_execution.production_state import (
@@ -223,6 +224,85 @@ def test_actual_concrete_constructor_graph_builds_without_source_or_store_io():
     assert provider.calls == backend.calls == []
     assert client._process is None and not client._preflight_complete
     assert not transport._preflight_complete
+
+
+def test_canonical_host_frontdoor_builds_the_exact_concrete_graph_without_start_or_io():
+    resources, pools, provider, backend, client, transport = concrete_resources()
+
+    async def original_entry_provider():
+        raise AssertionError("host construction must not invoke the original-entry provider")
+
+    async def terminal_evidence_provider(_trade_id, _source_id):
+        raise AssertionError("host construction must not request terminal evidence")
+
+    host = build_production_host(
+        resources,
+        entry_provider=original_entry_provider,
+        terminal_evidence_provider=terminal_evidence_provider,
+        terminal_source_id=provider.source_id,
+    )
+
+    assert type(host) is ProductionHost
+    assembly = host.assembly
+    assert assembly.status == ProductionAssemblyStatus()
+    assert host.status.started is False
+    assert host.status.start_attempted is False
+    assert host.status.readiness is False
+    assert assembly.runtime is resources.runtime
+    assert assembly.coordinator.runtime is assembly.runtime
+    assert assembly.engine.production_runtime is assembly.runtime
+    assert assembly.reads.client is transport.client is client
+    assert assembly.entry_risk.evaluator is resources.risk_evaluator
+    assert assembly.entry_risk.lifecycle_bindings is assembly.lifecycle_adapter.bindings
+    assert assembly.exit_risk.lifecycle_bindings is assembly.lifecycle_adapter.bindings
+    assert assembly.engine.trades is resources.trades
+    assert assembly.engine.effects is resources.effects
+    assert assembly.engine.trades.pool is assembly.engine.effects.pool is resources.runtime.state_source.pool
+    assert assembly.engine.clock is assembly.reconciler._clock is resources.clock
+    assert assembly.reconciler.pool is resources.reconciliation_pool
+    assert assembly.accounting.pool is resources.accounting_pool
+    assert all(pool.calls == [] for pool in pools)
+    assert provider.calls == backend.calls == []
+    assert client._process is None and not client._preflight_complete
+    assert not transport._preflight_complete
+
+
+@pytest.mark.parametrize("corruption", ["clock", "symbols"])
+def test_canonical_host_frontdoor_rejects_bad_resources_before_host_or_provider_effects(
+    monkeypatch,
+    corruption,
+):
+    resources, pools, provider, backend, *_ = concrete_resources()
+    if corruption == "clock":
+        resources = replace(resources, clock=Clock(resources.clock()))
+    else:
+        resources = replace(
+            resources,
+            risk_evaluator=LiveRiskEvaluator(
+                LiveRiskScopeV1.model_validate(
+                    resources.risk_evaluator.scope.model_dump()
+                    | {"approved_prod_symbols": (("BTCUSDT", "ETHUSD"),)}
+                ),
+                resources.risk_evaluator.limits,
+                require_instrument_rules=True,
+            ),
+        )
+
+    def forbidden_host_constructor(*_args, **_kwargs):
+        raise AssertionError("invalid resources must fail before the host is constructed")
+
+    monkeypatch.setattr("kairos_execution.production_host.ProductionHost", forbidden_host_constructor)
+
+    with pytest.raises(ProductionAssemblyError):
+        build_production_host(
+            resources,
+            entry_provider=lambda: None,
+            terminal_evidence_provider=lambda _trade_id, _source_id: None,
+            terminal_source_id=provider.source_id,
+        )
+
+    assert all(pool.calls == [] for pool in pools)
+    assert provider.calls == backend.calls == []
 
 
 def test_different_clock_instance_is_rejected_with_actual_constructor_resources():

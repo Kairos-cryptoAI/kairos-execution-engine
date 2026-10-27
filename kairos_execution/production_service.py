@@ -67,6 +67,9 @@ class ProductionServiceStatus:
     entry_policy: Literal["REJECT_ALL", "EXTERNAL_ADMISSION_REQUIRED"]
     cleanup_unresolved: bool
     readiness: Literal[False] = False
+    entry_worker_running: bool = False
+    lifecycle_worker_running: bool = False
+    closing: bool = False
 
 
 @dataclass(slots=True)
@@ -145,7 +148,38 @@ class ProductionServiceDriver:
             entries_blocked=self._entries_blocked,
             entry_policy="REJECT_ALL" if self._entries_blocked else "EXTERNAL_ADMISSION_REQUIRED",
             cleanup_unresolved=self._cleanup_unresolved,
+            entry_worker_running=self._worker_task is not None and not self._worker_task.done(),
+            lifecycle_worker_running=self._lifecycle_task is not None and not self._lifecycle_task.done(),
+            closing=self._closing,
         )
+
+    def block_new_entries(self, reason_code: str) -> ProductionServiceStatus:
+        """One-way host interlock; never stop protective maintenance or rearm.
+
+        Only bounded public reason codes are accepted. Raw exception or source
+        payloads do not belong in service status. Closing admission cannot make
+        an unknown operation safe, cancel an existing position or release risk.
+        """
+        if not isinstance(reason_code, str) or re.fullmatch(r"[A-Z][A-Z0-9_]{0,95}", reason_code) is None:
+            raise ValueError("a bounded public uppercase reason code is required")
+        self._unknown(reason_code)
+        return self.status
+
+    def check_health(self) -> ProductionServiceStatus:
+        """Latch new entries closed if a background worker has disappeared.
+
+        A `started` flag alone is not proof that execution maintenance is alive.
+        This check never replaces a task or retries recovery and deliberately
+        leaves any surviving protective maintenance running.
+        """
+        current = self.status
+        if (
+            current.started
+            and not current.closing
+            and (not current.entry_worker_running or not current.lifecycle_worker_running)
+        ):
+            self._unknown("SERVICE_BACKGROUND_WORKER_STOPPED")
+        return self.status
 
     def _unknown(self, reason: str) -> None:
         self._entries_blocked = True

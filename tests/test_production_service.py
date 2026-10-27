@@ -83,11 +83,67 @@ async def test_startup_recovery_precedes_processing_and_default_is_reject_all():
         assert status.entries_blocked
         assert status.entry_policy == "REJECT_ALL"
         assert status.readiness is False
+        assert status.entry_worker_running and status.lifecycle_worker_running
+        assert not status.closing
         with pytest.raises(ProductionServiceError, match="entries are blocked"):
             await driver.submit(envelope())
         assert not any(call[0] == "entry" for call in coordinator.calls)
     finally:
         await driver.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("worker", ["entry", "lifecycle"])
+async def test_public_health_latches_missing_worker_without_replacing_surviving_task(worker):
+    coordinator = SyntheticCoordinator()
+    driver = ProductionServiceDriver(coordinator, entry_admission=lambda: True)
+    await driver.start()
+    killed = driver._worker_task if worker == "entry" else driver._lifecycle_task
+    survivor = driver._lifecycle_task if worker == "entry" else driver._worker_task
+    assert killed is not None and survivor is not None
+    killed.cancel()
+    await asyncio.gather(killed, return_exceptions=True)
+    try:
+        status = driver.check_health()
+        assert status.started and status.entries_blocked and not status.recovery_complete
+        assert status.recovery_blockers == ("SERVICE_BACKGROUND_WORKER_STOPPED",)
+        assert not survivor.done()
+        assert driver._worker_task is (killed if worker == "entry" else survivor)
+        assert driver._lifecycle_task is (survivor if worker == "entry" else killed)
+        with pytest.raises(ProductionServiceError, match="entries are blocked"):
+            await driver.submit(envelope())
+        assert not any(call[0] == "entry" for call in coordinator.calls)
+    finally:
+        await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_host_entry_block_is_one_way_and_keeps_maintenance_running():
+    coordinator = SyntheticCoordinator()
+    driver = ProductionServiceDriver(
+        coordinator, entry_admission=lambda: True, reconciliation_interval_s=0.01
+    )
+    await driver.start()
+    try:
+        status = driver.block_new_entries("HOST_INPUT_UNRESOLVED")
+        assert status.entries_blocked and not status.recovery_complete
+        assert status.entry_worker_running and status.lifecycle_worker_running
+        await asyncio.sleep(0.03)
+        assert any(call[0] == "reconcile" for call in coordinator.calls)
+        assert driver.check_health().entries_blocked
+        with pytest.raises(ProductionServiceError, match="entries are blocked"):
+            await driver.submit(envelope())
+    finally:
+        await driver.close()
+    assert driver.status.closing and not driver.status.started
+    assert not driver.status.entry_worker_running and not driver.status.lifecycle_worker_running
+
+
+@pytest.mark.parametrize("reason", ["", "private exception payload", "bad_code", "A" * 97, None, True])
+def test_host_entry_block_rejects_raw_or_unbounded_reason(reason):
+    driver = ProductionServiceDriver(SyntheticCoordinator())
+    with pytest.raises(ValueError, match="public uppercase reason"):
+        driver.block_new_entries(reason)
 
 
 @pytest.mark.asyncio
