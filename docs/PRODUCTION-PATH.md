@@ -354,3 +354,52 @@ it is not a production bypass or evidence of an actual account lifecycle.
 All readiness flags remain false and policy remains `REJECT_ALL`. This API and
 its isolated database acceptance establish engineering composition only, not
 profitability, real-venue acceptance, or permission to place a real order.
+
+### Canonical host and captured-input preparation
+
+`production_host.build_production_host` is the single construction front door
+for the same concrete resource graph. Construction performs no I/O or startup.
+The explicit seven-proof/owner-arm start is still one-shot; a changed arm,
+cancelled or unknown attempt cannot replace the driver. The host admits at most
+one original envelope, bound to the exact manual arm, and latches the actual
+driver's entry interlock closed on provider, worker or accounting uncertainty.
+Public worker-health fields distinguish live maintenance from a stale `started`
+flag. Surviving protective maintenance is not stopped just because entries close.
+
+After its exact owned trade naturally reaches the native terminal `FLAT` state,
+the running host polls only its fixed registered terminal source. An explicitly
+typed, bound `PendingTerminalEvidence` permits bounded read-only waiting; it is
+not terminal evidence and cannot release a reservation. The first final proof
+goes through the existing independent reconciler and accounting exactly once.
+Unknown completion stays fenced; there is no force-close, new arm, alternate
+source retry or automatic capital increase. Shutdown is bounded and unresolved
+cleanup is reported, not relabelled as a successful restart.
+
+`production_native_producer.NativeProductionInputPreparer` now joins the existing
+capture/session projectors, native Text/Router/review/context output and the
+existing unsigned input-envelope preflight. It selects exact retained RSS,
+EVEDEX instrument/depth, Binance depth and causal Macro input/output identities.
+It derives PROD venue quality through the existing Quant calculation from the
+actual selected book pair, persists that calculation with both raw parent
+digests, and never converts a DEV measurement into PROD. Existing thresholds
+and original intent, source, review and two-second execution clocks remain.
+Model evidence must be the original persisted budgeted call pair; caller capture
+times are not trusted. The result is **unsigned**, unregistered and non-authorizing.
+
+The public Binance adapter performs one fixed bounded unauthenticated depth GET,
+retains the exact original body and request/receive clocks through the existing
+create-only sink, and uses the original T/E source timestamp. No exchange/account
+credential is accepted by that adapter. Macro's new opt-in capture retains exact
+application context and allocation, with a stable source/message processing key
+claimed through the existing durable processing repository before model work.
+Capture/completion failure never releases or resets the claim/budget hold.
+Application context is not an official macroeconomic HTTP feed: unavailable
+macro/onchain factors stay unavailable. Native model output is joined back to
+the exact original context prompt and native response transform.
+
+These APIs do not solve the remaining real source admission. Raw market/bar
+authentication, independently accepted producer identity, account/exposure,
+protective lineage, fee/funding finality, real private-event recovery and accepted
+PROD signing/order semantics remain required. No default LIVE CLI/Compose route,
+database, consumer, retired CURRENT owner, real order or paid model is activated.
+Strategy selection is deliberately not part of this wiring change.
