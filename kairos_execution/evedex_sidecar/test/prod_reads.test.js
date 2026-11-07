@@ -22,6 +22,7 @@ test("real pinned SDK PROD read methods retain exact bodies and fixed GET querie
     ["open_orders", {}, "/api/order/opened", {}],
     ["instruments", {}, "/api/market/instrument", { fields: "metrics" }],
     ["depth", { instrument: "BTCUSD", max_level: 20 }, "/api/market/BTCUSD/deep", { maxLevel: "20" }],
+    ["best_depth", { instrument: "BTCUSD" }, "/api/market/BTCUSD/deep", { marketLevel: "1" }],
   ];
   for (const [source, payload, path, query] of cases) {
     const capture = await gateway.fetchRawCapture({ source, ...payload });
@@ -35,7 +36,7 @@ test("real pinned SDK PROD read methods retain exact bodies and fixed GET querie
     assert.equal(new URL(request.url).origin, "https://trading-api.evedex.com");
     assert.equal(request.maxRedirects, 0);
     assert.equal(request.responseType, "arraybuffer");
-    if (source !== "instruments" && source !== "depth") {
+    if (source !== "instruments" && source !== "depth" && source !== "best_depth") {
       assert.equal(request.headers.get("x-api-key"), "offline-key");
     }
   }
@@ -45,6 +46,9 @@ test("real pinned SDK PROD read methods retain exact bodies and fixed GET querie
     { instrument: "BTCUSD", max_level: true }, { instrument: "BTCUSD", max_level: 101 },
   ]) {
     await assert.rejects(gateway.fetchRawCapture({ source: "depth", ...payload }), /malformed/);
+  }
+  for (const payload of [{ instrument: "../DEV" }, { instrument: "BTCUSD", max_level: 1 }]) {
+    await assert.rejects(gateway.fetchRawCapture({ source: "best_depth", ...payload }), /malformed/);
   }
   assert.equal(requests.length, count);
   await gateway.close();

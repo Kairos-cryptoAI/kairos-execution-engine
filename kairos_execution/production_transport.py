@@ -200,6 +200,14 @@ def _raw_capture_request(
         return history_payload, history_query
     if any(value is not None for value in (order_id, after, before, transfer_type)):
         raise ProductionTransportError("history parameters are not valid for this fixed source")
+    if source == "best_depth":
+        if (
+            not isinstance(instrument, str)
+            or re.fullmatch(r"[A-Z0-9]{1,32}", instrument) is None
+            or any(value is not None for value in (version, limit, offset, next_cursor, max_level))
+        ):
+            raise ProductionTransportError("raw best-depth query is outside the fixed read contract")
+        return {"source": source, "instrument": instrument}, {"marketLevel": 1}
     if source == "depth":
         if (
             not isinstance(instrument, str)
@@ -319,6 +327,13 @@ def parse_raw_response_capture(
             "/api/user/funding-transfer" if source == "funding_transfers" else "/api/fill",
             authorized_query,
         )
+    elif source == "best_depth":
+        if expected_query != {"marketLevel": 1}:
+            raise ProductionTransportError("raw best-depth query differs from the documented contract")
+        _, authorized_query = _raw_capture_request(
+            source, version=None, limit=None, offset=None, next_cursor=None, instrument=instrument
+        )
+        expected_path = (f"/api/market/{instrument}/deep", authorized_query)
     elif source == "depth":
         if set(expected_query) != {"maxLevel"}:
             raise ProductionTransportError("raw depth query is outside the fixed read contract")
@@ -982,6 +997,9 @@ class ProductionEvedexSdkClient:
         elif source == "depth":
             if set(payload) != {"source", "instrument", "max_level"}:
                 raise ProductionTransportError("raw depth capture fields differ from the fixed read contract")
+        elif source == "best_depth":
+            if set(payload) != {"source", "instrument"}:
+                raise ProductionTransportError("raw best-depth fields differ from the fixed read contract")
         elif source == "order_fills":
             if set(payload) != {"source", "order_id"}:
                 raise ProductionTransportError("raw order fills fields differ from the fixed read contract")

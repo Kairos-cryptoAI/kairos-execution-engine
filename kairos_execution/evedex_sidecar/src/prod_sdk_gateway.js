@@ -566,6 +566,15 @@ export class EvedexProdSdkGateway {
       path = "/api/market/instrument";
       query = { fields: "metrics" };
       read = () => this.account.exchangeGateway.getInstrumentsMetrics();
+    } else if (source === "best_depth") {
+      if (typeof instrument !== "string" || !/^[A-Z0-9]{1,32}$/.test(instrument) || max_level !== undefined) {
+        throw new TypeError("raw best-depth query is malformed");
+      }
+      path = `/api/market/${instrument}/deep`;
+      query = { marketLevel: 1 };
+      // The pinned SDK only serializes maxLevel/roundPrice; use its public GET
+      // with the current documented best-book parameter and capture exact bytes.
+      read = () => this.account.exchangeGateway.get(path, new URLSearchParams(query).toString());
     } else if (source === "depth") {
       if (typeof instrument !== "string" || !/^[A-Z0-9]{1,32}$/.test(instrument) ||
           !Number.isInteger(max_level) || max_level < 1 || max_level > 100) {

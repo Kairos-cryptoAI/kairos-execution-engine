@@ -72,6 +72,13 @@ function validate(value) {
       exactKeys(payload, ["source"]);
       return { id: value.id, operation: value.operation, payload };
     }
+    if (source === "best_depth") {
+      exactKeys(payload, ["source", "instrument"]);
+      if (typeof payload.instrument !== "string" || !/^[A-Z0-9]{1,32}$/.test(payload.instrument)) {
+        throw new TypeError("raw best-depth query is malformed");
+      }
+      return { id: value.id, operation: value.operation, payload };
+    }
     if (source === "depth") {
       exactKeys(payload, ["source", "instrument", "max_level"]);
       if (typeof payload.instrument !== "string" || !/^[A-Z0-9]{1,32}$/.test(payload.instrument) ||

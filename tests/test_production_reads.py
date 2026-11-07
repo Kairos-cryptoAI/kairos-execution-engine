@@ -38,6 +38,10 @@ def fixture(*, bodies=None):
         "order_page": b'{"count":0,"list":[]}',
         "tpsl_page": b'{"count":0,"list":[]}',
         "depth": b'{"t":1793062800123,"asks":[{"price":1.234567890123456789,"quantity":2.5000}],"bids":[]}',
+        "best_depth": (
+            b'{"t":1793062800123,"asks":[{"price":1.234567890123456789,"quantity":2.5000}],'
+            b'"bids":[{"price":1.2,"quantity":1}]}'
+        ),
         "order_fills": (
             b'[{"id":"fill-1","fillQuantity":0.000000000000000001,"fillPrice":123456789.123456789,'
             b'"fee":[{"coin":"usdt","quantity":0.000000000000000003}],"createdAt":"2026-10-27T00:00:03.123Z"}]'
@@ -67,6 +71,7 @@ def fixture(*, bodies=None):
             "order_page": "/api/order",
             "tpsl_page": "/api/tpsl",
             "depth": f"/api/market/{payload.get('instrument')}/deep",
+            "best_depth": f"/api/market/{payload.get('instrument')}/deep",
             "order_fills": f"/api/order/{payload.get('order_id')}/fill",
             "funding_transfers": "/api/user/funding-transfer",
             "fill_history": "/api/fill",
@@ -76,6 +81,8 @@ def fixture(*, bodies=None):
             query = {"fields": "metrics"}
         if source == "depth":
             query = {"maxLevel": str(payload["max_level"])}
+        if source == "best_depth":
+            query = {"marketLevel": "1"}
         if source == "order_fills":
             query = {"version": "2"}
         if "transfer_type" in query:
@@ -171,6 +178,47 @@ async def test_depth_keeps_exact_native_timestamp_and_no_decimal_roundtrip():
         await reads.fetch_depth(symbol="BTCUSDT", max_level=True)
     with pytest.raises(ProductionReadUnavailable):
         await reads.fetch_depth(symbol="ETHUSDT")
+
+
+@pytest.mark.asyncio
+async def test_documented_best_book_is_separate_from_legacy_depth_and_preserves_bytes():
+    reads, calls = fixture()
+    await reads.preflight()
+    best = await reads.fetch_best_depth(symbol="BTCUSDT")
+    assert calls[-1] == {"source": "best_depth", "instrument": "BTCUSD"}
+    assert best["asks"][0]["price"] == Decimal("1.234567890123456789")
+    assert json.loads(best["native_read_capture"]["query_json"]) == {"marketLevel": "1"}
+    assert best["native_read_capture"]["source"] == "best_depth"
+    with pytest.raises(ProductionReadUnavailable):
+        await reads.fetch_best_depth(symbol="ETHUSDT")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"t":1,"asks":[],"bids":[]}',
+        b'{"t":1,"asks":[{"price":1,"quantity":1}],"bids":[{"price":1,"quantity":1}]}',
+        b'{"t":1,"asks":[{"price":2,"quantity":1},{"price":3,"quantity":1}],'
+        b'"bids":[{"price":1,"quantity":1}]}',
+    ],
+)
+async def test_documented_best_book_rejects_empty_crossed_or_multiple_levels(body):
+    reads, _ = fixture(bodies={"best_depth": body})
+    await reads.preflight()
+    with pytest.raises(ProductionReadUnavailable, match="uncrossed"):
+        await reads.fetch_best_depth(symbol="BTCUSDT")
+
+
+@pytest.mark.asyncio
+async def test_best_book_compares_decimal_strings_numerically():
+    reads, _ = fixture(
+        bodies={
+            "best_depth": b'{"t":1,"asks":[{"price":"10","quantity":1}],"bids":[{"price":"9","quantity":1}]}'
+        }
+    )
+    await reads.preflight()
+    assert (await reads.fetch_best_depth(symbol="BTCUSDT"))["bids"][0]["price"] == "9"
 
 
 @pytest.mark.asyncio

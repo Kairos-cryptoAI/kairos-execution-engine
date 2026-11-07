@@ -229,6 +229,24 @@ class ProductionEvedexReads:
     async def fetch_depth(self, *, symbol: str, max_level: int = 100) -> dict[str, Any]:
         instrument = self._venue_symbol(symbol)
         depth = self._object(await self._read("depth", instrument=instrument, max_level=max_level))
+        return self._validate_depth(depth, source="depth")
+
+    async def fetch_best_depth(self, *, symbol: str) -> dict[str, Any]:
+        """Read documented marketLevel=1; this is a quote observation, not execution authority."""
+        instrument = self._venue_symbol(symbol)
+        depth = self._object(await self._read("best_depth", instrument=instrument))
+        depth = self._validate_depth(depth, source="best_depth")
+        bids, asks = depth["bids"], depth["asks"]
+        if (
+            len(bids) != 1
+            or len(asks) != 1
+            or self._decimal(bids[0]["price"], "native best bid")
+            >= self._decimal(asks[0]["price"], "native best ask")
+        ):
+            raise ProductionReadUnavailable("documented best book requires one uncrossed bid and ask")
+        return depth
+
+    def _validate_depth(self, depth: dict[str, Any], *, source: str) -> dict[str, Any]:
         # Only lossless integral timestamp conversion; never replace the venue clock.
         timestamp = self._integer(depth.get("t"), "native depth timestamp", maximum=2**53 - 1)
         for field in ("asks", "bids"):
@@ -238,7 +256,7 @@ class ProductionEvedexReads:
                     or self._decimal(row.get("quantity"), "native depth quantity") <= 0
                 ):
                     raise ProductionReadUnavailable("native depth contains nonpositive levels")
-        return {**depth, "t": timestamp, "native_read_capture": dict(self.last_captures["depth"])}
+        return {**depth, "t": timestamp, "native_read_capture": dict(self.last_captures[source])}
 
     async def drain_events(self, *, limit: int = 1000) -> list[dict[str, Any]]:
         raise ProductionReadUnavailable(
