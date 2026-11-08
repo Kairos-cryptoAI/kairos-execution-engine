@@ -88,7 +88,9 @@ test("PROD actual HTTP budget preserves entry/protection/compensation headroom a
   for (let i = 0; i < 24; i++) await send("POST", "/api/v2/order/limit");
   assert.equal(gateway.readHealth().local_mutation_rate_limit_reserve, 6);
   const beforeDenied = requests.length;
+  gateway.httpClient.beginMarketDeadline({}, now + 2_000);
   await assert.rejects(send("POST", "/api/v2/order/market"), /mandatory STOP and TARGET/);
+  gateway.httpClient.endMarketDeadline();
   await assert.rejects(send("POST", "/api/v2/order/stop-limit"), /mandatory STOP and TARGET/);
   assert.equal(requests.length, beforeDenied);
   await send("POST", "/api/tpsl/BTCUSD");

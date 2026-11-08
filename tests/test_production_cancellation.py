@@ -277,6 +277,124 @@ def test_partial_entry_cancellation_requires_both_live_protections_in_same_snaps
         )
 
 
+def _protection_setup_partial():
+    verifier, evidence, now = _verifier()
+    trade = SimpleNamespace(
+        state="PROTECTING",
+        side="BUY",
+        account_id=evidence.owner_arm.request.context.remote_account_id,
+        quantity=Decimal("10"),
+        filled_quantity=Decimal("4"),
+        entry_client_order_id="entry-1",
+        stop_exchange_order_id=None,
+        target_exchange_order_id=None,
+    )
+    order = CancellationOrderFactV1(
+        order_id="entry-1",
+        instrument="BTCUSD",
+        role="ENTRY",
+        status="PARTIALLY_FILLED",
+        side="BUY",
+        remaining_quantity=Decimal("6"),
+        reduce_only=False,
+    )
+    venue = _venue(evidence.owner_arm.request.context, now, position="4", orders=(order,))
+    return verifier, trade, venue, now
+
+
+def test_first_stop_failure_does_not_deadlock_cancellation_of_exact_owned_entry_remainder():
+    verifier, trade, venue, now = _protection_setup_partial()
+    assert not venue.protections and trade.stop_exchange_order_id is None
+    verifier._validate_venue(
+        venue,
+        trade=trade,
+        instrument="BTCUSD",
+        target_id="entry-1",
+        role="ENTRY",
+        source_id="synthetic",
+        now=now,
+    )
+    # New fills during protection setup are still attributable only through
+    # the same authoritative parent and exact original remaining quantity.
+    grown = venue.model_copy(
+        update={
+            "position_quantity": Decimal("5"),
+            "orders": (venue.orders[0].model_copy(update={"remaining_quantity": Decimal("5")}),),
+        }
+    )
+    verifier._validate_venue(
+        grown,
+        trade=trade,
+        instrument="BTCUSD",
+        target_id="entry-1",
+        role="ENTRY",
+        source_id="synthetic",
+        now=now,
+    )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "active",
+        "entry_pending",
+        "unknown_parent",
+        "other_parent",
+        "missing_fill",
+        "shrunk_position",
+        "wrong_side",
+        "wrong_remainder",
+        "other_entry",
+        "reduce_only",
+        "expired",
+    ],
+)
+def test_unprotected_remainder_exception_never_infers_ownership_or_skips_original_constraints(fault):
+    verifier, trade, venue, now = _protection_setup_partial()
+    if fault == "active":
+        trade.state = "ACTIVE"
+    elif fault == "entry_pending":
+        trade.state = "ENTRY_PENDING"
+    elif fault == "unknown_parent":
+        venue = venue.model_copy(update={"entry_parent_order_id": None})
+    elif fault == "other_parent":
+        venue = venue.model_copy(update={"entry_parent_order_id": "other-entry"})
+    elif fault == "missing_fill":
+        trade.filled_quantity = 0
+    elif fault == "shrunk_position":
+        trade.filled_quantity = 5
+    elif fault == "wrong_side":
+        venue = venue.model_copy(update={"position_side": "SELL"})
+    elif fault == "wrong_remainder":
+        venue = venue.model_copy(
+            update={
+                "orders": (venue.orders[0].model_copy(update={"remaining_quantity": Decimal("5")}),),
+            }
+        )
+    elif fault == "other_entry":
+        venue = venue.model_copy(
+            update={
+                "orders": (venue.orders[0].model_copy(update={"order_id": "other-entry"}),),
+            }
+        )
+    elif fault == "reduce_only":
+        venue = venue.model_copy(
+            update={"orders": (venue.orders[0].model_copy(update={"reduce_only": True}),)}
+        )
+    else:
+        now = venue.valid_until
+    with pytest.raises(ProductionCancellationError):
+        verifier._validate_venue(
+            venue,
+            trade=trade,
+            instrument="BTCUSD",
+            target_id="entry-1",
+            role="ENTRY",
+            source_id="synthetic",
+            now=now,
+        )
+
+
 def test_active_stop_requires_flat_or_authoritative_competing_exit():
     verifier, evidence, now = _verifier(role="STOP_LOSS")
     trade = SimpleNamespace(

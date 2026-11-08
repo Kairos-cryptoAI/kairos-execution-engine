@@ -24,6 +24,7 @@ from kairos_persistence import EffectStatus, EffectType
 from pydantic import Field, field_validator, model_validator
 
 from .managed_signer import CustodyBindingV1, _typed_message
+from .market_ioc_admission import MARKET_IOC_ENTRY_CONTRACT
 from .production_claims import PostgresProductionClaims
 from .production_lifecycle_binding import ProductionLifecycleBindingV1, build_production_lifecycle_binding
 from .production_readiness import (
@@ -462,14 +463,15 @@ class ProductionCancellationVerifier:
         origin = await self.effects.get(origin_key)
         if origin is None or await verify_effect(origin_key) is not True:
             raise ProductionCancellationError("durable origin execution journal chain is invalid")
+        binding = await self.bindings.get(origin_key)
         self._validate_origin(
             origin,
             trade=trade,
             origin_key=origin_key,
             role=role,
             target_id=target_id,
+            binding=binding,
         )
-        binding = await self.bindings.get(origin_key)
         signing_claimed_at = await self._verify_completed_origin_claims(binding)
         owner_hash = self._verify_origin_binding(
             binding,
@@ -577,10 +579,11 @@ class ProductionCancellationVerifier:
             or risk.signing_request_id != binding.request.request_id
             or risk.effect_id != binding.signing_effect_id
             or risk.client_order_id != trade.entry_client_order_id
-            or risk.operation != "New limit order"
+            or risk.operation != binding.request.operation
             or risk.instrument != decision.venue_symbol
             or risk.side != expected_side
-            or risk.quantity != message.get("quantity")
+            or risk.quantity != message.get("quantity", 0)
+            or risk.cash_quantity != message.get("cashQuantity")
             or risk.price != message.get("limitPrice")
             or risk.leverage != 1
             or risk.worst_case_loss_usd != Decimal(str(decision.worst_case_loss_usd))
@@ -673,6 +676,7 @@ class ProductionCancellationVerifier:
         origin_key: str,
         role: str,
         target_id: str,
+        binding: ProductionLifecycleBindingV1 | None = None,
     ) -> None:
         if origin is None:
             raise ProductionCancellationError("owned origin effect is absent")
@@ -740,6 +744,21 @@ class ProductionCancellationVerifier:
                 "price_hex": float(trade.stop_price if role == "STOP_LOSS" else trade.target_price).hex(),
             }
         )
+        if role == "ENTRY" and binding is not None and binding.market_ioc_entry is not None:
+            if binding.market_ioc_envelope is None:
+                raise ProductionCancellationError("original market envelope is absent")
+            expected_payload = {
+                "trade_id": trade.trade_id,
+                "intent_id": trade.strategy_intent_id,
+                "client_order_id": owned_client_id,
+                "venue_symbol": trade.venue_symbol,
+                "side": trade.side,
+                "entry_contract": MARKET_IOC_ENTRY_CONTRACT,
+                "cash_quantity_e8": binding.market_ioc_entry.cash_quantity_e8,
+                "market_envelope_sha256": canonical_digest(binding.market_ioc_envelope),
+                "quantity_cap_hex": float(trade.quantity).hex(),
+                "leverage_hex": float(trade.leverage).hex(),
+            }
         if origin.request_payload != expected_payload:
             raise ProductionCancellationError("origin journal payload differs from exact trade geometry")
 
@@ -784,6 +803,8 @@ class ProductionCancellationVerifier:
                 now=signing_claimed_at,
                 parent_order_id=None if role == "ENTRY" else trade.entry_client_order_id,
                 risk_decision_id=trade.risk_decision_id,
+                market_ioc_entry=candidate.market_ioc_entry,
+                market_ioc_envelope=candidate.market_ioc_envelope,
             )
         except Exception:
             raise ProductionCancellationError("stored lifecycle binding fails canonical rebuild") from None
@@ -979,7 +1000,26 @@ class ProductionCancellationVerifier:
                     and item.parent_order_id == trade.entry_client_order_id
                     and item.covered_quantity >= venue.position_quantity
                 }
-                if not expected.issubset(live):
+                # The first protection can fail while the trade is still
+                # PROTECTING. Cancelling its own proven entry remainder only
+                # removes possible new exposure; requiring both protections
+                # here would deadlock the subsequent independently authorized
+                # emergency close. This does not authorize cancelling a stop
+                # or closing a position. Exact owner/origin/claim checks above
+                # remain mandatory, and the source must identify this position
+                # as belonging to the same entry, not merely the same symbol.
+                try:
+                    recorded_fill = Decimal(str(getattr(trade, "filled_quantity", 0)))
+                    protection_setup_remainder = (
+                        getattr(getattr(trade, "state", None), "value", getattr(trade, "state", None))
+                        == TradeLifecycleState.PROTECTING.value
+                        and recorded_fill.is_finite()
+                        and 0 < recorded_fill <= venue.position_quantity <= Decimal(str(trade.quantity))
+                        and venue.entry_parent_order_id == target_id == trade.entry_client_order_id
+                    )
+                except (ValueError, ArithmeticError):
+                    protection_setup_remainder = False
+                if not expected.issubset(live) and not protection_setup_remainder:
                     raise ProductionCancellationError("partial entry exposure lacks both active protections")
             return
 

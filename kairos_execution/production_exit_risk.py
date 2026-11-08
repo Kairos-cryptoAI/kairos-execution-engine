@@ -400,7 +400,12 @@ class ProductionLiveExitRiskPublisher:
                 raise ValueError("immutable ENTRY lifecycle plan is absent")
             candidate = ProductionLifecycleBindingV1.model_validate(candidate)
             original_plan_now = datetime.fromtimestamp(
-                max(decision.decided_at_ms, decision.intent.entry_eligible_ts_ms) / 1_000,
+                max(
+                    decision.decided_at_ms,
+                    decision.intent.entry_eligible_ts_ms,
+                    candidate.market_ioc_envelope.observed_at_ms if candidate.market_ioc_envelope else 0,
+                )
+                / 1_000,
                 tz=UTC,
             )
             rebuilt = build_production_lifecycle_binding(
@@ -413,6 +418,8 @@ class ProductionLiveExitRiskPublisher:
                 manual_request_sha256=candidate.request.manual_request_sha256,
                 expires_at=candidate.request.expires_at,
                 now=original_plan_now,
+                market_ioc_entry=candidate.market_ioc_entry,
+                market_ioc_envelope=candidate.market_ioc_envelope,
             )
             if (
                 candidate != rebuilt

@@ -6,6 +6,7 @@ not a factory and does not create signing, approval, or readiness authority.
 
 from __future__ import annotations
 
+import asyncio
 import math
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -19,11 +20,16 @@ from kairos_core.contracts import RiskTradeDecisionV1
 from kairos_core.enums import (
     EntryPolicy,
     EvedexProfile,
+    OrderRole,
     ReviewDecision,
     Side,
+    TradeExecutionEventType,
+    TradeLifecycleState,
     TradingMode,
 )
 from kairos_persistence import (
+    EffectStatus,
+    EffectType,
     ExecutionJournalRepository,
     ExecutionMutationBudgetRepository,
     ExecutionRuntimeHealthRepository,
@@ -35,6 +41,7 @@ from pydantic import Field, model_validator
 
 from .lifecycle_scope import ExecutionLifecycleScope, LifecycleAdmissionPolicy
 from .managed_signer import CustodyBindingV1
+from .market_ioc_admission import MARKET_IOC_ENTRY_CONTRACT, check_market_ioc_bounds, validate_market_ioc_ack
 from .paper_engine import (
     PaperExecutionResult,
     PaperExecutionSafetyError,
@@ -73,6 +80,7 @@ class ProductionLifecycleConfigV1(StrictRecord):
     expected_health: ProductionVenueHealthV1
     service_name: Identity
     symbol_map: dict[Identity, Identity]
+    entry_order_type: Literal["LIMIT_IOC", "MARKET_IOC"] = "LIMIT_IOC"
 
     @model_validator(mode="after")
     def validate_profile_and_instruments(self) -> ProductionLifecycleConfigV1:
@@ -293,6 +301,9 @@ class ProductionLifecycleEngine(_EvedexProtectedExecutionEngine):
             raise ValueError("adapter/runtime/custody scope differs from production lifecycle settings")
         if adapter.name != "evedex":
             raise ValueError("production lifecycle supports only the managed EVEDEX adapter")
+        if settings.entry_order_type != getattr(adapter, "entry_order_type", "LIMIT_IOC"):
+            raise ValueError("configured entry order contract differs from the managed adapter")
+        self._market_entry_bindings: dict[str, ProductionLifecycleBindingV1] = {}
         self.production_settings = settings
         self.production_runtime = runtime
         if prepared_exit_risk is not None:
@@ -325,9 +336,418 @@ class ProductionLifecycleEngine(_EvedexProtectedExecutionEngine):
             runtime_health=runtime_health,
         )
 
+    async def _market_entry_history(self, decision):
+        store = getattr(self.adapter, "bindings", None)
+        if store is None:
+            return None
+        effect_id = self._effect_id(decision.trade_id, OrderRole.ENTRY, "place")
+        effect_store = getattr(self, "effects", None)
+        effect = await effect_store.get(effect_id) if effect_store is not None else None
+        original_contract = effect.request_payload.get("entry_contract") if effect is not None else None
+        if original_contract not in {None, MARKET_IOC_ENTRY_CONTRACT}:
+            raise PaperExecutionSafetyError("unknown persisted ENTRY contract")
+        binding = await store.get(effect_id)
+        if binding is None:
+            if original_contract == MARKET_IOC_ENTRY_CONTRACT:
+                raise PaperExecutionSafetyError("persisted market ENTRY lacks original binding")
+            return None
+        if binding.market_ioc_entry is None and binding.market_ioc_envelope is None:
+            if (
+                original_contract == MARKET_IOC_ENTRY_CONTRACT
+                or binding.request.operation == "New market order"
+            ):
+                raise PaperExecutionSafetyError("persisted market ENTRY lacks original bounded metadata")
+            return None
+        if (
+            binding is None
+            or binding.market_ioc_entry is None
+            or binding.market_ioc_envelope is None
+            or binding.context != self.production_settings.context
+            or binding.role != "ENTRY"
+            or binding.decision_sha256 != canonical_digest(decision)
+            or binding.decision_id != decision.decision_id
+            or binding.trade_id != decision.trade_id
+            or binding.lifecycle_effect_id != effect_id
+            or binding.request.operation != "New market order"
+            or (effect is not None and original_contract != MARKET_IOC_ENTRY_CONTRACT)
+        ):
+            raise PaperExecutionSafetyError("immutable market-IOC history is absent or differs")
+        original_check_ms = max(
+            decision.decided_at_ms,
+            decision.intent.entry_eligible_ts_ms,
+            binding.market_ioc_envelope.observed_at_ms,
+        )
+        check_market_ioc_bounds(
+            binding.market_ioc_entry,
+            binding.market_ioc_envelope,
+            context=self.production_settings.context,
+            decision=decision,
+            # The original source proof may be observed after Risk decided.
+            # Reconstruct inside that immutable proof's original interval;
+            # never demand a current lease or renew it during recovery.
+            now_ms=original_check_ms,
+        )
+        if not (
+            original_check_ms
+            < binding.request.expires_at.timestamp() * 1000
+            <= binding.market_ioc_envelope.valid_until_ms
+        ):
+            raise PaperExecutionSafetyError(
+                "historical market signing deadline exceeds original source proof"
+            )
+        if not hasattr(self, "_market_entry_bindings"):
+            self._market_entry_bindings = {}
+        self._market_entry_bindings[decision.trade_id] = binding
+        return binding
+
+    async def _entry_request_payload(self, decision, trade, *, client_order_id):
+        if self.production_settings.entry_order_type != "MARKET_IOC":
+            return await super()._entry_request_payload(decision, trade, client_order_id=client_order_id)
+        effect = self._effect_id(trade.trade_id, OrderRole.ENTRY, "place")
+        binding = await self.adapter.inspect_entry(decision, effect)
+        await self._market_entry_history(decision)
+        return {
+            "trade_id": trade.trade_id,
+            "intent_id": trade.strategy_intent_id,
+            "client_order_id": client_order_id,
+            "venue_symbol": decision.venue_symbol,
+            "side": trade.side,
+            "entry_contract": MARKET_IOC_ENTRY_CONTRACT,
+            "cash_quantity_e8": binding.market_ioc_entry.cash_quantity_e8,
+            "market_envelope_sha256": canonical_digest(binding.market_ioc_envelope),
+            "quantity_cap_hex": float(decision.quantity).hex(),
+            "leverage_hex": float(1).hex(),
+        }
+
+    def _entry_mutation_operation(self):
+        return "place_market" if self.production_settings.entry_order_type == "MARKET_IOC" else "place_limit"
+
+    async def _dispatch_entry_order(self, decision, trade, *, effect_id, client_order_id):
+        if self.production_settings.entry_order_type != "MARKET_IOC":
+            return await super()._dispatch_entry_order(
+                decision, trade, effect_id=effect_id, client_order_id=client_order_id
+            )
+        binding = await self.adapter.inspect_entry(decision, effect_id)
+        return await self.adapter.place_market_ioc(
+            effect_id=effect_id,
+            client_order_id=client_order_id,
+            symbol=trade.symbol,
+            side=self._order_side(decision),
+            cash_quantity_e8=binding.market_ioc_entry.cash_quantity_e8,
+            leverage=1,
+        )
+
+    def _validate_entry_response(self, response, *, decision, client_order_id):
+        binding = getattr(self, "_market_entry_bindings", {}).get(decision.trade_id)
+        if binding is None:
+            if str(response.get("type", "")).upper() == "MARKET":
+                raise PaperExecutionSafetyError("original market-IOC response envelope is unavailable")
+            return super()._validate_entry_response(
+                response, decision=decision, client_order_id=client_order_id
+            )
+        return validate_market_ioc_ack(
+            response,
+            decision=decision,
+            client_order_id=client_order_id,
+            request=binding.market_ioc_entry,
+            envelope=binding.market_ioc_envelope,
+        )
+
+    async def _validate_recovered_entry_effect(self, effect, record):
+        trade = await self.trades.get(effect.trade_id)
+        if trade is not None:
+            await self._market_entry_history(self._decision_for_trade(trade))
+        return await super()._validate_recovered_entry_effect(effect, record)
+
+    async def _account_snapshot_unlocked(self):
+        for trade in await self.trades.recovery_required(
+            environment=self._environment, account_id=self._lifecycle_scope.account_id
+        ):
+            await self._market_entry_history(self._decision_for_trade(trade))
+        return await super()._account_snapshot_unlocked()
+
+    async def _reconcile_redelivery_locked(self, trade):
+        await self._market_entry_history(self._decision_for_trade(trade))
+        return await super()._reconcile_redelivery_locked(trade)
+
+    async def _reconcile_trade(self, trade, venue, sidecar_events):
+        await self._market_entry_history(self._decision_for_trade(trade))
+        cleanup = await self._reduce_unverifiable_market_fill(trade, venue)
+        if cleanup is not None:
+            return cleanup
+        return await super()._reconcile_trade(trade, venue, sidecar_events)
+
+    async def _unripe_effects(self, trade, *, eligible_effect_keys):
+        unripe = await super()._unripe_effects(trade, eligible_effect_keys=eligible_effect_keys)
+        if self._effect_id(trade.trade_id, OrderRole.ENTRY, "place") in unripe:
+            # An ambiguity grace fences entry retries; it must not postpone
+            # reduction of already observed, exactly owned market exposure.
+            cleanup = await self._reduce_unverifiable_market_fill(
+                trade, await self.adapter.fetch_paper_state()
+            )
+            if cleanup is not None:
+                self._recovered_events.extend(cleanup)
+        if trade.state is TradeState.PROTECTING and set(unripe) & {
+            self._effect_id(trade.trade_id, OrderRole.STOP_LOSS, "create"),
+            self._effect_id(trade.trade_id, OrderRole.ENTRY, "cancel"),
+        }:
+            # The grace prevents repeating an unknown mutation, not reducing
+            # owned exposure. The production terminal-entry fence below must
+            # still prove the original remainder cannot fill again. An unknown
+            # cancel with only an absent open projection fails that fence.
+            cleanup = await self._emergency_close(
+                self._decision_for_trade(trade),
+                trade,
+                "original protection/cancellation outcome unresolved during recovery",
+            )
+            self._recovered_events.extend(cleanup)
+        return unripe  # Keep the unknown entry outcome blocked and unresolved.
+
+    async def _reduce_unverifiable_market_fill(self, trade, venue):
+        if trade.state is not TradeState.ENTRY_PENDING:
+            return None
+        decision = self._decision_for_trade(trade)
+        binding = await self._market_entry_history(decision)
+        if binding is None:
+            return None
+        record = self._find_order(venue, trade.entry_client_order_id) or self._find_historical_order(
+            venue, trade.entry_client_order_id
+        )
+        if record is not None:
+            try:
+                self._validate_entry_response(
+                    record, decision=decision, client_order_id=trade.entry_client_order_id
+                )
+            except (ValueError, PaperExecutionSafetyError):
+                pass
+            else:
+                return None
+        quantity = self._position_quantity_for_trade(venue, trade)
+        if quantity <= 0:
+            return None
+        # Incomplete economics may still prove exact ownership and a terminal
+        # remainder. Mere open-order absence never proves either fact.
+        try:
+            history_quantity = Decimal(str(record["quantity"]))
+            history_remaining = Decimal(str(record["unFilledQuantity"]))
+            terminal_owned_fill = (
+                record["id"] == trade.entry_client_order_id
+                and record["instrument"] == trade.venue_symbol
+                and record["side"] == trade.side
+                and record["type"] == "MARKET"
+                and record["timeInForce"] == "IOC"
+                and str(record["status"]).upper().replace("CANCELLED", "CANCELED")
+                in {"FILLED", "CANCELED", "EXPIRED"}
+                and (str(record["status"]).upper() != "FILLED" or history_remaining == 0)
+                and history_quantity.is_finite()
+                and history_remaining.is_finite()
+                and 0 <= history_remaining < history_quantity <= Decimal(str(decision.quantity))
+                and history_quantity - history_remaining == Decimal(str(quantity))
+            )
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            terminal_owned_fill = False
+        if not terminal_owned_fill:
+            raise PaperExecutionSafetyError(
+                "unverifiable market fill lacks exact terminal owned fill history"
+            )
+        account = self._object(venue.get("account"), "account")
+        identities = {
+            str(account[key]) for key in ("id", "exchangeId", "user") if account.get(key) is not None
+        }
+        effect_id = self._effect_id(trade.trade_id, OrderRole.ENTRY, "place")
+        effect = await self.effects.get(effect_id)
+        owners = await self.trades.recovery_required(
+            environment=self._environment, account_id=self._lifecycle_scope.account_id
+        )
+        expected_request = {
+            "trade_id": trade.trade_id,
+            "intent_id": trade.strategy_intent_id,
+            "client_order_id": trade.entry_client_order_id,
+            "venue_symbol": trade.venue_symbol,
+            "side": trade.side,
+            "entry_contract": MARKET_IOC_ENTRY_CONTRACT,
+            "cash_quantity_e8": binding.market_ioc_entry.cash_quantity_e8,
+            "market_envelope_sha256": canonical_digest(binding.market_ioc_envelope),
+            "quantity_cap_hex": float(decision.quantity).hex(),
+            "leverage_hex": float(1).hex(),
+        }
+        if (
+            self._lifecycle_scope.remote_account_id not in identities
+            or self._find_order(venue, trade.entry_client_order_id) is not None
+            or quantity > decision.quantity
+            or Decimal(str(quantity)) * 100_000_000 > binding.market_ioc_envelope.maximum_base_quantity_e8
+            or effect is None
+            or effect.effect_type is not EffectType.PLACE_ORDER
+            or effect.request_payload != expected_request
+            or effect.symbol != trade.symbol
+            or effect.exchange != trade.exchange
+            or effect.order_role != "ENTRY"
+            or effect.status not in {EffectStatus.PREPARED, EffectStatus.CONFIRMED, EffectStatus.RECONCILED}
+            or effect.trade_id != trade.trade_id
+            or effect.client_order_id != trade.entry_client_order_id
+            or effect.environment != trade.environment
+            or effect.account_id != trade.account_id
+            or not await self.trades.verify_chain(trade.trade_id)
+            or not await self.effects.verify_chain(effect_id)
+            or len([owner for owner in owners if owner.venue_symbol == trade.venue_symbol]) != 1
+        ):
+            raise PaperExecutionSafetyError(
+                "unverifiable market fill lacks bounded exclusive reduction lineage"
+            )
+        await self._block_entries_unlocked(
+            "market entry outcome unresolved; owned exposure requires reduction"
+        )
+        trade, failed = await self._transition_with_event(
+            decision,
+            trade,
+            TradeState.PROTECTING,
+            journal_event_type="UNVERIFIABLE_MARKET_ENTRY_WITH_OWNED_EXPOSURE",
+            public_event_type=TradeExecutionEventType.FAILED,
+            lifecycle_state=TradeLifecycleState.PROTECTING,
+            event_payload={"observed_quantity_hex": float(quantity).hex()},
+            transition_filled_quantity=quantity,
+            first_fill_at=trade.entry_eligible_at,
+            entry_exchange_order_id=trade.entry_client_order_id,
+            effect_id=effect_id,
+            order_role=OrderRole.ENTRY,
+            client_order_id=trade.entry_client_order_id,
+            requested_quantity=decision.quantity,
+            public_filled_quantity=quantity,
+            position_quantity=quantity,
+            details=(("reason", "unverifiable_market_entry_owned_exposure"),),
+        )
+        return [failed, *(await self._emergency_close(decision, trade, "unverifiable market entry outcome"))]
+
     async def _prepare_exit_risk(self, effect_id: str) -> None:
         if self.prepared_exit_risk is not None:
             await self.prepared_exit_risk.stage(effect_id)
+
+    async def _assert_terminal_entry_before_close(self, decision, trade, venue) -> None:
+        """Open-order absence is not proof that an owned entry cannot fill again.
+
+        A cancellation ACK without terminal quantity history may be delayed or
+        unresolved. Keep it fenced until the qualified account read supplies
+        the exact original order and its terminal remainder. This check grants
+        no exit authority; the existing per-effect Risk and claims still apply.
+        """
+        effect_id = self._effect_id(trade.trade_id, OrderRole.ENTRY, "place")
+        binding = await self.adapter.bindings.get(effect_id)
+        market = await self._market_entry_history(decision)
+        if (
+            binding is None
+            or binding.context != self.production_settings.context
+            or binding.role != "ENTRY"
+            or binding.trade_id != trade.trade_id
+            or binding.decision_id != decision.decision_id
+            or binding.decision_sha256 != canonical_digest(decision)
+            or binding.lifecycle_effect_id != effect_id
+            or binding.request.operation != ("New market order" if market else "New limit order")
+        ):
+            raise PaperExecutionSafetyError("terminal entry proof lacks exact original signing lineage")
+        expected_payload: dict[str, Any] = {
+            "trade_id": trade.trade_id,
+            "intent_id": trade.strategy_intent_id,
+            "client_order_id": trade.entry_client_order_id,
+            "venue_symbol": trade.venue_symbol,
+            "side": trade.side,
+            "leverage_hex": float(1).hex(),
+        }
+        if market is not None:
+            if market.market_ioc_entry is None or market.market_ioc_envelope is None:
+                raise PaperExecutionSafetyError("original bounded market metadata is unavailable")
+            expected_payload.update(
+                entry_contract=MARKET_IOC_ENTRY_CONTRACT,
+                cash_quantity_e8=market.market_ioc_entry.cash_quantity_e8,
+                market_envelope_sha256=canonical_digest(market.market_ioc_envelope),
+                quantity_cap_hex=float(decision.quantity).hex(),
+            )
+        else:
+            expected_payload.update(
+                quantity_hex=float(decision.quantity).hex(),
+                limit_price_hex=float(decision.worst_entry_price).hex(),
+            )
+        origin = await self.effects.get(effect_id)
+        if (
+            origin is None
+            or origin.effect_type is not EffectType.PLACE_ORDER
+            or origin.status not in {EffectStatus.PREPARED, EffectStatus.CONFIRMED, EffectStatus.RECONCILED}
+            or origin.trade_id != trade.trade_id
+            or origin.client_order_id != trade.entry_client_order_id
+            or origin.environment != trade.environment
+            or origin.account_id != trade.account_id
+            or origin.exchange != trade.exchange
+            or origin.symbol != trade.symbol
+            or origin.order_role != "ENTRY"
+            or origin.request_payload != expected_payload
+            or not await self.effects.verify_chain(effect_id)
+            or not await self.trades.verify_chain(trade.trade_id)
+        ):
+            raise PaperExecutionSafetyError("terminal entry proof differs from original prepared effect")
+        account = self._object(venue.get("account"), "account")
+        identities = {
+            str(account[key]) for key in ("id", "exchangeId", "user") if account.get(key) is not None
+        }
+        if self._lifecycle_scope.remote_account_id not in identities:
+            raise PaperExecutionSafetyError("terminal entry proof belongs to another account")
+        if self._find_order(venue, trade.entry_client_order_id) is not None:
+            raise PaperExecutionSafetyError("original entry remainder is still open before close")
+        record = self._find_historical_order(venue, trade.entry_client_order_id)
+        if record is None:
+            raise PaperExecutionSafetyError(
+                "owned terminal entry quantity is unavailable; absence is insufficient"
+            )
+        quantity = Decimal(str(self._position_quantity_for_trade(venue, trade)))
+        try:
+            total = Decimal(str(record["quantity"]))
+            remaining = Decimal(str(record["unFilledQuantity"]))
+            status = str(record["status"]).upper().replace("CANCELLED", "CANCELED")
+            expected_type = "MARKET" if market is not None else "LIMIT"
+            terminal = (
+                record["id"] == trade.entry_client_order_id
+                and record["instrument"] == trade.venue_symbol
+                and record["side"] == trade.side
+                and record["type"] == expected_type
+                and record.get("timeInForce", "IOC" if market is None else None) == "IOC"
+                and status in {"FILLED", "CANCELED", "EXPIRED"}
+                and total.is_finite()
+                and remaining.is_finite()
+                and 0 <= remaining <= total <= Decimal(str(decision.quantity))
+                and (market is not None or total == Decimal(str(decision.quantity)))
+                and (status != "FILLED" or (total > 0 and remaining == 0))
+                and quantity <= total - remaining
+            )
+            if market is not None:
+                assert market.market_ioc_envelope is not None
+                terminal = (
+                    terminal and total * 100_000_000 <= market.market_ioc_envelope.maximum_base_quantity_e8
+                )
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            terminal = False
+        if not terminal:
+            raise PaperExecutionSafetyError(
+                "owned terminal entry quantity is unavailable; absence is insufficient"
+            )
+
+    async def _cancel_entry_and_measure_position(self, decision, trade):
+        venue = await self.adapter.fetch_paper_state()
+        if self._find_order(venue, trade.entry_client_order_id) is not None:
+            await self._cancel_entry_effect(trade)
+            venue = await self.adapter.fetch_paper_state()
+        await self._assert_terminal_entry_before_close(decision, trade, venue)
+        # The original terminal order cannot legitimately reopen. Retain the
+        # shared fresh position read, cumulative-fill facts and close sizing.
+        return await super()._cancel_entry_and_measure_position(decision, trade)
+
+    async def _emergency_close(self, decision, trade, reason):
+        try:
+            return await super()._emergency_close(decision, trade, reason)
+        except (Exception, asyncio.CancelledError) as failure:
+            detail = f"production emergency reduction requires recovery: {type(failure).__name__}"
+            self._recovery_blockers = (detail,)
+            # A failed/unknown STOP cleanup must also revoke durable entry
+            # authority when this engine was called directly, outside service.
+            await asyncio.shield(self._block_entries_unlocked(detail))
+            raise
 
     async def _handle_once(self, decision: RiskTradeDecisionV1) -> PaperExecutionResult:
         # A durable completed/uncertain entry is recovery work, not a new entry

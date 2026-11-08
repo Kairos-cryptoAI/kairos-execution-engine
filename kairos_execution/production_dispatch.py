@@ -13,7 +13,7 @@ import hashlib
 import json
 import re
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol
 from uuid import UUID
 
@@ -97,7 +97,7 @@ class ProductionWireRequestV1(StrictRecord):
 class _WireToken:
     """Private one-call capability; binds one HTTP operation and expires once."""
 
-    __slots__ = ("_seal", "_method", "_path", "_body_sha256", "_expires_at", "_used")
+    __slots__ = ("_seal", "_method", "_path", "_body_sha256", "_expires_at", "_used", "_ipc_used")
 
     def __init__(self, *, seal: object, method: str, path: str, body_sha256: str, expires_at: datetime):
         if seal is not _WIRE_SEAL:
@@ -108,8 +108,9 @@ class _WireToken:
         self._body_sha256 = body_sha256
         self._expires_at = expires_at
         self._used = False
+        self._ipc_used = False
 
-    def consume(self, *, method: str, path: str, body_sha256: str, now: datetime) -> None:
+    def consume(self, *, method: str, path: str, body_sha256: str, now: datetime) -> datetime:
         _aware(now)
         if (
             self._seal is not _WIRE_SEAL
@@ -123,6 +124,26 @@ class _WireToken:
                 "exact one-use wire authorization is absent, expired, or already consumed"
             )
         self._used = True
+        return self._expires_at
+
+    def consume_ipc(
+        self, *, method: str, path: str, body_sha256: str, deadline_ms: int, now: datetime
+    ) -> None:
+        _aware(now)
+        expiry_ms = (self._expires_at - datetime(1970, 1, 1, tzinfo=UTC)) // timedelta(milliseconds=1)
+        if (
+            self._seal is not _WIRE_SEAL
+            or not self._used
+            or self._ipc_used
+            or method != self._method
+            or path != self._path
+            or body_sha256 != self._body_sha256
+            or type(deadline_ms) is not int
+            or deadline_ms != expiry_ms
+            or now >= self._expires_at
+        ):
+            raise ProductionDispatchError("exact one-use market IPC authorization is absent or expired")
+        self._ipc_used = True
 
 
 _WIRE_SEAL = object()
@@ -405,12 +426,13 @@ class ProductionEffectDispatcher:
                 body_sha256=body_digest,
                 expires_at=request.signing_request.expires_at,
             )
-            token.consume(
-                method=request.method,
-                path=request.path,
-                body_sha256=body_digest,
-                now=fresh_time(),
-            )
+            if request.signing_request.operation != "New market order":
+                token.consume(
+                    method=request.method,
+                    path=request.path,
+                    body_sha256=body_digest,
+                    now=fresh_time(),
+                )
         except asyncio.CancelledError:
             await self._finish_shielded(namespace, request, request_sha256, "UNRESOLVED", None, deadline)
             raise
@@ -421,7 +443,16 @@ class ProductionEffectDispatcher:
             ) from None
 
         try:
-            response = await self.sender(method=request.method, path=request.path, body=body)
+            if request.signing_request.operation == "New market order":
+                response = await self.sender(
+                    method=request.method,
+                    path=request.path,
+                    body=body,
+                    expires_at=request.signing_request.expires_at,
+                    wire_token=token,
+                )
+            else:
+                response = await self.sender(method=request.method, path=request.path, body=body)
             fresh_time()
             if not isinstance(response, dict):
                 raise ValueError("transport returned a malformed response")

@@ -141,6 +141,14 @@ class PostgresLifecycleBindingStore:
                 "decision_sha256": binding.decision_sha256,
                 "lifecycle_effect_id": binding.lifecycle_effect_id,
                 "role": binding.role,
+                **(
+                    {
+                        "market_ioc_entry": binding.market_ioc_entry.model_dump(mode="json"),
+                        "market_ioc_envelope": binding.market_ioc_envelope.model_dump(mode="json"),
+                    }
+                    if binding.market_ioc_entry is not None and binding.market_ioc_envelope is not None
+                    else {}
+                ),
             }
         )
         if request.request_id != expected_request_id:

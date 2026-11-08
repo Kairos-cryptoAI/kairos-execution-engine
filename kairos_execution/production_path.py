@@ -17,6 +17,7 @@ from kairos_core.contracts import CandidateReviewV1, StrategicAllocation, VenueQ
 from kairos_core.enums import SystemMode
 from kairos_risk.live import LiveRiskEvaluationV1, LiveRiskEvaluator  # type: ignore[import-untyped]
 
+from .market_ioc_admission import MarketIocEntryRequestV1
 from .paper_engine import PaperExecutionResult
 from .production_exit_risk import ProductionExitRiskStageReceiptV1, ProductionLiveExitRiskPublisher
 from .production_lifecycle import ProductionLifecycleEngine
@@ -221,6 +222,10 @@ class ProductionLiveLifecycleCoordinator:
         self.engine = engine
         self.entry_risk = entry_risk
         self.runtime = runtime
+        if getattr(engine.production_settings, "entry_order_type", "LIMIT_IOC") == "MARKET_IOC" and (
+            entry_risk.market_ioc_admission is not engine.adapter.market_ioc_admission
+        ):
+            raise ValueError("market-IOC Risk and execution must share the exact registered-source boundary")
 
     async def admit_and_handle_entry(
         self,
@@ -235,9 +240,14 @@ class ProductionLiveLifecycleCoordinator:
         expires_at: datetime,
         system_mode: SystemMode,
         entry_interlock: Callable[[], bool] | None = None,
+        market_ioc_entry: MarketIocEntryRequestV1 | None = None,
     ) -> ProductionLiveEntryResult | ProductionLiveEntryRefusal:
         now = _time(self.engine.clock)
         _check_entry_interlock(entry_interlock)
+        if (market_ioc_entry is not None) != (
+            getattr(self.engine.production_settings, "entry_order_type", "LIMIT_IOC") == "MARKET_IOC"
+        ):
+            raise ProductionPathError("entry order mode differs; no implicit limit/market substitution")
         auth = self.runtime.authorization
         try:
             _, owner_digest = _verify_owner_signed_arm(
@@ -263,6 +273,7 @@ class ProductionLiveLifecycleCoordinator:
                 expires_at=expires_at,
                 now=now,
                 system_mode=system_mode,
+                **({"market_ioc_entry": market_ioc_entry} if market_ioc_entry is not None else {}),
             )
         except ProductionLiveRiskEntryRefused as refusal:
             if (

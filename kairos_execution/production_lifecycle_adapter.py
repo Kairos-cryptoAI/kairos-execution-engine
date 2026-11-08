@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import hashlib
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from kairos_core.contracts import RiskTradeDecisionV1
 from kairos_core.enums import OrderSide
 from kairos_persistence import EffectStatus, EffectType
 
 from .adapters.evedex_sidecar import EvedexSidecarAdapter
+from .market_ioc_admission import MARKET_IOC_ENTRY_CONTRACT, MarketIocAdmission
 from .production_lifecycle_binding import (
     ProductionLifecycleBindingV1,
     build_production_lifecycle_binding,
@@ -46,7 +47,19 @@ class ManagedProductionLifecycleAdapter:
     exchange_order_id_matches_client_order_id = True
     protective_stop_lookup_authoritative = True
 
-    def __init__(self, *, runtime, reads, bindings, trades, effects, cancellations, clock=None):
+    def __init__(
+        self,
+        *,
+        runtime,
+        reads,
+        bindings,
+        trades,
+        effects,
+        cancellations,
+        clock=None,
+        entry_order_type: Literal["LIMIT_IOC", "MARKET_IOC"] = "LIMIT_IOC",
+        market_ioc_admission: MarketIocAdmission | None = None,
+    ):
         from .production_cancellation import ProductionCancellationVerifier
         from .production_lifecycle_store import PostgresLifecycleBindingStore
 
@@ -95,6 +108,12 @@ class ManagedProductionLifecycleAdapter:
         self.clock = clock or (lambda: datetime.now(UTC))
         self.environment = f"PROD:{canonical_digest(self.context)}:LIVE"
         self.namespace = f"prod.v1:{canonical_digest(self.context)}"
+        if entry_order_type not in {"LIMIT_IOC", "MARKET_IOC"}:
+            raise ValueError("explicit reviewed entry-order contract required")
+        if entry_order_type == "MARKET_IOC" and (type(market_ioc_admission) is not MarketIocAdmission):
+            raise ValueError("explicit market-IOC admission boundary is required")
+        self.entry_order_type = entry_order_type
+        self.market_ioc_admission = market_ioc_admission
 
     async def preflight(self) -> dict[str, Any]:
         health = await self.reads.preflight()
@@ -130,6 +149,20 @@ class ManagedProductionLifecycleAdapter:
         if candidate is None:
             raise ProductionLifecycleRefused("independent persisted lifecycle signing plan is absent")
         candidate = ProductionLifecycleBindingV1.model_validate(candidate)
+        if role == "ENTRY":
+            market = candidate.market_ioc_entry is not None
+            if market != (self.entry_order_type == "MARKET_IOC"):
+                raise ProductionLifecycleRefused("entry order contract differs; no limit/market substitution")
+            if market:
+                if self.market_ioc_admission is None or candidate.market_ioc_envelope is None:
+                    raise ProductionLifecycleRefused("original market-IOC admission is unavailable")
+                self.market_ioc_admission.verify(
+                    candidate.market_ioc_entry,
+                    context=self.context,
+                    decision=decision,
+                    now_ms=int(self.clock().timestamp() * 1000),
+                    expected=candidate.market_ioc_envelope,
+                )
         rebuilt = build_production_lifecycle_binding(
             decision=decision,
             context=self.context,
@@ -143,6 +176,8 @@ class ManagedProductionLifecycleAdapter:
             parent_order_id=parent,
             close_quantity=quantity,
             risk_decision_id=candidate.risk_decision_id,
+            market_ioc_entry=candidate.market_ioc_entry,
+            market_ioc_envelope=candidate.market_ioc_envelope,
         )
         if candidate != rebuilt:
             raise ProductionLifecycleRefused("persisted signing plan differs from exact durable lifecycle")
@@ -206,6 +241,8 @@ class ManagedProductionLifecycleAdapter:
     async def place_limit(
         self, *, effect_id, client_order_id, symbol, side, quantity, limit_price, leverage, post_only=False
     ):
+        if self.entry_order_type != "LIMIT_IOC":
+            raise ProductionLifecycleRefused("limit call cannot dispatch a market-IOC entry")
         effect, trade, decision = await self._prepared(
             effect_id, types={EffectType.PLACE_ORDER}, symbol=symbol
         )
@@ -221,6 +258,43 @@ class ManagedProductionLifecycleAdapter:
         ):
             raise ProductionLifecycleRefused("entry call changed the immutable Risk geometry")
         plan = await self.inspect_entry(decision, effect_id)
+        return await self._send(plan)
+
+    async def place_market_ioc(
+        self,
+        *,
+        effect_id,
+        client_order_id,
+        symbol,
+        side,
+        cash_quantity_e8,
+        leverage,
+    ):
+        if self.entry_order_type != "MARKET_IOC":
+            raise ProductionLifecycleRefused("explicit market-IOC adapter mode is required")
+        effect, trade, decision = await self._prepared(
+            effect_id, types={EffectType.PLACE_ORDER}, symbol=symbol
+        )
+        plan = await self.inspect_entry(decision, effect_id)
+        request = plan.market_ioc_entry
+        if (
+            request is None
+            or plan.market_ioc_envelope is None
+            or type(cash_quantity_e8) is not int
+            or cash_quantity_e8 != request.cash_quantity_e8
+            or leverage != 1
+            or effect.order_role != "ENTRY"
+            or effect.client_order_id != client_order_id
+            or trade.entry_client_order_id != client_order_id
+            or side != OrderSide(trade.side)
+            or effect.request_payload.get("entry_contract") != MARKET_IOC_ENTRY_CONTRACT
+            or effect.request_payload.get("cash_quantity_e8") != cash_quantity_e8
+            or effect.request_payload.get("market_envelope_sha256")
+            != canonical_digest(plan.market_ioc_envelope)
+        ):
+            raise ProductionLifecycleRefused(
+                "market entry call differs from exact prepared bounded cash contract"
+            )
         return await self._send(plan)
 
     async def create_tpsl(self, *, effect_id, symbol, side, tpsl_type, quantity, price, parent_order_id):

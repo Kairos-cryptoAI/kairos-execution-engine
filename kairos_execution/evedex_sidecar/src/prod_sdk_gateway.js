@@ -117,6 +117,44 @@ export class PinnedProdRestClient extends RestClient {
     this.httpsAgent = new HttpsAgent({ keepAlive: false, maxSockets: 8 });
     this.rawCaptureExpected = undefined;
     this.rawCapture = undefined;
+    this.marketDeadline = undefined;
+    this.marketWallHighWater = undefined;
+  }
+
+  beginMarketDeadline(body, deadlineMs) {
+    const wall = this.clock();
+    if (this.marketDeadline || !Number.isSafeInteger(wall) || !Number.isSafeInteger(deadlineMs) ||
+        deadlineMs <= wall || deadlineMs - wall > 30_000) {
+      throw new Error("market signing deadline is absent, expired, or outside its bound");
+    }
+    this.marketDeadline = Object.freeze({
+      body: JSON.stringify(body, Object.keys(body).sort()),
+      deadlineMs, wall, monotonic: performance.now(), remainingMs: deadlineMs - wall,
+    });
+    this.marketWallHighWater = wall;
+  }
+
+  endMarketDeadline() {
+    this.marketDeadline = undefined;
+    this.marketWallHighWater = undefined;
+  }
+
+  #assertMarketDeadline(request) {
+    const scope = this.marketDeadline;
+    const wall = this.clock();
+    let body;
+    try {
+      body = typeof request.body === "string" ? JSON.parse(request.body) : request.body;
+    } catch {
+      throw new Error("market HTTP body is malformed");
+    }
+    if (!scope || !body || typeof body !== "object" || Array.isArray(body) ||
+        JSON.stringify(body, Object.keys(body).sort()) !== scope.body ||
+        !Number.isSafeInteger(wall) || wall < this.marketWallHighWater || wall >= scope.deadlineMs ||
+        performance.now() - scope.monotonic >= scope.remainingMs) {
+      throw new Error("market HTTP deadline expired or exact admitted body changed");
+    }
+    this.marketWallHighWater = wall;
   }
 
   beginRawCapture(expected) {
@@ -183,7 +221,15 @@ export class PinnedProdRestClient extends RestClient {
   async request(request) {
     const url = validateProdHttpUrl(request);
     this.#validateCaptureRequest(request, url);
-    const requestedAt = new Date(this.clock()).toISOString();
+    const requestedAtMs = this.clock();
+    if (String(request.method).toUpperCase() === "POST" && url.pathname === "/api/v2/order/market" &&
+        this.marketDeadline) {
+      if (!Number.isSafeInteger(requestedAtMs) || requestedAtMs < this.marketWallHighWater) {
+        throw new Error("market HTTP clock moved backwards");
+      }
+      this.marketWallHighWater = requestedAtMs;
+    }
+    const requestedAt = new Date(requestedAtMs).toISOString();
     const captureActive = this.rawCaptureExpected !== undefined;
     const config = {
       url: url.toString(),
@@ -211,7 +257,11 @@ export class PinnedProdRestClient extends RestClient {
       else throw new TypeError("PROD mutation has no enforced local budget classification");
       // Reserve at the single actual HTTP-send boundary, not at SDK dispatch
       // or authentication. Failed/ambiguous sends are spent, never refunded.
+      if (operation === "place_market") this.#assertMarketDeadline(request);
       this.mutationBudget.reserve(operation);
+    }
+    if (method === "POST" && url.pathname === "/api/v2/order/market") {
+      this.#assertMarketDeadline(request);
     }
     try {
       const response = await axios.request(config);
@@ -436,11 +486,20 @@ export class EvedexProdSdkGateway {
     };
   }
 
-  async sendSignedPost({ method, path, body }) {
+  async sendSignedPost({ method, path, body, deadline_ms }) {
     if (method !== "POST") throw new TypeError("only exact signed POST operations are supported");
     const validated = validateBody(path, body);
     this.#requirePreflight();
-    return validated.operation.call(this.account.exchangeGateway, validated.body);
+    if (path !== "/api/v2/order/market") {
+      if (deadline_ms !== undefined) throw new TypeError("market deadline cannot authorize another operation");
+      return validated.operation.call(this.account.exchangeGateway, validated.body);
+    }
+    this.httpClient.beginMarketDeadline(validated.body, deadline_ms);
+    try {
+      return await validated.operation.call(this.account.exchangeGateway, validated.body);
+    } finally {
+      this.httpClient.endMarketDeadline();
+    }
   }
 
   async cancelOrder({ instrument, orderId }) {

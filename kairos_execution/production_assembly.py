@@ -20,6 +20,7 @@ from kairos_persistence import ExecutionJournalRepository, TradeLifecycleReposit
 from kairos_risk.live import LiveRiskEvaluator  # type: ignore[import-untyped]
 
 from .managed_signer import ManagedSignerBoundary
+from .market_ioc_admission import MarketIocAdmission
 from .production_accounting import PostgresProductionAccounting
 from .production_cancellation import (
     ProductionCancellationVenueSource,
@@ -96,6 +97,7 @@ class ProductionAssemblyResources:
     canary_verifier: TechnicalCanaryPreconditionsVerifier
     clock: Callable[[], datetime]
     sleeper: Callable[[float], Awaitable[None]] | None = None
+    market_ioc_admission: MarketIocAdmission | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -423,6 +425,8 @@ def build_production_assembly(resources: ProductionAssemblyResources) -> Product
         custody_binding=runtime.binding,
         database_uuid=runtime.database_uuid,
         policy_namespace=namespace,
+        market_ioc_admission=resources.market_ioc_admission,
+        clock=resources.clock,
     )
     trades = resources.trades
     effects = resources.effects
@@ -470,6 +474,8 @@ def build_production_assembly(resources: ProductionAssemblyResources) -> Product
         effects=effects,
         cancellations=cancellations,
         clock=resources.clock,
+        entry_order_type=resources.lifecycle_settings.entry_order_type,
+        market_ioc_admission=resources.market_ioc_admission,
     )
     engine = ProductionLifecycleEngine(
         lifecycle_adapter,

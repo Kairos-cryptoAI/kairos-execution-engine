@@ -15,6 +15,7 @@ from typing import Literal
 
 from kairos_core.contracts import RiskTradeDecisionV1
 from kairos_core.enums import EvedexProfile, Side, TradingMode
+from pydantic import model_serializer
 
 from .crypto import MATCHER_PRECISION
 from .managed_signer import (
@@ -22,6 +23,11 @@ from .managed_signer import (
     ManagedSigningRequestV1,
     SigningOperation,
     _typed_message,
+)
+from .market_ioc_admission import (
+    MarketIocEntryRequestV1,
+    VerifiedMarketIocEnvelopeV1,
+    check_market_ioc_bounds,
 )
 from .production_readiness import Digest, ProductionContextV1, StrictRecord, canonical_digest
 from .signing_authorization import (
@@ -59,6 +65,17 @@ class ProductionLifecycleBindingV1(StrictRecord):
     lifecycle_effect_id: Digest
     signing_effect_id: Digest
     request: ManagedSigningRequestV1
+    market_ioc_entry: MarketIocEntryRequestV1 | None = None
+    market_ioc_envelope: VerifiedMarketIocEnvelopeV1 | None = None
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_shape(self, handler):
+        payload = handler(self)
+        if self.market_ioc_entry is None:
+            payload.pop("market_ioc_entry", None)
+        if self.market_ioc_envelope is None:
+            payload.pop("market_ioc_envelope", None)
+        return payload
 
 
 def _sha256_json(payload: object) -> str:
@@ -132,6 +149,8 @@ def build_production_lifecycle_binding(
     parent_order_id: str | None = None,
     close_quantity: float | None = None,
     risk_decision_id: str | None = None,
+    market_ioc_entry: MarketIocEntryRequestV1 | None = None,
+    market_ioc_envelope: VerifiedMarketIocEnvelopeV1 | None = None,
 ) -> ProductionLifecycleBindingV1:
     """Build one bounded EVEDEX signing request; this function grants no authority.
 
@@ -179,17 +198,46 @@ def build_production_lifecycle_binding(
     _validate_client_id_for_decision(client_order_id, decision, role)
 
     operation: SigningOperation
+    if (market_ioc_entry is None) != (market_ioc_envelope is None):
+        raise ValueError("explicit market-IOC request and verified envelope are required together")
+    if market_ioc_entry is not None:
+        if role != "ENTRY" or market_ioc_envelope is None:
+            raise ValueError("market-IOC contract applies only to explicit ENTRY effects")
+        market_ioc_envelope = check_market_ioc_bounds(
+            market_ioc_entry,
+            market_ioc_envelope,
+            context=context,
+            decision=decision,
+            now_ms=int(now.timestamp() * 1000),
+        )
+        if (
+            custody_binding.chain_id != 42161
+            or expires_at.timestamp() * 1000 > market_ioc_envelope.valid_until_ms
+        ):
+            raise ValueError("market-IOC signing chain/deadline exceeds its original envelope")
     if role == "ENTRY":
-        message = {
-            "id": client_order_id,
-            "instrument": instrument,
-            "side": position_side,
-            "leverage": 1,
-            "quantity": quantity,
-            "limitPrice": _exact_evedex_integer(decision.worst_entry_price, field="worst entry price"),
-            "chainId": custody_binding.chain_id,
-        }
-        operation = "New limit order"
+        if market_ioc_entry is None:
+            message = {
+                "id": client_order_id,
+                "instrument": instrument,
+                "side": position_side,
+                "leverage": 1,
+                "quantity": quantity,
+                "limitPrice": _exact_evedex_integer(decision.worst_entry_price, field="worst entry price"),
+                "chainId": custody_binding.chain_id,
+            }
+            operation = "New limit order"
+        else:
+            message = {
+                "id": client_order_id,
+                "instrument": instrument,
+                "side": position_side,
+                "leverage": 1,
+                "cashQuantity": market_ioc_entry.cash_quantity_e8,
+                "timeInForce": "IOC",
+                "chainId": custody_binding.chain_id,
+            }
+            operation = "New market order"
     elif role in {"STOP_LOSS", "TAKE_PROFIT"}:
         if parent_order_id is None:
             raise ValueError("protective lifecycle effect requires its persisted parent entry ID")
@@ -227,6 +275,14 @@ def build_production_lifecycle_binding(
             "decision_sha256": canonical_digest(decision),
             "lifecycle_effect_id": lifecycle_effect_id,
             "role": role,
+            **(
+                {
+                    "market_ioc_entry": market_ioc_entry.model_dump(mode="json"),
+                    "market_ioc_envelope": market_ioc_envelope.model_dump(mode="json"),
+                }
+                if market_ioc_entry is not None and market_ioc_envelope is not None
+                else {}
+            ),
         }
     )
     request = ManagedSigningRequestV1(
@@ -254,6 +310,8 @@ def build_production_lifecycle_binding(
         lifecycle_effect_id=lifecycle_effect_id,
         signing_effect_id=signing_id,
         request=request,
+        market_ioc_entry=market_ioc_entry,
+        market_ioc_envelope=market_ioc_envelope,
     )
 
 
@@ -288,11 +346,12 @@ def compare_entry_risk_to_decision(
         "signing_request_id": lifecycle.request.request_id,
         "effect_id": lifecycle.signing_effect_id,
         "client_order_id": message["id"],
-        "operation": "New limit order",
+        "operation": "New market order" if lifecycle.market_ioc_entry is not None else "New limit order",
         "instrument": decision.venue_symbol,
         "side": "BUY" if decision.intent.side is Side.LONG else "SELL",
-        "quantity": message["quantity"],
-        "price": message["limitPrice"],
+        "quantity": message.get("quantity", 0),
+        "cash_quantity": message.get("cashQuantity"),
+        "price": message.get("limitPrice"),
         "leverage": 1,
         "worst_case_loss_usd": Decimal(str(decision.worst_case_loss_usd)),
     }

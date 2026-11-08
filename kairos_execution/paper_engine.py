@@ -1521,16 +1521,7 @@ class _EvedexProtectedExecutionEngine:
         await self._check_operator_entry(decision, effect_id)
         await self._bind_canary_entry(decision, effect_id)
         self._assert_fresh_entry_market(decision, int(self.clock().astimezone(UTC).timestamp() * 1000))
-        request = {
-            "trade_id": trade.trade_id,
-            "intent_id": trade.strategy_intent_id,
-            "client_order_id": client_order_id,
-            "venue_symbol": decision.venue_symbol,
-            "side": trade.side,
-            "quantity_hex": float(decision.quantity).hex(),
-            "limit_price_hex": float(decision.worst_entry_price).hex(),
-            "leverage_hex": float(decision.leverage).hex(),
-        }
+        request = await self._entry_request_payload(decision, trade, client_order_id=client_order_id)
         await self._assert_entry_admission(trade)
         return await self.effects.prepare(
             effect_key=effect_id,
@@ -1544,6 +1535,33 @@ class _EvedexProtectedExecutionEngine:
             trade_id=trade.trade_id,
             order_role=OrderRole.ENTRY.value,
             recovery_delay=self._EFFECT_AMBIGUITY_GRACE,
+        )
+
+    async def _entry_request_payload(self, decision, trade, *, client_order_id) -> dict[str, Any]:
+        return {
+            "trade_id": trade.trade_id,
+            "intent_id": trade.strategy_intent_id,
+            "client_order_id": client_order_id,
+            "venue_symbol": decision.venue_symbol,
+            "side": trade.side,
+            "quantity_hex": float(decision.quantity).hex(),
+            "limit_price_hex": float(decision.worst_entry_price).hex(),
+            "leverage_hex": float(decision.leverage).hex(),
+        }
+
+    def _entry_mutation_operation(self) -> str:
+        return "place_limit"
+
+    async def _dispatch_entry_order(self, decision, trade, *, effect_id, client_order_id) -> dict[str, Any]:
+        return await self.adapter.place_limit(
+            effect_id=effect_id,
+            client_order_id=client_order_id,
+            symbol=trade.symbol,
+            side=self._order_side(decision),
+            quantity=decision.quantity,
+            limit_price=decision.worst_entry_price,
+            leverage=decision.leverage,
+            post_only=False,
         )
 
     async def _entry_effect(
@@ -1586,20 +1604,16 @@ class _EvedexProtectedExecutionEngine:
         await self._check_operator_entry(decision, effect_id)
         await self._reserve_mutation(
             effect_id,
-            operation="place_limit",
+            operation=self._entry_mutation_operation(),
             compensation=False,
             require_entry_headroom=True,
         )
         async with self._entry_dispatch_guard(decision, effect_id):
-            response = await self.adapter.place_limit(
+            response = await self._dispatch_entry_order(
+                decision,
+                trade,
                 effect_id=effect_id,
                 client_order_id=client_order_id,
-                symbol=trade.symbol,
-                side=self._order_side(decision),
-                quantity=decision.quantity,
-                limit_price=decision.worst_entry_price,
-                leverage=decision.leverage,
-                post_only=False,
             )
             exchange_order_id, _, _, _ = self._validate_entry_response(
                 response,

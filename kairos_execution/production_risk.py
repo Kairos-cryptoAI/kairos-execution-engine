@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Literal
@@ -26,6 +27,7 @@ from kairos_risk.live import (  # type: ignore[import-untyped]
 from pydantic import field_validator
 
 from .managed_signer import CustodyBindingV1
+from .market_ioc_admission import MarketIocAdmission, MarketIocEntryRequestV1, check_market_ioc_bounds
 from .production_exposure import require_exposure_write_authority
 from .production_history import SOURCE_ID, ProductionHistoryCaptureV1
 from .production_lifecycle_binding import (
@@ -129,6 +131,8 @@ class ProductionLiveRiskPublisher:
         custody_binding: CustodyBindingV1,
         database_uuid: UUID,
         policy_namespace: str,
+        market_ioc_admission: MarketIocAdmission | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         if not isinstance(evaluator, LiveRiskEvaluator):
             raise TypeError("the concrete fail-closed LiveRiskEvaluator is required")
@@ -164,6 +168,10 @@ class ProductionLiveRiskPublisher:
         self.policy_namespace = policy_namespace
         self.context = context
         self.scope = scope
+        if market_ioc_admission is not None and type(market_ioc_admission) is not MarketIocAdmission:
+            raise TypeError("explicit market-IOC admission verifier is required")
+        self.market_ioc_admission = market_ioc_admission
+        self.clock = clock or (lambda: datetime.now(UTC))
 
     async def evaluate_and_stage_entry(
         self,
@@ -177,6 +185,7 @@ class ProductionLiveRiskPublisher:
         expires_at: datetime,
         now: datetime,
         system_mode: SystemMode,
+        market_ioc_entry: MarketIocEntryRequestV1 | None = None,
     ) -> ProductionLiveRiskStageReceiptV1:
         """Evaluate verified account evidence and stage exactly one ENTRY risk row.
 
@@ -192,6 +201,8 @@ class ProductionLiveRiskPublisher:
             raise ProductionLiveRiskError(
                 "LIVE signing deadline must be within the five-second evidence lease"
             )
+        if market_ioc_entry is not None and self.market_ioc_admission is None:
+            raise ProductionLiveRiskError("qualified market-IOC admission is unavailable")
         decided_at_ms = int(now.timestamp() * 1_000)
         try:
             evaluation = self.evaluator.evaluate(
@@ -277,6 +288,30 @@ class ProductionLiveRiskPublisher:
             occurred_at=datetime.fromtimestamp(decision.decided_at_ms / 1_000, tz=UTC),
         )
         try:
+            market_envelope = None
+            binding_now = now
+            if market_ioc_entry is not None:
+                if self.market_ioc_admission is None:
+                    raise ValueError("explicit market-IOC admission is unavailable")
+                observed_now = self._utc(self.clock(), "market source verification clock")
+                if observed_now < now:
+                    raise ValueError("market source verification clock moved backwards")
+                market_envelope = self.market_ioc_admission.verify(
+                    market_ioc_entry,
+                    context=self.context,
+                    decision=decision,
+                    now_ms=int(observed_now.timestamp() * 1000),
+                )
+                binding_now = self._utc(self.clock(), "market signing staging clock")
+                if binding_now < observed_now:
+                    raise ValueError("market staging clock moved backwards")
+                check_market_ioc_bounds(
+                    market_ioc_entry,
+                    market_envelope,
+                    context=self.context,
+                    decision=decision,
+                    now_ms=int(binding_now.timestamp() * 1000),
+                )
             binding = build_production_lifecycle_binding(
                 decision=decision,
                 context=self.context,
@@ -286,7 +321,9 @@ class ProductionLiveRiskPublisher:
                 client_order_id=client_id,
                 manual_request_sha256=manual_request_sha256,
                 expires_at=expires_at,
-                now=now,
+                now=binding_now,
+                market_ioc_entry=market_ioc_entry,
+                market_ioc_envelope=market_envelope,
             )
             risk = self._risk_geometry(evaluation, binding, valid_until=valid_until, observed_at=now)
         except Exception:
@@ -310,7 +347,7 @@ class ProductionLiveRiskPublisher:
             evaluation=evaluation,
             lifecycle_binding=binding,
             risk_geometry=risk,
-            staged_at=now,
+            staged_at=binding_now,
             binding_inserted=binding_inserted,
         )
 
@@ -372,14 +409,15 @@ class ProductionLiveRiskPublisher:
         decision = evaluation.decision
         message = json.loads(binding.request.message_json)
         facts = self._verified_facts(evaluation)
+        market = binding.market_ioc_entry is not None
         if (
             binding.role != "ENTRY"
             or binding.risk_decision_id != decision.decision_id
             or binding.decision_id != decision.decision_id
             or message.get("instrument") != decision.venue_symbol
             or message.get("side") != ("BUY" if decision.intent.side is Side.LONG else "SELL")
-            or message.get("quantity") is None
-            or message.get("limitPrice") is None
+            or (not market and (message.get("quantity") is None or message.get("limitPrice") is None))
+            or (market and (message.get("cashQuantity") is None or message.get("timeInForce") != "IOC"))
         ):
             raise ProductionLiveRiskError("LIVE risk does not match the exact ENTRY signing request")
         return RiskGeometryV1(
@@ -391,9 +429,9 @@ class ProductionLiveRiskPublisher:
             operation=binding.request.operation,
             instrument=message["instrument"],
             side=message["side"],
-            quantity=message["quantity"],
-            cash_quantity=None,
-            price=message["limitPrice"],
+            quantity=message.get("quantity", 0),
+            cash_quantity=message.get("cashQuantity"),
+            price=message.get("limitPrice"),
             stop_price=None,
             protection_type=None,
             trigger_price=None,

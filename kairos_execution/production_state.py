@@ -634,6 +634,54 @@ def _validate_snapshot_clock(
         raise ProductionStateError("production signing state snapshot is stale or future-dated")
 
 
+async def _validate_snapshot_clock_after_wait(
+    *,
+    started_at: datetime,
+    resolved_at: datetime,
+    clock_probe: Callable[[], datetime],
+    max_age: timedelta,
+) -> None:
+    """Wait at most 50 ms of monotonic time; then retain the strict check.
+
+    This never changes the immutable DB timestamp, UTC clock, freshness bound
+    or any signing deadline. It grants no clock/source qualification. A small
+    cross-clock lead can become past before use; a large lead, rollback, stall
+    or scheduler timeout refuses. Callers must still recheck their original
+    authorization/evidence expiry after the source I/O, as before.
+    """
+    maximum_wait = 0.050
+    checked_at = clock_probe()
+    # Preserve all original malformed-clock/rollback/staleness failures.
+    if (
+        any(
+            value.tzinfo is None or value.utcoffset() != timedelta(0)
+            for value in (started_at, resolved_at, checked_at)
+        )
+        or checked_at < started_at
+        or resolved_at <= checked_at
+        or (resolved_at - checked_at).total_seconds() > maximum_wait
+    ):
+        _validate_snapshot_clock(
+            started_at=started_at, resolved_at=resolved_at, checked_at=checked_at, max_age=max_age
+        )
+        return
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + maximum_wait
+    while resolved_at > checked_at:
+        if loop.time() >= deadline:
+            raise ProductionStateError("production snapshot UTC availability wait timed out")
+        await asyncio.sleep(0.001)
+        current = clock_probe()
+        if current.tzinfo is None or current.utcoffset() != timedelta(0) or current < checked_at:
+            raise ProductionStateError("production snapshot UTC clock moved backwards or is invalid")
+        checked_at = current
+        if loop.time() >= deadline:
+            raise ProductionStateError("production snapshot UTC availability wait timed out")
+    _validate_snapshot_clock(
+        started_at=started_at, resolved_at=resolved_at, checked_at=checked_at, max_age=max_age
+    )
+
+
 async def _check_role_isolated(
     connection: asyncpg.Connection, role_name: str, protected: Sequence[str]
 ) -> None:
@@ -1153,11 +1201,10 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
                         ):
                             raise ProductionStateError("accepted owner nonce does not bind the exact arm")
                         resolved_at = (await connection.fetchval("SELECT clock_timestamp()")).astimezone(UTC)
-            checked_at = self._clock_probe()
-            _validate_snapshot_clock(
+            await _validate_snapshot_clock_after_wait(
                 started_at=started_at,
                 resolved_at=resolved_at,
-                checked_at=checked_at,
+                clock_probe=self._clock_probe,
                 max_age=self.max_snapshot_age,
             )
             return owner_arm, owner_claim
@@ -1220,13 +1267,18 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
                             request_id,
                         )
                         risk = self._verified_payload(risk_row, RiskGeometryV1, "entry risk decision")
+                        expected_notional = _entry_notional_usd(
+                            {"cashQuantity": risk.cash_quantity}
+                            if risk.operation == "New market order"
+                            else {"quantity": risk.quantity, "limitPrice": risk.price}
+                        )
                         _, evidence_sha256 = _payload(risk)
                         if (
                             risk.context != self.context
                             or risk.signing_request_id != request_id
                             or risk.decision_id != expected_decision
                             or risk.effect_id != effect_digest
-                            or risk.operation != "New limit order"
+                            or risk.operation not in {"New limit order", "New market order"}
                             or risk.client_order_id is None
                             or risk.observed_at != risk_row["observed_at"]
                             or risk.valid_until != risk_row["valid_until"]
@@ -1251,9 +1303,7 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
                             or reservation_row["observed_at"] != risk.observed_at
                             or reservation_row["evidence_sha256"] != evidence_sha256
                             or Decimal(reservation_row["risk_usd"]) != risk.worst_case_loss_usd
-                            or risk.price is None
-                            or Decimal(reservation_row["notional_usd"])
-                            != Decimal(risk.quantity) * Decimal(risk.price) / Decimal(10**16)
+                            or Decimal(reservation_row["notional_usd"]) != expected_notional
                             or Decimal(reservation_row["account_equity_usd"]) != risk.account_equity_usd
                             or Decimal(reservation_row["daily_realized_loss_usd"])
                             != risk.daily_realized_loss_usd
@@ -1290,11 +1340,10 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
                             request_sha256=reservation_row["request_sha256"],
                         )
                         resolved_at = (await connection.fetchval("SELECT clock_timestamp()")).astimezone(UTC)
-            checked_at = self._clock_probe()
-            _validate_snapshot_clock(
+            await _validate_snapshot_clock_after_wait(
                 started_at=started_at,
                 resolved_at=resolved_at,
-                checked_at=checked_at,
+                clock_probe=self._clock_probe,
                 max_age=self.max_snapshot_age,
             )
             return fact
@@ -1347,11 +1396,10 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
                             exit_operation=exit_operation,
                             now=now,
                         )
-            checked_at = self._clock_probe()
-            _validate_snapshot_clock(
+            await _validate_snapshot_clock_after_wait(
                 started_at=now,
                 resolved_at=evidence.resolved_at,
-                checked_at=checked_at,
+                clock_probe=self._clock_probe,
                 max_age=self.max_snapshot_age,
             )
             return evidence

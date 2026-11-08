@@ -24,9 +24,13 @@ function validate(value) {
   if (!value.payload || typeof value.payload !== "object" || Array.isArray(value.payload)) throw new TypeError("request payload must be an object");
   const payload = value.payload;
   if (value.operation === "send_signed_post") {
-    exactKeys(payload, ["method", "path", "body"]);
+    const isMarket = payload.path === "/api/v2/order/market";
+    exactKeys(payload, isMarket ? ["method", "path", "body", "deadline_ms"] : ["method", "path", "body"]);
     if (payload.method !== "POST" || typeof payload.path !== "string" || !payload.body || typeof payload.body !== "object" || Array.isArray(payload.body)) {
       throw new TypeError("signed post request is malformed");
+    }
+    if (isMarket && (!Number.isSafeInteger(payload.deadline_ms) || payload.deadline_ms <= 0)) {
+      throw new TypeError("market signing deadline must be an exact positive epoch millisecond");
     }
     return { id: value.id, operation: value.operation, payload };
   }
