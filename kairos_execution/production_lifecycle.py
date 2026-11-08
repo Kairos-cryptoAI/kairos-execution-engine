@@ -41,7 +41,12 @@ from pydantic import Field, model_validator
 
 from .lifecycle_scope import ExecutionLifecycleScope, LifecycleAdmissionPolicy
 from .managed_signer import CustodyBindingV1
-from .market_ioc_admission import MARKET_IOC_ENTRY_CONTRACT, check_market_ioc_bounds, validate_market_ioc_ack
+from .market_ioc_admission import (
+    MARKET_IOC_ENTRY_CONTRACT,
+    check_market_ioc_bounds,
+    validate_market_ioc_ack,
+    validate_market_ioc_request_binding,
+)
 from .paper_engine import (
     PaperExecutionResult,
     PaperExecutionSafetyError,
@@ -451,6 +456,7 @@ class ProductionLifecycleEngine(_EvedexProtectedExecutionEngine):
             client_order_id=client_order_id,
             request=binding.market_ioc_entry,
             envelope=binding.market_ioc_envelope,
+            signed_request=binding.request,
         )
 
     async def _validate_recovered_entry_effect(self, effect, record):
@@ -510,6 +516,13 @@ class ProductionLifecycleEngine(_EvedexProtectedExecutionEngine):
         binding = await self._market_entry_history(decision)
         if binding is None:
             return None
+        validate_market_ioc_request_binding(
+            signed_request=binding.request,
+            decision=decision,
+            client_order_id=trade.entry_client_order_id,
+            request=binding.market_ioc_entry,
+            envelope=binding.market_ioc_envelope,
+        )
         record = self._find_order(venue, trade.entry_client_order_id) or self._find_historical_order(
             venue, trade.entry_client_order_id
         )
@@ -535,7 +548,7 @@ class ProductionLifecycleEngine(_EvedexProtectedExecutionEngine):
                 and record["instrument"] == trade.venue_symbol
                 and record["side"] == trade.side
                 and record["type"] == "MARKET"
-                and record["timeInForce"] == "IOC"
+                and ("timeInForce" not in record or record["timeInForce"] == "IOC")
                 and str(record["status"]).upper().replace("CANCELLED", "CANCELED")
                 in {"FILLED", "CANCELED", "EXPIRED"}
                 and (str(record["status"]).upper() != "FILLED" or history_remaining == 0)
@@ -633,6 +646,14 @@ class ProductionLifecycleEngine(_EvedexProtectedExecutionEngine):
         effect_id = self._effect_id(trade.trade_id, OrderRole.ENTRY, "place")
         binding = await self.adapter.bindings.get(effect_id)
         market = await self._market_entry_history(decision)
+        if market is not None:
+            validate_market_ioc_request_binding(
+                signed_request=market.request,
+                decision=decision,
+                client_order_id=trade.entry_client_order_id,
+                request=market.market_ioc_entry,
+                envelope=market.market_ioc_envelope,
+            )
         if (
             binding is None
             or binding.context != self.production_settings.context
@@ -707,7 +728,7 @@ class ProductionLifecycleEngine(_EvedexProtectedExecutionEngine):
                 and record["instrument"] == trade.venue_symbol
                 and record["side"] == trade.side
                 and record["type"] == expected_type
-                and record.get("timeInForce", "IOC" if market is None else None) == "IOC"
+                and ("timeInForce" not in record or record["timeInForce"] == "IOC")
                 and status in {"FILLED", "CANCELED", "EXPIRED"}
                 and total.is_finite()
                 and remaining.is_finite()

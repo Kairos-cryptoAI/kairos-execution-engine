@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -25,7 +26,7 @@ from kairos_execution.production_observation import PROD_EXCHANGE_ORIGIN
 from kairos_execution.production_readiness import canonical_digest
 from kairos_execution.profiles import profile_params
 from kairos_execution.state_machine import client_order_id
-from tests.test_market_ioc_admission import DynamicSyntheticEnvelopeVerifier
+from tests.test_market_ioc_admission import DynamicSyntheticEnvelopeVerifier, _signed_request
 from tests.test_production_lifecycle_binding import _decision, _scope
 
 
@@ -106,7 +107,11 @@ def _market_reduction_engine():
         decision=decision,
         now_ms=decision.decided_at_ms,
     )
-    binding = SimpleNamespace(market_ioc_entry=market_request, market_ioc_envelope=envelope)
+    binding = SimpleNamespace(
+        market_ioc_entry=market_request,
+        market_ioc_envelope=envelope,
+        request=_signed_request(decision, trade.entry_client_order_id, market_request),
+    )
     request = {
         "trade_id": trade.trade_id,
         "intent_id": trade.strategy_intent_id,
@@ -226,6 +231,29 @@ async def test_unverifiable_market_fill_requires_exact_terminal_owned_quantity(f
         await engine._reduce_unverifiable_market_fill(trade, venue)
     engine._emergency_close.assert_not_awaited()
     engine._transition_with_event.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_terminal_recovery_accepts_absent_tif_only_with_matching_original_ioc_request():
+    engine, trade, _effect, binding, venue = _market_reduction_engine()
+    venue["order_history"][0].pop("timeInForce")
+    assert await engine._reduce_unverifiable_market_fill(trade, venue) == ["failed", "close"]
+    engine._emergency_close.assert_awaited_once()
+
+    engine, trade, _effect, binding, venue = _market_reduction_engine()
+    venue["order_history"][0].pop("timeInForce")
+    message = json.loads(binding.request.message_json)
+    message["timeInForce"] = "FOK"
+    binding.request = binding.request.model_copy(update={"message_json": json.dumps(message)})
+    with pytest.raises(ValueError, match="original signed"):
+        await engine._reduce_unverifiable_market_fill(trade, venue)
+    engine._emergency_close.assert_not_awaited()
+
+    engine, trade, _effect, _binding, venue = _market_reduction_engine()
+    venue["order_history"][0]["timeInForce"] = "GTC"
+    with pytest.raises(PaperExecutionSafetyError):
+        await engine._reduce_unverifiable_market_fill(trade, venue)
+    engine._emergency_close.assert_not_awaited()
 
 
 @pytest.mark.asyncio

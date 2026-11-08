@@ -147,6 +147,16 @@ async def test_exact_terminal_owned_partial_allows_only_later_independent_close(
 
 
 @pytest.mark.asyncio
+async def test_terminal_fence_checks_signed_ioc_if_order_history_omits_tif():
+    engine, decision, trade, _effect, venue = fixture()
+    del venue["order_history"][0]["timeInForce"]
+    await engine._assert_terminal_entry_before_close(decision, trade, venue)
+    venue["order_history"][0]["timeInForce"] = "FOK"
+    with pytest.raises(PaperExecutionSafetyError):
+        await engine._assert_terminal_entry_before_close(decision, trade, venue)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "fault",
     [

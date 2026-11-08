@@ -186,7 +186,9 @@ class _SyntheticVenue(_BaseSyntheticVenue):
             {**body, "quantity": float(body["cashQuantity"]) / 100, "limitPrice": 100.51}
         )
         response.pop("limitPrice")
-        response.update(type="MARKET", timeInForce="IOC", cashQuantity=body["cashQuantity"], fee=0)
+        response.pop("timeInForce", None)  # OpenAPI order responses do not guarantee this field.
+        # An empty fee array is not a final zero fee; protection must still be placed.
+        response.update(type="MARKET", cashQuantity=body["cashQuantity"], fee=[])
         for key in ("orders", "order_history"):
             self.state[key] = [copy.deepcopy(response)]
         self.state["balance"]["openOrders"] = [
@@ -228,6 +230,7 @@ class _SyntheticMarketSource:
             maximum_fill_price_e8=int(Decimal(str(decision.worst_entry_price)) * 100_000_000),
             maximum_base_quantity_e8=int(Decimal(str(decision.quantity)) * 100_000_000),
             maximum_fees_usd=Decimal(str(decision.estimated_fees_usd)),
+            fee_usdt_usd_upper_bound=Decimal("1.01"),
             cash_notional_cap_enforced=True,
             base_quantity_includes_rounding=True,
             price_bounds_cover_each_fill=True,

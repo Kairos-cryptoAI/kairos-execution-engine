@@ -1,5 +1,8 @@
 """Synthetic, offline market IOC envelope checks: fixtures grant no venue authority."""
 
+import hashlib
+import json
+from datetime import UTC, datetime
 from decimal import Decimal
 from types import MappingProxyType
 
@@ -7,12 +10,15 @@ import pytest
 from kairos_core.enums import Side
 
 from kairos_execution import market_ioc_admission as module
+from kairos_execution.managed_signer import ManagedSigningRequestV1
 from kairos_execution.market_ioc_admission import (
     MarketIocAdmission,
     MarketIocEntryRequestV1,
     VerifiedMarketIocEnvelopeV1,
     check_market_ioc_bounds,
-    validate_market_ioc_ack,
+)
+from kairos_execution.market_ioc_admission import (
+    validate_market_ioc_ack as validate_market_ioc_ack_core,
 )
 from kairos_execution.production_readiness import canonical_digest
 from tests.test_production_lifecycle_binding import _decision, _scope
@@ -53,6 +59,7 @@ class DynamicSyntheticEnvelopeVerifier:
             maximum_fill_price_e8=price_e8,
             maximum_base_quantity_e8=quantity_e8,
             maximum_fees_usd=Decimal(str(decision.estimated_fees_usd)),
+            fee_usdt_usd_upper_bound=Decimal("1.01"),
             cash_notional_cap_enforced=True,
             base_quantity_includes_rounding=True,
             price_bounds_cover_each_fill=True,
@@ -82,6 +89,7 @@ def inputs():
         maximum_fill_price_e8=10_051_000_000,
         maximum_base_quantity_e8=10_000_000,
         maximum_fees_usd=Decimal("0.009"),
+        fee_usdt_usd_upper_bound=Decimal("1.01"),
         cash_notional_cap_enforced=True,
         base_quantity_includes_rounding=True,
         price_bounds_cover_each_fill=True,
@@ -89,6 +97,40 @@ def inputs():
         bounds_enforced_through_terminal_ioc=True,
     )
     return request, envelope, context, decision
+
+
+def _signed_request(decision, client_order_id, request):
+    context, _ = _scope(decision)
+    return ManagedSigningRequestV1(
+        request_id="synthetic-request",
+        context=context,
+        manual_request_sha256="a" * 64,
+        custody_receipt_sha256="b" * 64,
+        operation="New market order",
+        message_json=json.dumps(
+            {
+                "id": client_order_id,
+                "instrument": decision.venue_symbol,
+                "side": "BUY" if decision.intent.side is Side.LONG else "SELL",
+                "timeInForce": "IOC",
+                "cashQuantity": request.cash_quantity_e8,
+                "leverage": 1,
+                "chainId": 42161,
+            }
+        ),
+        expires_at=datetime(2027, 1, 1, tzinfo=UTC),
+    )
+
+
+def validate_market_ioc_ack(response, *, decision, client_order_id, request, envelope, signed_request=None):
+    return validate_market_ioc_ack_core(
+        response,
+        decision=decision,
+        client_order_id=client_order_id,
+        request=request,
+        envelope=envelope,
+        signed_request=signed_request or _signed_request(decision, client_order_id, request),
+    )
 
 
 def check(inputs, *, request=None, envelope=None, context=None, decision=None, now_ms=11_000):
@@ -277,6 +319,7 @@ def test_ack_new_is_not_fill_and_partial_fill_must_match_envelope(inputs):
         "quantity": "0.1",
         "unFilledQuantity": "0.1",
         "status": "NEW",
+        "fee": [],
     }
     assert validate_market_ioc_ack(
         ack, decision=decision, client_order_id="fixture-id", request=request, envelope=envelope
@@ -286,14 +329,14 @@ def test_ack_new_is_not_fill_and_partial_fill_must_match_envelope(inputs):
         "status": "PARTIALLY_FILLED",
         "unFilledQuantity": "0.05",
         "filledAvgPrice": "100",
-        "fee": "0.001",
+        "fee": [{"coin": "USDT", "quantity": 0.001}],
     }
     assert validate_market_ioc_ack(
         partial, decision=decision, client_order_id="fixture-id", request=request, envelope=envelope
     ) == ("fixture-id", "PARTIALLY_FILLED", 0.05, 100.0)
     for changes in (
         {"filledAvgPrice": "101"},
-        {"fee": "0.01"},
+        {"fee": [{"coin": "USDT", "quantity": 0.01}]},
         {"unFilledQuantity": "0.2"},
         {"cashQuantity": "11"},
     ):
@@ -319,13 +362,14 @@ def test_zero_fill_cancel_cannot_hide_an_explicit_fee_over_the_envelope(inputs):
         "quantity": "0.1",
         "unFilledQuantity": "0.1",
         "status": "CANCELED",
+        "fee": [],
     }
     assert validate_market_ioc_ack(
         ack, decision=decision, client_order_id="fixture-id", request=request, envelope=envelope
     ) == ("fixture-id", "CANCELED", 0.0, None)
     with pytest.raises(ValueError):
         validate_market_ioc_ack(
-            {**ack, "fee": "0.00900001"},
+            {**ack, "fee": [{"coin": "USDT", "quantity": 0.00900001}]},
             decision=decision,
             client_order_id="fixture-id",
             request=request,
@@ -345,7 +389,7 @@ def test_zero_fill_cancel_cannot_hide_an_explicit_fee_over_the_envelope(inputs):
         {"unFilledQuantity": "-1"},
         {"filledAvgPrice": "99.99"},
         {"filledAvgPrice": "100.51000001"},
-        {"fee": "-1"},
+        {"fee": [{"coin": "USDT", "quantity": -1}]},
         {"status": "FILLED"},
         {"status": "UNRECOGNIZED"},
     ],
@@ -363,7 +407,7 @@ def test_partial_ack_rejects_scope_wrong_side_or_out_of_bounds(inputs, mutation)
         "unFilledQuantity": "0.05",
         "status": "PARTIALLY_FILLED",
         "filledAvgPrice": "100",
-        "fee": "0.001",
+        "fee": [{"coin": "USDT", "quantity": 0.001}],
     }
     with pytest.raises(ValueError):
         validate_market_ioc_ack(
@@ -389,10 +433,158 @@ def test_partial_ack_requires_economic_fields(inputs, missing):
         "unFilledQuantity": "0.05",
         "status": "PARTIALLY_FILLED",
         "filledAvgPrice": "100",
-        "fee": "0.001",
+        "fee": [{"coin": "USDT", "quantity": 0.001}],
     }
     del partial[missing]
     with pytest.raises(ValueError):
         validate_market_ioc_ack(
             partial, decision=decision, client_order_id="fixture-id", request=request, envelope=envelope
+        )
+
+
+def _openapi_market_partial(decision):
+    # Response shape from the public OpenAPI. timeInForce is intentionally
+    # absent: it is established from the immutable original request instead.
+    return {
+        "id": "fixture-id",
+        "user": "fixture-account",
+        "instrument": decision.venue_symbol,
+        "type": "MARKET",
+        "side": "BUY",
+        "status": "PARTIALLY_FILLED",
+        "rejectedReason": "",
+        "quantity": 0.1,
+        "limitPrice": 0,
+        "stopPrice": None,
+        "group": "manually",
+        "unFilledQuantity": 0.05,
+        "cashQuantity": 10,
+        "filledAvgPrice": 100,
+        "realizedPnL": 0,
+        "fee": [{"coin": "USDT", "quantity": 0.001}],
+        "triggeredAt": None,
+        "createdAt": "2026-11-08T00:00:00Z",
+        "updatedAt": "2026-11-08T00:00:00Z",
+    }
+
+
+def test_openapi_market_ack_uses_original_ioc_request_and_array_fee(inputs):
+    request, envelope, _, decision = inputs
+    response = _openapi_market_partial(decision)
+    assert validate_market_ioc_ack(
+        response, decision=decision, client_order_id="fixture-id", request=request, envelope=envelope
+    ) == ("fixture-id", "PARTIALLY_FILLED", 0.05, 100.0)
+    response["timeInForce"] = "GTC"
+    with pytest.raises(ValueError):
+        validate_market_ioc_ack(
+            response, decision=decision, client_order_id="fixture-id", request=request, envelope=envelope
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"timeInForce": "FOK"},
+        {"id": "other-id"},
+        {"cashQuantity": 100},
+        {"instrument": "ETHUSD"},
+        {"side": "SELL"},
+        {"leverage": 2},
+    ],
+)
+def test_absent_ack_tif_cannot_hide_substituted_signed_request(inputs, mutation):
+    request, envelope, _, decision = inputs
+    signed = _signed_request(decision, "fixture-id", request)
+    message = json.loads(signed.message_json)
+    message.update(mutation)
+    signed = signed.model_copy(update={"message_json": json.dumps(message)})
+    with pytest.raises(ValueError, match="original signed"):
+        validate_market_ioc_ack(
+            _openapi_market_partial(decision),
+            decision=decision,
+            client_order_id="fixture-id",
+            request=request,
+            envelope=envelope,
+            signed_request=signed,
+        )
+
+
+@pytest.mark.parametrize(
+    "fee",
+    [
+        None,
+        0.001,
+        {},
+        [{"coin": "USDT", "quantity": None}],
+        [{"coin": "USDT", "quantity": -1}],
+        [{"coin": "USDT", "quantity": True}],
+        [{"coin": "USDT", "quantity": float("nan")}],
+    ],
+)
+def test_partial_unknown_or_unqualified_reported_fees_remain_unresolved(inputs, fee):
+    request, envelope, _, decision = inputs
+    with pytest.raises(ValueError):
+        validate_market_ioc_ack(
+            {**_openapi_market_partial(decision), "fee": fee},
+            decision=decision,
+            client_order_id="fixture-id",
+            request=request,
+            envelope=envelope,
+        )
+
+
+@pytest.mark.parametrize("fee", [[], [{"coin": "BTC", "quantity": 0.001}]])
+def test_unpriced_or_unpublished_fee_is_unknown_but_does_not_block_protection(inputs, fee):
+    request, envelope, _, decision = inputs
+    response = {**_openapi_market_partial(decision), "fee": fee}
+    assert module._reported_fee_upper_usd(response, envelope=envelope) is None
+    assert (
+        validate_market_ioc_ack(
+            response, decision=decision, client_order_id="fixture-id", request=request, envelope=envelope
+        )[2]
+        == 0.05
+    )
+
+
+def test_legacy_envelope_roundtrips_without_inventing_fx_rate(inputs):
+    request, envelope, _, decision = inputs
+    values = envelope.model_dump(mode="python")
+    del values["fee_usdt_usd_upper_bound"]
+    legacy = VerifiedMarketIocEnvelopeV1.model_validate(values)
+    assert legacy.fee_usdt_usd_upper_bound is None
+    assert legacy.model_dump(mode="python") == values
+    old_json = envelope.model_dump(mode="json")
+    del old_json["fee_usdt_usd_upper_bound"]
+    expected_digest = hashlib.sha256(
+        json.dumps(old_json, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert canonical_digest(legacy) == expected_digest
+    response = _openapi_market_partial(decision)
+    assert module._reported_fee_upper_usd(response, envelope=legacy) is None
+    assert (
+        validate_market_ioc_ack(
+            response, decision=decision, client_order_id="fixture-id", request=request, envelope=legacy
+        )[2]
+        == 0.05
+    )
+
+
+def test_reported_usdt_is_converted_with_attested_conservative_upper_bound(inputs):
+    request, envelope, _, decision = inputs
+    response = _openapi_market_partial(decision)
+    response["fee"] = [{"coin": "USDT", "quantity": 0.00895}]
+    # 0.00895 USDT * 1.01 USD/USDT exceeds the 0.009 USD cap.
+    with pytest.raises(ValueError, match="fee exceeds"):
+        validate_market_ioc_ack(
+            response, decision=decision, client_order_id="fixture-id", request=request, envelope=envelope
+        )
+    # A rounded binary64 number at the cap is not evidence of exact raw JSON.
+    response["fee"] = [{"coin": "USDT", "quantity": 0.009}]
+    with pytest.raises(ValueError, match="fee exceeds"):
+        validate_market_ioc_ack(
+            response,
+            decision=decision,
+            client_order_id="fixture-id",
+            request=request,
+            envelope=envelope.model_copy(update={"fee_usdt_usd_upper_bound": Decimal(1)}),
         )
