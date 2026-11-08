@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import os
 import traceback
 from datetime import UTC, datetime, timedelta
@@ -265,6 +266,11 @@ class _UnknownCancellationTransport(_SyntheticCancellationTransport):
 @pytest.mark.integration
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "research_fee_v2",
+    [False, True, "v1-restart"],
+    ids=["legacy-fee-v1", "research-fee-v2", "v1-restarted-by-research-engine"],
+)
+@pytest.mark.parametrize(
     ("market_entry", "use_service_driver"),
     [
         (False, False),
@@ -288,8 +294,12 @@ class _UnknownCancellationTransport(_SyntheticCancellationTransport):
     ],
 )
 async def test_native_synthetic_live_path_stages_entry_exits_closes_and_releases_once(
-    monkeypatch, use_service_driver, market_entry
+    monkeypatch, use_service_driver, market_entry, research_fee_v2
 ):
+    if research_fee_v2:
+        pytest.importorskip(
+            "kairos_core.contracts.execution_fee_v2", reason="explicit V2 research source set required"
+        )
     unknown_entry = market_entry in {"missing_fee", "missing_cash"}
     stop_failure = market_entry in {"stop_failure", "cancel_unknown"}
     cancel_unknown = market_entry == "cancel_unknown"
@@ -668,6 +678,29 @@ async def test_native_synthetic_live_path_stages_entry_exits_closes_and_releases
             maximum_arm_lifetime=timedelta(minutes=10),
             clock_probe=mutable_clock,
         )
+        original_verify_evidence = authorization._verify_evidence
+
+        def diagnostic_verify_evidence(request, binding, evidence, *, now):
+            try:
+                return original_verify_evidence(request, binding, evidence, now=now)
+            except Exception as error:
+                if "operator or risk evidence is stale or future-dated" in str(error):
+                    observed = {
+                        "resolved": evidence.resolved_at,
+                        "risk": evidence.risk.observed_at,
+                        "operator": evidence.operator.observed_at if evidence.operator else None,
+                    }
+                    print(
+                        "synthetic freshness ages ms:",
+                        {
+                            key: None if at is None else (now - at).total_seconds() * 1000
+                            for key, at in observed.items()
+                        },
+                        flush=True,
+                    )
+                raise
+
+        monkeypatch.setattr(authorization, "_verify_evidence", diagnostic_verify_evidence)
         signer = ManagedSignerBoundary(
             custody,
             backend=backend,
@@ -757,7 +790,18 @@ async def test_native_synthetic_live_path_stages_entry_exits_closes_and_releases
         )
         from kairos_execution.production_lifecycle import ProductionLifecycleEngine
 
-        engine = ProductionLifecycleEngine(
+        if research_fee_v2:
+            from kairos_execution.execution_fee_v2_engine_research import ResearchFeeV2ProductionEngine
+
+            engine_type = (
+                ResearchFeeV2ProductionEngine if research_fee_v2 is True else ProductionLifecycleEngine
+            )
+            restart_engine_type = ResearchFeeV2ProductionEngine
+        else:
+            engine_type = ProductionLifecycleEngine
+            restart_engine_type = ProductionLifecycleEngine
+
+        engine = engine_type(
             adapter,
             trades,
             effects,
@@ -791,6 +835,32 @@ async def test_native_synthetic_live_path_stages_entry_exits_closes_and_releases
 
         monkeypatch.setattr(coordinator, "admit_and_handle_entry", diagnostic_admit)
         assert await coordinator.initialize_recovery() == ()
+        if use_service_driver:
+            # This local policy gate is explicitly synthetic. The real Risk,
+            # journals, claims, owner signatures and FSM still run below; no
+            # venue/account source is qualified by the fixture.
+            service_driver = build_production_service(
+                coordinator=coordinator,
+                entry_admission=lambda: True,
+                reconciliation_interval_s=60.0,
+            )
+            status = await service_driver.start()
+            assert status.recovery_complete and not status.entries_blocked
+            assert status.readiness is False
+        # Refresh the entirely synthetic facts only after all DDL, recovery,
+        # and component construction so the publisher sees a genuinely fresh
+        # two-second quote window rather than a pre-setup timestamp.
+        stage_now = _precise_utc_now()
+        remaining_to_next_cut_ms = 60_000 - int(stage_now.timestamp() * 1000) % 60_000
+        if remaining_to_next_cut_ms < 5_000:
+            # The old finite candidate really expires at that cut. Wait for
+            # the next cut and create all new fixture inputs below; never
+            # extend an existing intent or reset its original quote deadline.
+            await asyncio.sleep((remaining_to_next_cut_ms + 5) / 1000)
+            stage_now = _precise_utc_now()
+        # Publish the first synthetic operator observations only after any
+        # cut wait. The original timestamps and freshness rules are unchanged;
+        # a pre-wait observation could otherwise expire before admission.
         operator_now = _precise_utc_now()
         arm = owner_evidence.owner_arm.request
         disarmed = owner_evidence.operator.model_copy(
@@ -819,29 +889,7 @@ async def test_native_synthetic_live_path_stages_entry_exits_closes_and_releases
         )
         await operator.append_operator_observation_async(disarmed)
         await operator.append_operator_observation_async(armed)
-        if use_service_driver:
-            # This local policy gate is explicitly synthetic. The real Risk,
-            # journals, claims, owner signatures and FSM still run below; no
-            # venue/account source is qualified by the fixture.
-            service_driver = build_production_service(
-                coordinator=coordinator,
-                entry_admission=lambda: True,
-                reconciliation_interval_s=60.0,
-            )
-            status = await service_driver.start()
-            assert status.recovery_complete and not status.entries_blocked
-            assert status.readiness is False
-        # Refresh the entirely synthetic facts only after all DDL, recovery,
-        # and component construction so the publisher sees a genuinely fresh
-        # two-second quote window rather than a pre-setup timestamp.
         stage_now = _precise_utc_now()
-        remaining_to_next_cut_ms = 60_000 - int(stage_now.timestamp() * 1000) % 60_000
-        if remaining_to_next_cut_ms < 5_000:
-            # The old finite candidate really expires at that cut. Wait for
-            # the next cut and create all new fixture inputs below; never
-            # extend an existing intent or reset its original quote deadline.
-            await asyncio.sleep((remaining_to_next_cut_ms + 5) / 1000)
-            stage_now = _precise_utc_now()
         now_ms = int(stage_now.timestamp() * 1000)
         fixture_base_ms = (now_ms // 60_000) * 60_000 - 60_000
         monkeypatch.setattr(paper_fixtures, "T0", fixture_base_ms)
@@ -977,7 +1025,7 @@ async def test_native_synthetic_live_path_stages_entry_exits_closes_and_releases
                 entry_order_type="LIMIT_IOC",
                 market_ioc_admission=admission,
             )
-            fresh_engine = ProductionLifecycleEngine(
+            fresh_engine = restart_engine_type(
                 fresh_adapter,
                 trades,
                 effects,
@@ -997,7 +1045,33 @@ async def test_native_synthetic_live_path_stages_entry_exits_closes_and_releases
                 await fresh_engine.handle(decision)
             assert venue.calls == ["ENTRY", "CLOSE"]
             return
-        if service_driver is None:
+        if service_driver is None and market_entry is True and research_fee_v2 is True:
+            # Two independent engines contend on real repository/account
+            # locks. Stale/conflicting second admission may refuse, but cannot
+            # dispatch an additional venue entry or create a second fact.
+            competing_engine = engine_type(
+                adapter,
+                trades,
+                effects,
+                config,
+                runtime,
+                clock=mutable_clock,
+                sleeper=_no_sleep,
+                prepared_exit_risk=stager,
+            )
+            competing = ProductionLiveLifecycleCoordinator(
+                engine=competing_engine, entry_risk=entry_publisher
+            )
+            outcomes = await asyncio.gather(
+                coordinator.admit_and_handle_entry(**entry_inputs),
+                competing.admit_and_handle_entry(**entry_inputs),
+                return_exceptions=True,
+            )
+            successful = [item for item in outcomes if hasattr(item, "execution_result")]
+            assert successful, [type(item).__name__ for item in outcomes]
+            entry_result = next((item for item in successful if item.execution_result.events), successful[0])
+            assert venue.calls.count("ENTRY") == 1
+        elif service_driver is None:
             entry_result = await coordinator.admit_and_handle_entry(**entry_inputs)
         else:
             entry_result = await service_driver.submit(
@@ -1008,8 +1082,106 @@ async def test_native_synthetic_live_path_stages_entry_exits_closes_and_releases
         assert any(
             event.event_type.value == "ENTRY_PARTIAL_FILL" for event in entry_result.execution_result.events
         )
+        if research_fee_v2 is True:
+            from kairos_core.contracts import ExecutionFeeBundleV2, ExecutionFeeComponentV2
+
+            from kairos_execution.execution_fee_v2_research import append_research_fee_update_v2
+
+            assert (
+                await trades.get_execution_contract_version(decision.trade_id) == "trade-execution-event.v2"
+            )
+            for event in entry_result.execution_result.events:
+                assert event.contract_version == "trade-execution-event.v2"
+                assert event.fee_usd is None and event.fee.coverage == "UNKNOWN"
+            assert await owner.fetchval(
+                "SELECT count(*) FROM message_outbox WHERE topic='kairos.execution.trade_event.v2'"
+            ) == len(entry_result.execution_result.events)
+            assert (
+                await owner.fetchval(
+                    "SELECT count(*) FROM message_outbox WHERE topic='kairos.execution.trade_event.v1'"
+                )
+                == 0
+            )
+            partial = next(
+                event
+                for event in entry_result.execution_result.events
+                if event.event_type.value == "ENTRY_PARTIAL_FILL"
+            )
+            received_ms = int(mutable_clock().timestamp() * 1000)
+            fee_update = ExecutionFeeBundleV2(
+                scope_kind=partial.fee.scope_kind,
+                scope_reference=partial.fee.scope_reference,
+                coverage="INCOMPLETE",
+                components=(
+                    ExecutionFeeComponentV2(
+                        component_id="synthetic-partial-fee",
+                        asset="USDT",
+                        amount="0.001",
+                        precision="APPROXIMATE",
+                        source_id="synthetic-fixture",
+                        source_version="1",
+                        source_received_at_ms=received_ms,
+                    ),
+                ),
+                usd_status="UNKNOWN",
+                supersedes_event_id=partial.event_id,
+            )
+            before_update = await trades.get(decision.trade_id)
+            outbox_before = await owner.fetchval("SELECT count(*) FROM message_outbox")
+            update = await append_research_fee_update_v2(
+                trades,
+                previous=partial,
+                fee=fee_update,
+                occurred_at_ms=received_ms,
+                namespace=engine._lifecycle_scope.event_namespace,
+                source_fact_id="c" * 64,
+            )
+            duplicate = await append_research_fee_update_v2(
+                trades,
+                previous=partial,
+                fee=fee_update,
+                occurred_at_ms=received_ms,
+                namespace=engine._lifecycle_scope.event_namespace,
+                source_fact_id="c" * 64,
+            )
+            assert update == duplicate and update.event_type == "FEE_UPDATED"
+            assert update.fee_usd is None and update.fee.supersedes_event_id == partial.event_id
+            assert update.requested_quantity is update.filled_quantity is update.position_quantity is None
+            assert update.average_price is None
+            assert (await trades.get(decision.trade_id)).state_version == before_update.state_version
+            assert await owner.fetchval("SELECT count(*) FROM message_outbox") == outbox_before + 1
+            outbox_payload = await owner.fetchval(
+                "SELECT payload FROM message_outbox WHERE message_id=$1 AND topic=$2",
+                update.message_id,
+                "kairos.execution.trade_event.v2",
+            )
+            if isinstance(outbox_payload, str):
+                outbox_payload = json.loads(outbox_payload)
+            assert ["fee_source_fact_id", "c" * 64] in outbox_payload["details"]
+            assert outbox_payload["fee_usd"] is None
+            assert outbox_payload["fee"]["coverage"] == "INCOMPLETE"
+        elif research_fee_v2 == "v1-restart":
+            assert (
+                await trades.get_execution_contract_version(decision.trade_id) == "trade-execution-event.v1"
+            )
         assert venue.calls[:3] == ["ENTRY", "STOP_LOSS", "TAKE_PROFIT"]
-        assert await owner.fetchval("SELECT count(*) FROM kairos_production_state_v1.risk_decisions") == 3
+        decision_count_after_entry = await owner.fetchval(
+            "SELECT count(*) FROM kairos_production_state_v1.risk_decisions"
+        )
+        if market_entry is True and research_fee_v2 is True and service_driver is None:
+            reservation_count = await owner.fetchval(
+                "SELECT count(*) FROM kairos_production_state_v1.risk_reservations"
+            )
+            print(
+                "synthetic race risk decisions/reservations:",
+                decision_count_after_entry,
+                reservation_count,
+                flush=True,
+            )
+            assert decision_count_after_entry in {3, 4}
+            assert reservation_count == 1
+        else:
+            assert decision_count_after_entry == 3
         assert (
             await owner.fetchval("SELECT count(*) FROM kairos_production_state_v1.exposure_observations") == 2
         )
@@ -1048,7 +1220,7 @@ async def test_native_synthetic_live_path_stages_entry_exits_closes_and_releases
                 entry_order_type="LIMIT_IOC",
                 market_ioc_admission=admission,
             )
-            engine = ProductionLifecycleEngine(
+            engine = restart_engine_type(
                 restart_adapter,
                 trades,
                 effects,
@@ -1063,6 +1235,11 @@ async def test_native_synthetic_live_path_stages_entry_exits_closes_and_releases
             assert await coordinator.initialize_recovery() == ()
             assert venue.calls == calls_before_restart
             assert (await engine.handle(decision)).events == ()
+            if research_fee_v2 == "v1-restart":
+                assert (
+                    await trades.get_execution_contract_version(decision.trade_id)
+                    == "trade-execution-event.v1"
+                )
         await asyncio.sleep(max(0.0, (trade.timeout_at - mutable_clock()).total_seconds() + 0.05))
         for _ in range(3):
             if service_driver is None:
@@ -1073,14 +1250,63 @@ async def test_native_synthetic_live_path_stages_entry_exits_closes_and_releases
                 break
         assert "CLOSE" in venue.calls
         assert venue.calls.index("STOP_LOSS") < venue.calls.index("TAKE_PROFIT") < venue.calls.index("CLOSE")
-        assert await owner.fetchval("SELECT count(*) FROM kairos_production_state_v1.risk_decisions") == 4
+        assert (
+            await owner.fetchval("SELECT count(*) FROM kairos_production_state_v1.risk_decisions")
+            == decision_count_after_entry + 1
+        )
         trade = await trades.get(decision.trade_id)
         assert trade is not None and trade.state is TradeState.FLAT
+        if research_fee_v2 is True:
+            before_retry = await owner.fetchval("SELECT count(*) FROM message_outbox")
+            replayed_update = await append_research_fee_update_v2(
+                trades,
+                previous=partial,
+                fee=fee_update,
+                occurred_at_ms=received_ms,
+                namespace=engine._lifecycle_scope.event_namespace,
+                source_fact_id="c" * 64,
+            )
+            assert replayed_update.event_id == update.event_id
+            assert replayed_update.occurred_at_ms == update.occurred_at_ms
+            assert await owner.fetchval("SELECT count(*) FROM message_outbox") == before_retry
+            with pytest.raises(ValueError, match="replay conflicts"):
+                await append_research_fee_update_v2(
+                    trades,
+                    previous=partial,
+                    fee=fee_update,
+                    occurred_at_ms=received_ms + 1,
+                    namespace=engine._lifecycle_scope.event_namespace,
+                    source_fact_id="c" * 64,
+                )
+            for changed in ({"amount": Decimal("0.002")}, {"source_id": "different-source"}):
+                changed_fee = fee_update.model_copy(
+                    update={"components": (fee_update.components[0].model_copy(update=changed),)}
+                )
+                with pytest.raises(ValueError, match="replay conflicts"):
+                    await append_research_fee_update_v2(
+                        trades,
+                        previous=partial,
+                        fee=changed_fee,
+                        occurred_at_ms=received_ms,
+                        namespace=engine._lifecycle_scope.event_namespace,
+                        source_fact_id="c" * 64,
+                    )
         closed = await coordinator.reconcile_once()
         assert closed == []
         calls_before_replay = list(venue.calls)
         assert (await engine.handle(decision)).events == ()
         assert venue.calls == calls_before_replay
+
+        # A flat position and the ACK's empty fee array are not terminal fee
+        # or funding evidence and cannot by themselves release risk.
+        assert (
+            await owner.fetchval("SELECT count(*) FROM kairos_production_accounting_v1.accepted_releases")
+            == 0
+        )
+        assert (
+            await owner.fetchval("SELECT count(*) FROM kairos_production_reconciliation_v2.terminal_receipts")
+            == 0
+        )
 
         reservation = await owner.fetchrow(
             "SELECT r.owner_arm_sha256,r.request_sha256,d.payload "
@@ -1188,7 +1414,7 @@ async def test_native_synthetic_live_path_stages_entry_exits_closes_and_releases
             evidence_provider=_SyntheticExitProvider(),
             clock=mutable_clock,
         )
-        fresh_engine = ProductionLifecycleEngine(
+        fresh_engine = restart_engine_type(
             adapter,
             trades,
             effects,

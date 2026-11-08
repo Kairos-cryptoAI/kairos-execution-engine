@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
 from kairos_core.contracts import (
     AccountSnapshotV2,
@@ -60,6 +60,15 @@ from .lifecycle_scope import LifecycleAdmissionPolicy, PaperDevCanaryPolicy
 from .operator_control import PaperOperatorControl
 from .state_machine import client_order_id
 
+if TYPE_CHECKING:
+    from kairos_core.contracts import (  # type: ignore[attr-defined]  # optional research Core
+        TradeExecutionEventV2,
+    )
+
+    ExecutionEvent: TypeAlias = TradeExecutionEventV1 | TradeExecutionEventV2
+else:
+    ExecutionEvent = TradeExecutionEventV1
+
 _CANARY_SOURCE = "kairos-paper-canary"
 _CANARY_RULE_DOMAIN = "evedex-dev-instrument-rule.v1"
 _CANARY_RULE_DECIMAL_FIELDS = (
@@ -97,7 +106,7 @@ class PaperExecutionSafetyError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class PaperExecutionResult:
-    events: tuple[TradeExecutionEventV1, ...]
+    events: tuple[ExecutionEvent, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,7 +162,7 @@ class _EvedexProtectedExecutionEngine:
         self.clock = clock or (lambda: datetime.now(UTC))
         self._sleep = sleeper or asyncio.sleep
         self._recovery_blockers: tuple[str, ...] = ("startup recovery has not run",)
-        self._recovered_events: list[TradeExecutionEventV1] = []
+        self._recovered_events: list[ExecutionEvent] = []
         self._operational_telemetry: dict[str, str] = {}
         self._last_sidecar_health: dict[str, Any] = {}
         self._lifecycle_lock = asyncio.Lock()
@@ -684,7 +693,7 @@ class _EvedexProtectedExecutionEngine:
                 raise PaperExecutionSafetyError("IOC terminal projections conflict")
         return (None if not terminal else terminal[0]), observed_fill
 
-    async def _reconcile_redelivery_locked(self, trade: TradeRecord) -> list[TradeExecutionEventV1]:
+    async def _reconcile_redelivery_locked(self, trade: TradeRecord) -> list[ExecutionEvent]:
         """Recover one redelivered trade while its cross-process lock is held."""
         await self._observe_health(await self.adapter.preflight())
         venue = await self.adapter.fetch_paper_state()
@@ -738,10 +747,10 @@ class _EvedexProtectedExecutionEngine:
         self,
         trade: TradeRecord,
         venue: dict[str, Any],
-    ) -> list[TradeExecutionEventV1]:
+    ) -> list[ExecutionEvent]:
         """Close crash windows that provably precede any venue mutation."""
         decision = self._decision_for_trade(trade)
-        events: list[TradeExecutionEventV1] = []
+        events: list[ExecutionEvent] = []
         if trade.state is TradeState.RECEIVED:
             trade, cancelled = await self._transition_with_event(
                 decision,
@@ -794,7 +803,7 @@ class _EvedexProtectedExecutionEngine:
     async def _recover_terminal_public_fact(
         self,
         trade: TradeRecord,
-    ) -> list[TradeExecutionEventV1]:
+    ) -> list[ExecutionEvent]:
         """Audit terminal state; atomic transitions make repair unnecessary."""
         facts = await self.trades.list_execution_events(trade.trade_id)
         if trade.state is TradeState.CANCELLED:
@@ -816,7 +825,7 @@ class _EvedexProtectedExecutionEngine:
             return []
         raise PaperExecutionSafetyError("terminal FLAT trade lacks its atomic public lifecycle fact")
 
-    async def reconcile_once(self) -> list[TradeExecutionEventV1]:
+    async def reconcile_once(self) -> list[ExecutionEvent]:
         """Serialize reconciliation against decision handling in this process."""
         async with self._lifecycle_lock:
             async with self.trades.account_lock(**self._remote_account_scope):
@@ -828,7 +837,7 @@ class _EvedexProtectedExecutionEngine:
                     )
                     raise
 
-    async def _reconcile_once_unlocked(self) -> list[TradeExecutionEventV1]:
+    async def _reconcile_once_unlocked(self) -> list[ExecutionEvent]:
         """Reconcile sidecar events, entry expiry, fill protection and timeout."""
         if self.recovery_blocked:
             return []
@@ -1259,10 +1268,8 @@ class _EvedexProtectedExecutionEngine:
             math.isclose(left[key], right[key], rel_tol=1e-9, abs_tol=1e-12) for key in left
         )
 
-    async def _protect(
-        self, decision: RiskTradeDecisionV1, trade: TradeRecord
-    ) -> list[TradeExecutionEventV1]:
-        events: list[TradeExecutionEventV1] = []
+    async def _protect(self, decision: RiskTradeDecisionV1, trade: TradeRecord) -> list[ExecutionEvent]:
+        events: list[ExecutionEvent] = []
         stop_client_id = self._client_id(trade.trade_id, OrderRole.STOP_LOSS, decision.decided_at_ms)
         stop_effect = self._effect_id(trade.trade_id, OrderRole.STOP_LOSS, "create")
         try:
@@ -1418,7 +1425,7 @@ class _EvedexProtectedExecutionEngine:
 
     async def _emergency_close(
         self, decision: RiskTradeDecisionV1, trade: TradeRecord, reason: str
-    ) -> list[TradeExecutionEventV1]:
+    ) -> list[ExecutionEvent]:
         trade, close_quantity, events = await self._cancel_entry_and_measure_position(decision, trade)
         if trade.state is not TradeState.EXITING_EMERGENCY:
             close_client_id = self._fresh_close_client_id(trade.trade_id, OrderRole.EMERGENCY_EXIT)
@@ -2190,13 +2197,13 @@ class _EvedexProtectedExecutionEngine:
         trade: TradeRecord,
         venue: dict[str, Any],
         sidecar_events: tuple[dict[str, Any], ...],
-    ) -> list[TradeExecutionEventV1]:
+    ) -> list[ExecutionEvent]:
         """Converge one trade from authoritative state without guessing effects."""
         decision = self._decision_for_trade(trade)
         now = self.clock().astimezone(UTC)
         position_quantity = self._position_quantity_for_trade(venue, trade)
         entry = self._find_order(venue, trade.entry_client_order_id)
-        events: list[TradeExecutionEventV1] = []
+        events: list[ExecutionEvent] = []
         if trade.state in {TradeState.RECEIVED, TradeState.ENTRY_PENDING}:
             events.extend(await self._recover_pre_mutation_gap(trade, venue))
             current = await self.trades.get(trade.trade_id)
@@ -2494,7 +2501,7 @@ class _EvedexProtectedExecutionEngine:
         trade: TradeRecord,
         venue: dict[str, Any],
         position_quantity: float,
-    ) -> tuple[TradeRecord, list[TradeExecutionEventV1]]:
+    ) -> tuple[TradeRecord, list[ExecutionEvent]]:
         """Advance durable filled quantity when an entry remainder fills later."""
         tolerance = max(1e-12, trade.quantity * 1e-9)
         if position_quantity < trade.filled_quantity - tolerance:
@@ -2580,9 +2587,7 @@ class _EvedexProtectedExecutionEngine:
         )
         return response
 
-    async def _timeout_close(
-        self, decision: RiskTradeDecisionV1, trade: TradeRecord
-    ) -> list[TradeExecutionEventV1]:
+    async def _timeout_close(self, decision: RiskTradeDecisionV1, trade: TradeRecord) -> list[ExecutionEvent]:
         close_client_id = self._fresh_close_client_id(trade.trade_id, OrderRole.TIMEOUT_EXIT)
         trade, triggered = await self._transition_with_event(
             decision,
@@ -2613,7 +2618,7 @@ class _EvedexProtectedExecutionEngine:
         trade: TradeRecord,
         attribution: _VenueTriggeredExit,
         client_id: str | None,
-    ) -> tuple[TradeRecord, TradeExecutionEventV1]:
+    ) -> tuple[TradeRecord, ExecutionEvent]:
         if client_id is None:
             raise PaperExecutionSafetyError("triggered TP/SL lacks deterministic client lineage")
         return await self._transition_with_event(
@@ -2643,7 +2648,7 @@ class _EvedexProtectedExecutionEngine:
         trade: TradeRecord,
         role: OrderRole,
         reason: TradeExitReason,
-    ) -> list[TradeExecutionEventV1]:
+    ) -> list[ExecutionEvent]:
         trade, close_quantity, events = await self._cancel_entry_and_measure_position(decision, trade)
         if close_quantity <= 0:
             return [*events, *(await self._finish_venue_exit(decision, trade, role, reason))]
@@ -2699,9 +2704,9 @@ class _EvedexProtectedExecutionEngine:
         self,
         decision: RiskTradeDecisionV1,
         trade: TradeRecord,
-    ) -> tuple[TradeRecord, float, list[TradeExecutionEventV1]]:
+    ) -> tuple[TradeRecord, float, list[ExecutionEvent]]:
         """Cancel a fillable remainder before closing the net DEV position."""
-        events: list[TradeExecutionEventV1] = []
+        events: list[ExecutionEvent] = []
         venue = await self.adapter.fetch_paper_state()
         if self._find_order(venue, trade.entry_client_order_id) is not None:
             await self._cancel_entry_effect(trade)
@@ -2750,7 +2755,7 @@ class _EvedexProtectedExecutionEngine:
         response: dict[str, Any] | None = None,
         attribution: _VenueTriggeredExit | None = None,
         sidecar_events: tuple[dict[str, Any], ...] = (),
-    ) -> list[TradeExecutionEventV1]:
+    ) -> list[ExecutionEvent]:
         close_client_id = (
             trade.stop_client_order_id
             if role is OrderRole.STOP_LOSS
@@ -3333,11 +3338,7 @@ class _EvedexProtectedExecutionEngine:
         if existed is not None:
             stored = await self.trades.get_execution_event(new_trade.trade_id, fact_key=fact_key)
             if stored is not None:
-
-                def replay_creation(_sequence: int) -> TradeExecutionEventV1:
-                    return stored
-
-                build = replay_creation
+                build = self._replay_execution_event_builder(stored, build)
         result = await self.trades.create_with_execution_event(
             new_trade,
             fact_key=fact_key,
@@ -3375,7 +3376,7 @@ class _EvedexProtectedExecutionEngine:
         fee_usd: float = 0,
         exit_reason: TradeExitReason | None = None,
         details: tuple[tuple[str, str], ...] = (),
-    ) -> tuple[TradeRecord, TradeExecutionEventV1]:
+    ) -> tuple[TradeRecord, ExecutionEvent]:
         """Atomically mutate the FSM/internal journal and append one public fact."""
 
         default_position = (
@@ -3401,11 +3402,7 @@ class _EvedexProtectedExecutionEngine:
         )
         stored = await self.trades.get_execution_event(trade.trade_id, fact_key=fact_key)
         if stored is not None:
-
-            def replay_transition(_sequence: int) -> TradeExecutionEventV1:
-                return stored
-
-            build = replay_transition
+            build = self._replay_execution_event_builder(stored, build)
         result = await self.trades.transition_with_execution_event(
             trade.trade_id,
             target,
@@ -3424,6 +3421,14 @@ class _EvedexProtectedExecutionEngine:
             close_exchange_order_id=close_exchange_order_id,
         )
         return result.trade, result.event
+
+    def _replay_execution_event_builder(self, stored, build):
+        """Keep the established V1 replay unchanged; research profiles may verify more."""
+
+        def replay(_sequence: int):
+            return stored
+
+        return replay
 
     def _expected_venue_health(self) -> dict[str, Any]:
         """Exact pinned profile fields required by the existing PAPER route."""

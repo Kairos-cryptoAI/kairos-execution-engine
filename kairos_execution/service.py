@@ -6,7 +6,7 @@ import asyncio
 from datetime import UTC, date, datetime
 
 from kairos_core.bus import build_bus
-from kairos_core.contracts import AccountSnapshot, RiskTradeDecisionV1, ValidatedOrder
+from kairos_core.contracts import AccountSnapshot, RiskTradeDecisionV1, TradeExecutionEventV1, ValidatedOrder
 from kairos_core.enums import SystemMode, TradingMode
 from kairos_core.logging import configure_logging, get_logger
 from kairos_core.topics import Topics
@@ -134,7 +134,7 @@ class ExecutionService:
                 decision = RiskTradeDecisionV1.model_validate(env.payload)
                 result = await self._required_paper_engine().handle(decision)
                 for event in result.events:
-                    await self.bus.publish(Topics.TRADE_EXECUTION_EVENT, event)
+                    await self.bus.publish(self._trade_execution_event_topic(event), event)
                 self._request_account_refresh()
                 await self.bus.ack(Topics.RISK_TRADE_DECISION, env, group="execution-paper")
             except PaperExecutionSafetyError as exc:
@@ -297,7 +297,7 @@ class ExecutionService:
                 events = await engine.reconcile_once()
                 self._log_paper_telemetry()
                 for event in events:
-                    await self.bus.publish(Topics.TRADE_EXECUTION_EVENT, event)
+                    await self.bus.publish(self._trade_execution_event_topic(event), event)
             except Exception as exc:
                 await self._required_paper_engine().block_entries(
                     f"lifecycle reconciliation failed: {type(exc).__name__}"
@@ -307,6 +307,13 @@ class ExecutionService:
             else:
                 if events:
                     self._request_account_refresh()
+
+    @staticmethod
+    def _trade_execution_event_topic(event):
+        """Preserve the existing V1 route; detached research profiles may opt in."""
+        if type(event) is not TradeExecutionEventV1:
+            raise PaperExecutionSafetyError("unknown execution event version cannot be published")
+        return Topics.TRADE_EXECUTION_EVENT
 
     async def close(self) -> None:
         """Release both resources even if the first close operation fails."""
