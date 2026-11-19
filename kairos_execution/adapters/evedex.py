@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from kairos_core.contracts import AccountSnapshot, ExecutionReport, OrderIntent, PositionSnapshot
 from kairos_core.enums import OrderSide, OrderStatus, OrderType, TimeInForce
@@ -26,8 +26,10 @@ from kairos_core.enums import OrderSide, OrderStatus, OrderType, TimeInForce
 from ..crypto import EIP712_SCHEMAS, Signer, build_domain, to_eth_number
 from ..live_authorization import (
     LiveMutationAuthorization,
+    LiveMutationAuthorizationError,
     require_live_mutation_authorization,
 )
+from ..native_protection import EVEDEX_NATIVE_PROTECTION_UNAVAILABLE
 from ..ratelimit import TokenBucket
 from ..state_machine import (
     client_order_id,
@@ -215,6 +217,11 @@ class EvedexAdapter(ExchangeAdapter):
                 self._live_authorization,
                 operation=operation,
             )
+            if (self.chain_id == 42161 or urlsplit(self.base).hostname == "trading-api.evedex.com") and (
+                operation in {"place_order", "set_protective_stop"}
+                or operation.startswith(("/api/v2/order/", "/api/tpsl/"))
+            ):
+                raise LiveMutationAuthorizationError(EVEDEX_NATIVE_PROTECTION_UNAVAILABLE)
 
     async def fetch_order_history(self) -> EvedexOrderHistoryReadV1:
         """Read complete bounded history for the JWT-bound account; never a release signal."""
@@ -592,8 +599,8 @@ class EvedexAdapter(ExchangeAdapter):
         message = {
             "instrument": instrument,
             "type": "stop-loss",
-            # EVEDEX TpSl.side is the protected position side, not the side of
-            # the market order that will eventually close that position.
+            # The SDK example uses the entry side. Production admission is closed
+            # because a triggered order increased exposure using that same side.
             "side": position_side.value,
             "quantity": 0,
             "price": to_eth_number(stop_price),

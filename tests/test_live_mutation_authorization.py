@@ -13,6 +13,7 @@ from kairos_execution.adapters.evedex import EvedexAdapter
 from kairos_execution.live_authorization import (
     LiveMutationAuthorization,
     LiveMutationAuthorizationError,
+    _issue_live_mutation_authorization,
 )
 
 
@@ -53,6 +54,27 @@ def _evedex_adapter(signer: RecordingSigner | None = None) -> EvedexAdapter:
 def test_live_authorization_cannot_be_constructed_without_release_issuer():
     with pytest.raises(TypeError, match="issued by the release gate"):
         LiveMutationAuthorization()
+
+
+@pytest.mark.asyncio
+async def test_armed_prod_adapter_refuses_entry_and_native_protection_before_signing():
+    signer = RecordingSigner()
+    adapter = EvedexAdapter(
+        exchange_base_url="https://trading-api.evedex.com",
+        signer=signer,
+        chain_id=42161,
+        dry_run=False,
+        live_authorization=_issue_live_mutation_authorization(),
+    )
+    adapter._session_get = AsyncMock(side_effect=AssertionError("unexpected network call"))
+    with pytest.raises(LiveMutationAuthorizationError, match="not qualified to reduce"):
+        await adapter.place_order(_intent())
+    with pytest.raises(LiveMutationAuthorizationError, match="not qualified to reduce"):
+        await adapter.set_protective_stop("BTCUSD", 60_000, OrderSide.SELL, "parent")
+    adapter._authorize_live_mutation("close_position")
+    adapter._authorize_live_mutation("cancel_order")
+    assert signer.messages == []
+    adapter._session_get.assert_not_awaited()
 
 
 @pytest.mark.asyncio
