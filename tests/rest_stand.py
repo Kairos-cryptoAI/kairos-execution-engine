@@ -20,11 +20,14 @@ import base64
 import copy
 import hashlib
 import json
+import os
 import secrets
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from kairos_execution.managed_signer import reviewed_schema_sha256
 from kairos_execution.production_owner import (
@@ -45,7 +48,22 @@ from kairos_execution.single_host_readiness import issuer_registry_sha256
 from kairos_execution.technical_canary_readiness import TECHNICAL_CANARY_REQUIRED_KINDS
 
 SYNTHETIC = b"SYNTHETIC TEST STAND ONLY - NOT EVIDENCE OF ANY REAL DEPLOYMENT OR READINESS"
-ADMIN_DSN_FILE = Path(r"D:\Kairos\runtime\execution-prod\secrets\postgres-admin.dsn")
+
+
+def stand_admin_dsn() -> str:
+    if os.getenv("KAIROS_REST_STAND") != "1":
+        pytest.skip("set KAIROS_REST_STAND=1 to run the disposable database stand")
+    filename = os.getenv("KAIROS_REST_STAND_ADMIN_DSN_FILE")
+    if not filename:
+        pytest.skip("set KAIROS_REST_STAND_ADMIN_DSN_FILE for the disposable database server")
+    return Path(filename).read_text(encoding="utf-8").strip()
+
+
+def stand_container() -> str:
+    name = os.getenv("KAIROS_REST_STAND_CONTAINER")
+    if not name:
+        pytest.skip("set KAIROS_REST_STAND_CONTAINER to the disposable database container")
+    return name
 
 
 def iso_ms(stamp: datetime) -> str:

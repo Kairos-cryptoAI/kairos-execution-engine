@@ -57,7 +57,8 @@ async def test_postgres_lock_orders_stop_but_disconnect_loses_fence():
         async with pool.acquire() as connection:
             await connection.execute(
                 "INSERT INTO kairos_session_loss_v1.events VALUES($1,$2,1,'ACTIVE',clock_timestamp())",
-                scope, session_id,
+                scope,
+                session_id,
             )
         wrong_session = PostgresSessionStopBoundary(source, session_id=uuid4(), max_age=timedelta(seconds=5))
         with pytest.raises(SessionStopBoundaryError, match="STOP or current evidence unavailable"):
@@ -76,7 +77,8 @@ async def test_postgres_lock_orders_stop_but_disconnect_loses_fence():
                 await connection.fetchval("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", lock)
                 await connection.execute(
                     "INSERT INTO kairos_session_loss_v1.events VALUES($1,$2,2,'STOP',clock_timestamp())",
-                    scope, session_id,
+                    scope,
+                    session_id,
                 )
 
         async with guard.entry(context=context):
@@ -95,7 +97,8 @@ async def test_postgres_lock_orders_stop_but_disconnect_loses_fence():
             await connection.execute("TRUNCATE kairos_session_loss_v1.events")
             await connection.execute(
                 "INSERT INTO kairos_session_loss_v1.events VALUES($1,$2,1,'ACTIVE',clock_timestamp())",
-                scope, session_id,
+                scope,
+                session_id,
             )
         with pytest.raises(SessionStopBoundaryError, match="unavailable or operation unresolved"):
             async with guard.entry(context=context) as lease:

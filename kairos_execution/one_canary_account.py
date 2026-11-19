@@ -312,7 +312,7 @@ class EvedexCanaryAccountSource:
             for r in order_summaries
         ):
             raise CanaryAccountError("order summary contradicts opened orders")
-        statuses = Counter()
+        statuses: Counter[str] = Counter()
         for row in tpsl:
             status = row.get("status")
             if status not in KNOWN_TPSL:
@@ -363,7 +363,7 @@ class EvedexCanaryAccountSource:
             )
             self._identity(await self._get(session, "/api/user/me", reads))
         deposits = withdrawals = Decimal(0)
-        counts = Counter()
+        counts: Counter[str] = Counter()
         for row in rows:
             if str(row.get("coin", "")).lower() != "usdt":
                 raise CanaryAccountError("flow currency unsupported")

@@ -42,8 +42,12 @@ async def test_forged_active_guard_never_enables_direct_signer():
     claims, _ = claims_fixture(context=request.context)
     boundary = SyntheticStop(active=True)
     signer = ManagedSignerBoundary(
-        original.binding, backend=backend, verifier=verifier, claims=Claims(),
-        authorization=authorization, session_stop_boundary=boundary,
+        original.binding,
+        backend=backend,
+        verifier=verifier,
+        claims=Claims(),
+        authorization=authorization,
+        session_stop_boundary=boundary,
     )
     with pytest.raises(ManagedSigningError, match="atomic session entry fence is unavailable"):
         await signer.sign_async(request, now=NOW, claims=claims)
@@ -56,8 +60,12 @@ async def test_stop_after_signing_claim_prevents_custody_and_claim_is_unresolved
     claims, db = claims_fixture(context=request.context)
     boundary = SyntheticStop(active=False)
     signer = ManagedSignerBoundary(
-        original.binding, backend=backend, verifier=verifier, claims=Claims(),
-        authorization=authorization, session_stop_boundary=boundary,
+        original.binding,
+        backend=backend,
+        verifier=verifier,
+        claims=Claims(),
+        authorization=authorization,
+        session_stop_boundary=boundary,
     )
     # Deliberately disable only in this synthetic boundary-mechanics test.
     # A constructed production runtime rejects this inconsistent state.
@@ -72,8 +80,12 @@ async def test_stop_after_signing_claim_prevents_custody_and_claim_is_unresolved
 def test_sync_entry_cannot_skip_configured_async_boundary():
     original, request, backend, verifier, authorization = setup_signer()
     signer = ManagedSignerBoundary(
-        original.binding, backend=backend, verifier=verifier, claims=Claims(),
-        authorization=authorization, session_stop_boundary=SyntheticStop(active=True),
+        original.binding,
+        backend=backend,
+        verifier=verifier,
+        claims=Claims(),
+        authorization=authorization,
+        session_stop_boundary=SyntheticStop(active=True),
     )
     signer._require_session_entry_fence = False  # synthetic mechanics only
     with pytest.raises(ManagedSigningError, match="require asynchronous signing"):
@@ -100,11 +112,17 @@ async def signed_wire(operation="New limit order"):
         "New take-profit/stop-loss": ("PROTECTIVE_STOP", "/api/tpsl/BTCUSD"),
     }[operation]
     wire = ProductionWireRequestV1(
-        context=request.context, database_uuid=claims.database_uuid, decision_id=decision_id,
+        context=request.context,
+        database_uuid=claims.database_uuid,
+        decision_id=decision_id,
         effect_id=signing_effect_id(request=request, message=message, decision_id=decision_id),
-        effect_type=effect, method="POST", path=path,
+        effect_type=effect,
+        method="POST",
+        path=path,
         body=production_wire_body(request.operation, message, signed.signature),
-        signing_request=request, custody_binding=signer.binding, signed=signed,
+        signing_request=request,
+        custody_binding=signer.binding,
+        signed=signed,
     )
     return claims, db, wire, now
 
@@ -119,9 +137,14 @@ async def test_forged_active_guard_never_enables_direct_dispatch():
         return {"status": "SYNTHETIC"}
 
     dispatcher = ProductionEffectDispatcher(
-        authorization=CurrentState(), signature_verifier=SyntheticSignatureVerifier(),
-        claims=claims, database_uuid=claims.database_uuid, context=wire.context,
-        clock=lambda: now, sender=sender, session_stop_boundary=boundary,
+        authorization=CurrentState(),
+        signature_verifier=SyntheticSignatureVerifier(),
+        claims=claims,
+        database_uuid=claims.database_uuid,
+        context=wire.context,
+        clock=lambda: now,
+        sender=sender,
+        session_stop_boundary=boundary,
     )
     with pytest.raises(ProductionDispatchError, match="atomic session entry fence is unavailable"):
         await dispatcher.dispatch_one(wire)
@@ -138,9 +161,14 @@ async def test_stop_after_wire_claim_prevents_previously_signed_entry():
         return {"status": "SYNTHETIC"}
 
     dispatcher = ProductionEffectDispatcher(
-        authorization=CurrentState(), signature_verifier=SyntheticSignatureVerifier(),
-        claims=claims, database_uuid=claims.database_uuid, context=wire.context,
-        clock=lambda: now, sender=sender, session_stop_boundary=boundary,
+        authorization=CurrentState(),
+        signature_verifier=SyntheticSignatureVerifier(),
+        claims=claims,
+        database_uuid=claims.database_uuid,
+        context=wire.context,
+        clock=lambda: now,
+        sender=sender,
+        session_stop_boundary=boundary,
     )
     dispatcher._require_session_entry_fence = False  # synthetic mechanics only
     with pytest.raises(ProductionDispatchError, match="outcome is unresolved"):
@@ -167,9 +195,14 @@ async def test_wire_expiring_while_waiting_for_lock_never_calls_sender():
         return {"status": "SYNTHETIC"}
 
     dispatcher = ProductionEffectDispatcher(
-        authorization=CurrentState(), signature_verifier=SyntheticSignatureVerifier(),
-        claims=claims, database_uuid=claims.database_uuid, context=wire.context,
-        clock=lambda: current[0], sender=sender, session_stop_boundary=WaitPastExpiry(),
+        authorization=CurrentState(),
+        signature_verifier=SyntheticSignatureVerifier(),
+        claims=claims,
+        database_uuid=claims.database_uuid,
+        context=wire.context,
+        clock=lambda: current[0],
+        sender=sender,
+        session_stop_boundary=WaitPastExpiry(),
     )
     dispatcher._require_session_entry_fence = False  # synthetic mechanics only
     with pytest.raises(ProductionDispatchError, match="outcome is unresolved"):
@@ -188,9 +221,14 @@ async def test_stopped_boundary_does_not_block_authorized_protection(operation):
         return {"status": "SYNTHETIC"}
 
     dispatcher = ProductionEffectDispatcher(
-        authorization=CurrentState(), signature_verifier=SyntheticSignatureVerifier(),
-        claims=claims, database_uuid=claims.database_uuid, context=wire.context,
-        clock=lambda: now, sender=sender, session_stop_boundary=boundary,
+        authorization=CurrentState(),
+        signature_verifier=SyntheticSignatureVerifier(),
+        claims=claims,
+        database_uuid=claims.database_uuid,
+        context=wire.context,
+        clock=lambda: now,
+        sender=sender,
+        session_stop_boundary=boundary,
     )
     assert await dispatcher.dispatch_one(wire) == {"status": "SYNTHETIC"}
     assert len(sends) == 1 and boundary.calls == []
@@ -211,10 +249,23 @@ def test_builder_wires_one_session_boundary_without_changing_static_fence(builde
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("broken", [
-    "latch", "signer", "dispatcher", "foreign_source", "source_static", "signer_static", "wire_static",
-    "io_signer", "io_dispatcher", "io_source", "io_claims", "io_session",
-])
+@pytest.mark.parametrize(
+    "broken",
+    [
+        "latch",
+        "signer",
+        "dispatcher",
+        "foreign_source",
+        "source_static",
+        "signer_static",
+        "wire_static",
+        "io_signer",
+        "io_dispatcher",
+        "io_source",
+        "io_claims",
+        "io_session",
+    ],
+)
 async def test_runtime_refuses_inconsistent_session_configuration(builder_setup, broken):  # noqa: F811
     *_, arguments = builder_setup
     runtime = build_clocked_production_runtime(**arguments, session_stop_id=uuid4())

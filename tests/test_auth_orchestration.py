@@ -1,4 +1,5 @@
 """Synthetic credential copies and mocked auth/WS; no real account calls."""
+
 import asyncio
 import json
 
@@ -23,8 +24,10 @@ API_KEY = "synthetic-api-key-not-real"
 
 def provision(tmp_path):
     return provision_existing_auth_material(
-        destination=tmp_path / "protected", wallet_private_key=KEY,
-        api_key=API_KEY, expected_wallet_address=Account.from_key(KEY).address,
+        destination=tmp_path / "protected",
+        wallet_private_key=KEY,
+        api_key=API_KEY,
+        expected_wallet_address=Account.from_key(KEY).address,
     )
 
 
@@ -50,13 +53,17 @@ def test_existing_destination_and_wallet_mismatch_refused_without_changes(tmp_pa
     before = material.keystore_file.read_bytes()
     with pytest.raises(AuthPreparationError):
         provision_existing_auth_material(
-            destination=material.directory, wallet_private_key=KEY,
-            api_key=API_KEY, expected_wallet_address=material.wallet_address,
+            destination=material.directory,
+            wallet_private_key=KEY,
+            api_key=API_KEY,
+            expected_wallet_address=material.wallet_address,
         )
     assert material.keystore_file.read_bytes() == before
     with pytest.raises(AuthPreparationError):
         provision_existing_auth_material(
-            destination=tmp_path / "wrong", wallet_private_key=KEY, api_key=API_KEY,
+            destination=tmp_path / "wrong",
+            wallet_private_key=KEY,
+            api_key=API_KEY,
             expected_wallet_address=Account.from_key("0x" + "22" * 32).address,
         )
     assert not (tmp_path / "wrong").exists()
@@ -66,8 +73,10 @@ def test_existing_destination_and_wallet_mismatch_refused_without_changes(tmp_pa
 def test_invalid_api_key_refused_before_directory_creation(tmp_path, api):
     with pytest.raises(AuthPreparationError):
         provision_existing_auth_material(
-            destination=tmp_path / "protected", wallet_private_key=KEY,
-            api_key=api, expected_wallet_address=Account.from_key(KEY).address,
+            destination=tmp_path / "protected",
+            wallet_private_key=KEY,
+            api_key=api,
+            expected_wallet_address=Account.from_key(KEY).address,
         )
     assert not (tmp_path / "protected").exists()
 
@@ -82,7 +91,9 @@ def test_symlink_parent_refused(tmp_path):
         pytest.skip("this host does not permit synthetic directory symlink creation")
     with pytest.raises(AuthPreparationError):
         provision_existing_auth_material(
-            destination=alias / "protected", wallet_private_key=KEY, api_key=API_KEY,
+            destination=alias / "protected",
+            wallet_private_key=KEY,
+            api_key=API_KEY,
             expected_wallet_address=Account.from_key(KEY).address,
         )
     assert not (target / "protected").exists()
@@ -91,6 +102,7 @@ def test_symlink_parent_refused(tmp_path):
 @pytest.mark.asyncio
 async def test_one_login_then_same_token_stream_capture(monkeypatch):
     import kairos_execution.auth_orchestration as module
+
     calls = []
     session = VerifiedWalletSession("synthetic-access", "synthetic-refresh", "synthetic-account")
     reads = object()
@@ -114,8 +126,12 @@ async def test_one_login_then_same_token_stream_capture(monkeypatch):
     monkeypatch.setattr(module, "EvedexPrivateWsStream", Stream)
     monkeypatch.setattr(module, "capture_ws_rest_observation", capture)
     result = await authenticate_and_capture_once(
-        backend=object(), claims=object(), reads=reads, expected_context=object(),
-        expected_wallet_address="synthetic-wallet", allow_session_creation=True,
+        backend=object(),
+        claims=object(),
+        reads=reads,
+        expected_context=object(),
+        expected_wallet_address="synthetic-wallet",
+        allow_session_creation=True,
     )
     assert [name for name, _ in calls] == ["login", "stream", "capture"]
     assert result.session is session and result.observation is observed
@@ -126,6 +142,7 @@ async def test_one_login_then_same_token_stream_capture(monkeypatch):
 @pytest.mark.parametrize("failure", ["login", "stream", "capture"])
 async def test_external_failure_sanitized_no_retry_or_secret_context(monkeypatch, failure):
     import kairos_execution.auth_orchestration as module
+
     calls = []
 
     async def login(**kwargs):
@@ -149,8 +166,12 @@ async def test_external_failure_sanitized_no_retry_or_secret_context(monkeypatch
     monkeypatch.setattr(module, "capture_ws_rest_observation", capture)
     with pytest.raises(AuthPreparationError) as error:
         await authenticate_and_capture_once(
-            backend=object(), claims=object(), reads=object(), expected_context=object(),
-            expected_wallet_address="wallet", allow_session_creation=True,
+            backend=object(),
+            claims=object(),
+            reads=object(),
+            expected_context=object(),
+            expected_wallet_address="wallet",
+            allow_session_creation=True,
         )
     assert "synthetic-private-marker" not in str(error.value)
     assert error.value.__context__ is None
@@ -167,8 +188,12 @@ async def test_cancellation_preserved(monkeypatch):
     monkeypatch.setattr(module, "create_evedex_wallet_session", login)
     with pytest.raises(asyncio.CancelledError):
         await authenticate_and_capture_once(
-            backend=object(), claims=object(), reads=object(), expected_context=object(),
-            expected_wallet_address="wallet", allow_session_creation=True,
+            backend=object(),
+            claims=object(),
+            reads=object(),
+            expected_context=object(),
+            expected_wallet_address="wallet",
+            allow_session_creation=True,
         )
 
 
@@ -183,8 +208,12 @@ async def test_bad_observation_budget_refused_before_login(monkeypatch, timeout)
     monkeypatch.setattr(module, "create_evedex_wallet_session", login)
     with pytest.raises(AuthPreparationError):
         await authenticate_and_capture_once(
-            backend=object(), claims=object(), reads=object(), expected_context=object(),
-            expected_wallet_address="wallet", allow_session_creation=True,
+            backend=object(),
+            claims=object(),
+            reads=object(),
+            expected_context=object(),
+            expected_wallet_address="wallet",
+            allow_session_creation=True,
             observation_timeout_seconds=timeout,
         )
 
@@ -192,8 +221,10 @@ async def test_bad_observation_budget_refused_before_login(monkeypatch, timeout)
 def test_bad_existing_secret_not_retained_in_exception_context(tmp_path):
     with pytest.raises(AuthPreparationError) as error:
         provision_existing_auth_material(
-            destination=tmp_path / "protected", wallet_private_key="synthetic-secret-marker",
-            api_key=API_KEY, expected_wallet_address=Account.from_key(KEY).address,
+            destination=tmp_path / "protected",
+            wallet_private_key="synthetic-secret-marker",
+            api_key=API_KEY,
+            expected_wallet_address=Account.from_key(KEY).address,
         )
     assert "synthetic-secret-marker" not in str(error.value)
     assert error.value.__context__ is None
@@ -208,17 +239,28 @@ def test_cli_reports_confirmed_region_refusal_without_private_details(monkeypatc
         raise WalletSessionRegionForbidden()
 
     monkeypatch.setattr(module, "login_capture", login)
-    monkeypatch.setattr(sys, "argv", [
-        "auth_observation_cli", "login-followup-capture", "--runtime-dir", "synthetic-private-path",
-        "--plan-sha256", "a" * 64, "--acknowledge-prior-unknown",
-    ])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "auth_observation_cli",
+            "login-followup-capture",
+            "--runtime-dir",
+            "synthetic-private-path",
+            "--plan-sha256",
+            "a" * 64,
+            "--acknowledge-prior-unknown",
+        ],
+    )
     with pytest.raises(SystemExit) as error:
         module.main()
     captured = capsys.readouterr()
     assert error.value.code == 4 and not captured.err
     assert json.loads(captured.out) == {
-        "event": "AUTH_REGION_FORBIDDEN", "action": "login-followup-capture",
-        "code": "FORBIDDEN_REGION", "trading_authority": False,
+        "event": "AUTH_REGION_FORBIDDEN",
+        "action": "login-followup-capture",
+        "code": "FORBIDDEN_REGION",
+        "trading_authority": False,
     }
 
 
@@ -237,7 +279,11 @@ async def test_confirmed_region_refusal_stops_before_ws(monkeypatch):
     monkeypatch.setattr(module, "EvedexPrivateWsStream", Stream)
     with pytest.raises(WalletSessionRegionForbidden) as error:
         await authenticate_and_capture_once(
-            backend=object(), claims=object(), reads=object(), expected_context=object(),
-            expected_wallet_address="synthetic-wallet", allow_session_creation=True,
+            backend=object(),
+            claims=object(),
+            reads=object(),
+            expected_context=object(),
+            expected_wallet_address="synthetic-wallet",
+            allow_session_creation=True,
         )
     assert error.value.code == "FORBIDDEN_REGION" and error.value.__context__ is None

@@ -88,7 +88,10 @@ def _beat(path, clock, pid, started):
     )
 
 
-def _drill(tmp_path, *, now=NOW, chat_id=-1004475802889):
+SYNTHETIC_CHAT_ID = -1005
+
+
+def _drill(tmp_path, *, now=NOW, chat_id=SYNTHETIC_CHAT_ID):
     clock = Clock(now)
     telegram = FakeTelegram(clock)
     token = tmp_path / "bot.token"
@@ -138,7 +141,7 @@ def test_other_group_member_cannot_acknowledge_an_alert(tmp_path):
     telegram = FakeTelegram(clock)
     token = tmp_path / "bot.token"
     token.write_text("123456:SYNTHETIC-TOKEN-abcdefghijklmnopqrstuvwxyz", encoding="utf-8")
-    channel = TelegramChannel(token, -1004475802889, 5, http=telegram)
+    channel = TelegramChannel(token, SYNTHETIC_CHAT_ID, 5, http=telegram)
     log = AlertLog(tmp_path / "alerts.jsonl")
     monitor = Monitor(tmp_path / "missing-heartbeat", channel, log, "host", clock=clock)
     monitor.start()

@@ -11,7 +11,7 @@ import inspect
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, TypedDict
 
 from kairos_core.contracts import CandidateReviewV1, StrategicAllocation, VenueQualityV1
 from kairos_core.enums import SystemMode
@@ -38,6 +38,22 @@ from .production_runtime import ProductionExecutionRuntime
 
 class ProductionPathError(PermissionError):
     """The composed path failed closed; partial evidence must not be renewed."""
+
+
+class _EntryContracts(TypedDict, total=False):
+    limit_gtc_entry: LimitGtcEntryV1
+    market_ioc_entry: MarketIocEntryRequestV1
+
+
+def entry_contract_kwargs(
+    limit_gtc_entry: LimitGtcEntryV1 | None, market_ioc_entry: MarketIocEntryRequestV1 | None
+) -> _EntryContracts:
+    contracts: _EntryContracts = {}
+    if limit_gtc_entry is not None:
+        contracts["limit_gtc_entry"] = limit_gtc_entry
+    if market_ioc_entry is not None:
+        contracts["market_ioc_entry"] = market_ioc_entry
+    return contracts
 
 
 def _check_entry_interlock(interlock: Callable[[], bool] | None) -> None:
@@ -279,8 +295,7 @@ class ProductionLiveLifecycleCoordinator:
                 expires_at=expires_at,
                 now=now,
                 system_mode=system_mode,
-                **({"market_ioc_entry": market_ioc_entry} if market_ioc_entry is not None else {}),
-                **({"limit_gtc_entry": limit_gtc_entry} if limit_gtc_entry is not None else {}),
+                **entry_contract_kwargs(limit_gtc_entry, market_ioc_entry),
             )
         except ProductionLiveRiskEntryRefused as refusal:
             if (

@@ -889,9 +889,11 @@ class ProductionLifecycleEngine(_EvedexProtectedExecutionEngine):
                 and quantity <= total - remaining
             )
             if market is not None:
-                assert market.market_ioc_envelope is not None
+                envelope = market.market_ioc_envelope
                 terminal = (
-                    terminal and total * 100_000_000 <= market.market_ioc_envelope.maximum_base_quantity_e8
+                    terminal
+                    and envelope is not None
+                    and total * 100_000_000 <= envelope.maximum_base_quantity_e8
                 )
         except (KeyError, TypeError, ValueError, ArithmeticError):
             terminal = False
@@ -947,7 +949,7 @@ class ProductionLifecycleEngine(_EvedexProtectedExecutionEngine):
                 return PaperExecutionResult(events=tuple(await self._reconcile_redelivery_locked(existing)))
         # New entries retain original freshness, Risk and dispatch checks.
         result = await super()._handle_once(decision)
-        if self.production_settings.entry_order_type == "LIMIT_GTC":
+        if self.production_settings.entry_order_type == "LIMIT_GTC" and decision.trade_id is not None:
             trade = await self.trades.get(decision.trade_id)
             if trade is not None and trade.state in {TradeState.PROTECTING, TradeState.ACTIVE}:
                 try:

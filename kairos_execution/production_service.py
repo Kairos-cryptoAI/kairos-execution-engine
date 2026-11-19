@@ -26,6 +26,7 @@ from .production_path import (
     ProductionLiveEntryRefusal,
     ProductionLiveEntryResult,
     ProductionLiveLifecycleCoordinator,
+    entry_contract_kwargs,
 )
 from .production_readiness import SignedManualArmRequestV1, canonical_digest
 
@@ -313,15 +314,8 @@ class ProductionServiceDriver:
                             expires_at=item.envelope.expires_at,
                             system_mode=item.envelope.system_mode,
                             entry_interlock=entry_interlock,
-                            **(
-                                {"limit_gtc_entry": item.envelope.limit_gtc_entry}
-                                if item.envelope.limit_gtc_entry is not None
-                                else {}
-                            ),
-                            **(
-                                {"market_ioc_entry": item.envelope.market_ioc_entry}
-                                if item.envelope.market_ioc_entry is not None
-                                else {}
+                            **entry_contract_kwargs(
+                                item.envelope.limit_gtc_entry, item.envelope.market_ioc_entry
                             ),
                         )
                         if (

@@ -8,7 +8,6 @@ the real ``ProductionEvedexSdkClient``; the evidence is synthetic and labelled s
 from __future__ import annotations
 
 import asyncio
-import os
 import tempfile
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -41,15 +40,9 @@ from kairos_execution.technical_canary_readiness import TechnicalCanaryPrecondit
 from kairos_execution.utc_clock import precise_utc_now
 from tests import paper_fixtures
 from tests import test_production_risk as risk_fixtures
-from tests.rest_stand import ADMIN_DSN_FILE, FakeEvedex, StandCustody, issue_stand_evidence
+from tests.rest_stand import FakeEvedex, StandCustody, issue_stand_evidence, stand_admin_dsn
 
 pytestmark = pytest.mark.integration
-STAND_CUSTODY = StandCustody()
-WALLET = STAND_CUSTODY.wallet_address
-
-
-def _enabled() -> bool:
-    return os.getenv("KAIROS_REST_STAND") == "1" and ADMIN_DSN_FILE.exists()
 
 
 async def _drop(admin_dsn: str, database: str, roles) -> None:
@@ -65,9 +58,8 @@ async def _drop(admin_dsn: str, database: str, roles) -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("exit_kind", ["take-profit", "stop-loss", "early-exit"])
 async def test_one_armed_trade_enters_protects_exits_and_is_accounted(monkeypatch, exit_kind):
-    if not _enabled():
-        pytest.skip("KAIROS_REST_STAND=1 and the local administrator DSN file are required")
-    admin_dsn = ADMIN_DSN_FILE.read_text(encoding="utf-8").strip()
+    admin_dsn = stand_admin_dsn()
+    stand_custody = StandCustody()
     root = Path(tempfile.mkdtemp(prefix="rest-stand-"))
     now = precise_utc_now()
     base_ms = (int(now.timestamp() * 1000) // 60_000) * 60_000 - 60_000
@@ -82,7 +74,7 @@ async def test_one_armed_trade_enters_protects_exits_and_is_accounted(monkeypatc
         adaptive_system_id=strategy_id,
         source_set_sha256="b" * 64,
         custody_reference="synthetic:stand-custody",
-        wallet_address=WALLET,
+        wallet_address=stand_custody.wallet_address,
         chain_id=42161,
         owner_identity="owner",
         dollar_cap=Decimal("200"),
@@ -92,7 +84,7 @@ async def test_one_armed_trade_enters_protects_exits_and_is_accounted(monkeypatc
     custody = CustodyBindingV1(
         context=context,
         custody_reference="synthetic:stand-custody",
-        wallet_address=WALLET,
+        wallet_address=stand_custody.wallet_address,
         chain_id=42161,
         schema_sha256=reviewed_schema_sha256(42161),
         approved_instruments=("BTCUSD",),
@@ -146,7 +138,7 @@ async def test_one_armed_trade_enters_protects_exits_and_is_accounted(monkeypatc
                 registry, DirectoryEvidenceResolver(root / "evidence"), pinned_registry_sha256=pin
             ),
             owner_key=owner_key,
-            custody_backend=STAND_CUSTODY,
+            custody_backend=stand_custody,
             custody_signature_verifier=CoincurveTypedDataVerifier(),
             wire_signature_verifier=CoincurveTypedDataVerifier(),
             transport=transport,

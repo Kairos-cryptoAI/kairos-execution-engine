@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import tempfile
 from datetime import timedelta
 from decimal import Decimal
@@ -23,7 +22,7 @@ from kairos_execution.production_provisioning import provision_production_databa
 from kairos_execution.production_readiness import EvidenceKind, ProductionContextV1
 from kairos_execution.signed_evidence import DirectoryEvidenceResolver, SignedReceiptInterpreter
 from kairos_execution.utc_clock import precise_utc_now
-from tests.rest_stand import ADMIN_DSN_FILE
+from tests.rest_stand import stand_admin_dsn, stand_container
 from tests.test_production_owner import _frozen
 
 JUNIT_OK = b'<testsuites><testsuite><testcase name="a"/><testcase name="b"/></testsuite></testsuites>'
@@ -105,9 +104,8 @@ def test_limits_drill_rejects_limits_above_the_constitution(tmp_path):
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_recovery_and_operator_drills_on_a_provisioned_database_yield_signable_facts():
-    if os.getenv("KAIROS_REST_STAND") != "1" or not ADMIN_DSN_FILE.exists():
-        pytest.skip("KAIROS_REST_STAND=1 and the local administrator DSN file are required")
-    admin_dsn = ADMIN_DSN_FILE.read_text(encoding="utf-8").strip()
+    admin_dsn = stand_admin_dsn()
+    container = stand_container()
     root = Path(tempfile.mkdtemp(prefix="drills-"))
     evidence = root / "evidence"
     now = precise_utc_now().replace(microsecond=0)
@@ -123,7 +121,7 @@ async def test_recovery_and_operator_drills_on_a_provisioned_database_yield_sign
     )
     try:
         recovery = await recovery_drill(
-            manifest, admin_dsn=admin_dsn, container="kairos-execution-prod-db", evidence_dir=evidence
+            manifest, admin_dsn=admin_dsn, container=container, evidence_dir=evidence
         )
         operator = await operator_drill(manifest, evidence_dir=evidence)
     finally:

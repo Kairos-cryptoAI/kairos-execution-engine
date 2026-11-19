@@ -1,4 +1,5 @@
 """Synthetic WS frames with actual PROD reader logic, never LIVE authority."""
+
 import asyncio
 import traceback
 from collections import deque
@@ -46,8 +47,15 @@ async def test_confirmed_channels_bracket_actual_rest_reader_and_preserve_no_aut
 
     async def snapshot():
         assert stream.frames.empty()
-        stream.frames.put_nowait(WsFrame(kind="PUBLICATION", channel="funding", epoch="e", offset=1,
-                                          payload_json='{"private":"example"}'))
+        stream.frames.put_nowait(
+            WsFrame(
+                kind="PUBLICATION",
+                channel="funding",
+                epoch="e",
+                offset=1,
+                payload_json='{"private":"example"}',
+            )
+        )
         await asyncio.sleep(0)
         return await actual_fetch()
 
@@ -55,8 +63,9 @@ async def test_confirmed_channels_bracket_actual_rest_reader_and_preserve_no_aut
     capture = await capture_ws_rest_observation(reads, stream, after_snapshot_seconds=0.01)
     assert stream.closed and capture.subscribed_channels == CHANNELS
     assert len(capture.acknowledgements) == 8
-    assert all(ack.received_monotonic_ns <= capture.snapshot_started_monotonic_ns
-               for ack in capture.acknowledgements)
+    assert all(
+        ack.received_monotonic_ns <= capture.snapshot_started_monotonic_ns for ack in capture.acknowledgements
+    )
     assert any(call["source"] == "available_balance" for call in calls)
     assert capture.publications[0].channel == "funding"
     assert capture.publications[0].local_sequence == 1
@@ -79,13 +88,18 @@ async def test_snapshot_cannot_start_before_all_eight_acknowledgements():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("frames,reason", [
-    ([WsFrame(kind="PUBLICATION", channel="funding", payload_json="{}")], "without channel"),
-    ([WsFrame(kind="DISCONNECTED")], "disconnected"),
-    ([WsFrame(kind="RECOVERY_FAILED")], "recovery failed"),
-    ([WsFrame(kind="SUBSCRIBED", channel="funding"), WsFrame(kind="SUBSCRIBED", channel="funding")],
-     "duplicate"),
-])
+@pytest.mark.parametrize(
+    "frames,reason",
+    [
+        ([WsFrame(kind="PUBLICATION", channel="funding", payload_json="{}")], "without channel"),
+        ([WsFrame(kind="DISCONNECTED")], "disconnected"),
+        ([WsFrame(kind="RECOVERY_FAILED")], "recovery failed"),
+        (
+            [WsFrame(kind="SUBSCRIBED", channel="funding"), WsFrame(kind="SUBSCRIBED", channel="funding")],
+            "duplicate",
+        ),
+    ],
+)
 async def test_refuses_missing_acknowledgement_or_stream_gap(frames, reason):
     reads, _ = fixture()
     await reads.preflight()
@@ -98,17 +112,24 @@ async def test_refuses_missing_acknowledgement_or_stream_gap(frames, reason):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("second", [
-    WsFrame(kind="PUBLICATION", channel="funding", epoch="e", offset=3, payload_json="{}"),
-    WsFrame(kind="PUBLICATION", channel="funding", epoch="other", offset=2, payload_json="{}"),
-    WsFrame(kind="PUBLICATION", channel="funding", epoch="e", payload_json="{}"),
-])
+@pytest.mark.parametrize(
+    "second",
+    [
+        WsFrame(kind="PUBLICATION", channel="funding", epoch="e", offset=3, payload_json="{}"),
+        WsFrame(kind="PUBLICATION", channel="funding", epoch="other", offset=2, payload_json="{}"),
+        WsFrame(kind="PUBLICATION", channel="funding", epoch="e", payload_json="{}"),
+    ],
+)
 async def test_refuses_provider_offset_discontinuities_or_partial_cursor(second):
     reads, _ = fixture()
     await reads.preflight()
-    stream = SyntheticStream(acknowledgements() + [
-        WsFrame(kind="PUBLICATION", channel="funding", epoch="e", offset=1, payload_json="{}"), second,
-    ])
+    stream = SyntheticStream(
+        acknowledgements()
+        + [
+            WsFrame(kind="PUBLICATION", channel="funding", epoch="e", offset=1, payload_json="{}"),
+            second,
+        ]
+    )
     reads.fetch_paper_state = AsyncMock()
     with pytest.raises(WsRestObservationError):
         await capture_ws_rest_observation(reads, stream, timeout_seconds=1)
@@ -133,12 +154,13 @@ async def test_disconnect_during_snapshot_discards_partial_result():
 
 @pytest.mark.asyncio
 async def test_overflow_or_invalid_json_discards_snapshot():
-    for payloads in [ ['{}', '{}'], ['{"x": NaN}'], ['{"x":1,"x":2}'], ['{"x":1e400}'] ]:
+    for payloads in [["{}", "{}"], ['{"x": NaN}'], ['{"x":1,"x":2}'], ['{"x":1e400}']]:
         reads, _ = fixture()
         await reads.preflight()
-        stream = SyntheticStream(acknowledgements() + [
-            WsFrame(kind="PUBLICATION", channel="funding", payload_json=p) for p in payloads
-        ])
+        stream = SyntheticStream(
+            acknowledgements()
+            + [WsFrame(kind="PUBLICATION", channel="funding", payload_json=p) for p in payloads]
+        )
         reads.fetch_paper_state = AsyncMock()
         with pytest.raises(WsRestObservationError):
             await capture_ws_rest_observation(reads, stream, max_publications=1)
@@ -208,7 +230,7 @@ async def test_external_exceptions_never_expose_private_text_or_exception_chain(
         await capture_ws_rest_observation(reads, stream, after_snapshot_seconds=0)
     error = captured.value
     assert marker not in str(error)
-    assert marker not in ''.join(traceback.format_exception(error))
+    assert marker not in "".join(traceback.format_exception(error))
     while error is not None:
         assert marker not in str(error)
         error = error.__cause__ or error.__context__
@@ -249,10 +271,13 @@ async def test_clock_regression_between_publications_is_rejected(monkeypatch, cl
         monkeypatch.setattr(
             "kairos_execution.production_ws_observer.time.monotonic_ns", lambda: values.popleft()
         )
-    stream = SyntheticStream(acknowledgements() + [
-        WsFrame(kind="PUBLICATION", channel="funding", payload_json="{}"),
-        WsFrame(kind="PUBLICATION", channel="funding", payload_json="{}"),
-    ])
+    stream = SyntheticStream(
+        acknowledgements()
+        + [
+            WsFrame(kind="PUBLICATION", channel="funding", payload_json="{}"),
+            WsFrame(kind="PUBLICATION", channel="funding", payload_json="{}"),
+        ]
+    )
     with pytest.raises(WsRestObservationError, match="clock moved backwards"):
         await capture_ws_rest_observation(reads, stream)
 

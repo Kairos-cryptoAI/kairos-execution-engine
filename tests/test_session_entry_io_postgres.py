@@ -162,7 +162,12 @@ async def test_account_wide_pending_survives_lost_ack_and_restart(monkeypatch):
                     "(account_sha256,session_id,sequence,phase,custody_reference,request_id,"
                     "request_sha256,signature_sha256,effect_id,wire_sha256) "
                     "VALUES($1,$2,3,'WIRE_STARTED',$3,$4,$5,NULL,'effect',$6)",
-                    account, session_id, reference, request_id, request_sha, "d" * 64,
+                    account,
+                    session_id,
+                    reference,
+                    request_id,
+                    request_sha,
+                    "d" * 64,
                 )
         async with pool.acquire() as connection:
             await connection.execute(

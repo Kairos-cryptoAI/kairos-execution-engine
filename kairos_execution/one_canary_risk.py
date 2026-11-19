@@ -16,7 +16,7 @@ from typing import Any, Literal
 
 from kairos_core.contracts import StrategicAllocation, StrategyIntentV1, VenueQualityV1
 from kairos_core.enums import EvedexProfile, Side
-from kairos_risk.live import LiveRiskEvaluator
+from kairos_risk.live import LiveRiskEvaluator  # type: ignore[import-untyped]
 
 from .one_canary_account import (
     ASSUMPTIONS,
@@ -50,8 +50,11 @@ class CanaryInstrumentRules:
             or _money(row.get("multiplier")) != 1
         ):
             raise CanaryAccountError("instrument unavailable or unsupported contract economics")
+        symbol = row.get("name")
+        if not isinstance(symbol, str) or not symbol:
+            raise CanaryAccountError("instrument rules missing or inconsistent")
         result = cls(
-            row.get("name"),
+            symbol,
             observed_at,
             body_sha256,
             *(
@@ -68,9 +71,7 @@ class CanaryInstrumentRules:
             ),
         )
         if (
-            not isinstance(result.symbol, str)
-            or not result.symbol
-            or observed_at.tzinfo is None
+            observed_at.tzinfo is None
             or len(body_sha256) != 64
             or any(c not in "0123456789abcdef" for c in body_sha256)
             or any(

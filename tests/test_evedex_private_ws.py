@@ -1,4 +1,5 @@
 """Synthetic Centrifugo frames only; no token or exchange connection exists."""
+
 import asyncio
 import json
 from types import SimpleNamespace
@@ -91,8 +92,9 @@ def connect_reply(*, pong=False):
 
 
 def acks(*, epoch=True):
-    return [json.dumps({"id": i, "subscribe": {"epoch": "test-epoch"} if epoch else {}})
-            for i in range(2, 10)]
+    return [
+        json.dumps({"id": i, "subscribe": {"epoch": "test-epoch"} if epoch else {}}) for i in range(2, 10)
+    ]
 
 
 def opened(socket, *, identity=None):
@@ -123,12 +125,15 @@ async def test_real_wire_shape_ack_publication_and_heartbeat_without_secret_outp
             frame = await stream.receive()
             assert frame.kind == "PUBLICATION" and frame.channel == "funding"
             assert (frame.epoch, frame.offset, json.loads(frame.payload_json)) == (
-                "test-epoch", 1, {"quantity": "1"},
+                "test-epoch",
+                1,
+                {"quantity": "1"},
             )
         assert stream._access_token == ""
     assert sessions[0].url == URL and sessions[0].options["trust_env"] is False
     assert sessions[0].identity_request == (
-        IDENTITY_URL, {"headers": {"Authorization": f"Bearer {TOKEN}"}, "allow_redirects": False},
+        IDENTITY_URL,
+        {"headers": {"Authorization": f"Bearer {TOKEN}"}, "allow_redirects": False},
     )
     assert socket.sent[0] == {"id": 1, "connect": {"name": "js"}}
     assert len(socket.sent) == 10 and socket.sent[-1] == {}
@@ -159,8 +164,10 @@ async def test_adapter_brackets_actual_reader_with_eight_acknowledgements():
     sessions, patched = opened(socket)
     with patched:
         result = await capture_ws_rest_observation(
-            reads, EvedexPrivateWsStream(reads=reads, access_token=TOKEN),
-            timeout_seconds=1, after_snapshot_seconds=0.01,
+            reads,
+            EvedexPrivateWsStream(reads=reads, access_token=TOKEN),
+            timeout_seconds=1,
+            after_snapshot_seconds=0.01,
         )
     assert result.subscribed_channels == CHANNELS
     assert result.trading_authority is False and result.sequence_continuity_proven is False
@@ -193,8 +200,9 @@ async def test_identity_context_cannot_suppress_wrong_account():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("body", [b'{"exchangeId":"acct-prod-1","value":1e400}', b" " * 65537],
-                         ids=["overflow", "oversized"])
+@pytest.mark.parametrize(
+    "body", [b'{"exchangeId":"acct-prod-1","value":1e400}', b" " * 65537], ids=["overflow", "oversized"]
+)
 async def test_malformed_or_oversized_token_identity_is_refused(body):
     identity = IdentityResponse()
     identity.body = body
@@ -228,8 +236,10 @@ async def test_observer_detects_reader_scope_change_during_snapshot():
     reads.fetch_paper_state = snapshot
     with patched, pytest.raises(PrivateWsUnavailable, match="scopes differ"):
         await capture_ws_rest_observation(
-            reads, EvedexPrivateWsStream(reads=reads, access_token=TOKEN),
-            timeout_seconds=1, after_snapshot_seconds=0,
+            reads,
+            EvedexPrivateWsStream(reads=reads, access_token=TOKEN),
+            timeout_seconds=1,
+            after_snapshot_seconds=0,
         )
 
 
@@ -272,13 +282,16 @@ async def test_unsubscribe_is_reported_as_disconnect_and_no_reconnect():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("bad_reply", [
-    '{"id":2,"id":2,"subscribe":{}}',
-    '{"id":2,"subscribe":{"ignored":1e400}}',
-    json.dumps({"id": 2, "error": {"message": TOKEN}}),
-    json.dumps({"id": 2, "subscribe": {"recovered": True}}),
-    json.dumps({"push": {"channel": "wrong", "pub": {"data": {}}}}),
-])
+@pytest.mark.parametrize(
+    "bad_reply",
+    [
+        '{"id":2,"id":2,"subscribe":{}}',
+        '{"id":2,"subscribe":{"ignored":1e400}}',
+        json.dumps({"id": 2, "error": {"message": TOKEN}}),
+        json.dumps({"id": 2, "subscribe": {"recovered": True}}),
+        json.dumps({"push": {"channel": "wrong", "pub": {"data": {}}}}),
+    ],
+)
 async def test_malformed_refused_or_recovered_reply_never_leaks_payload(bad_reply):
     socket = Socket([connect_reply(), bad_reply])
     _, patched = opened(socket)

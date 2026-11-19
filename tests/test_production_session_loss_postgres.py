@@ -184,9 +184,10 @@ async def test_native_reservation_commits_stop_and_observer_survives_restart(mon
             await source.reserve_entry_async(request=request, binding=binding, evidence=stale_evidence)
         async with pool.acquire() as connection:
             assert await connection.fetchval("SELECT count(*) FROM kairos_session_loss_v1.events") == 1
-            assert await connection.fetchval(
-                "SELECT count(*) FROM kairos_production_state_v1.risk_reservations"
-            ) == 0
+            assert (
+                await connection.fetchval("SELECT count(*) FROM kairos_production_state_v1.risk_reservations")
+                == 0
+            )
         current = current.model_copy(update={"evidence_sha256": "b" * 64})
         # The incomplete synthetic production schema causes a PostgreSQL
         # error during candidate validation. The savepoint is rolled back,
@@ -195,21 +196,29 @@ async def test_native_reservation_commits_stop_and_observer_survives_restart(mon
             await source.reserve_entry_async(request=request, binding=binding, evidence=evidence)
         async with pool.acquire() as connection:
             assert await connection.fetchval("SELECT count(*) FROM kairos_session_loss_v1.events") == 2
-        current = current.model_copy(update={
-            "sequence": 3, "evidence_sha256": "c" * 64,
-            "observed_at": now + timedelta(microseconds=2),
-        })
+        current = current.model_copy(
+            update={
+                "sequence": 3,
+                "evidence_sha256": "c" * 64,
+                "observed_at": now + timedelta(microseconds=2),
+            }
+        )
         with pytest.raises(ProductionStateError, match="session risk reservation refused"):
             await source.reserve_entry_async(request=request, binding=binding, evidence=stale_evidence)
         async with pool.acquire() as connection:
             assert await connection.fetchval("SELECT count(*) FROM kairos_session_loss_v1.events") == 3
-            assert await connection.fetchval(
-                "SELECT count(*) FROM kairos_production_state_v1.risk_reservations"
-            ) == 0
-        current = current.model_copy(update={
-            "sequence": 4, "equity_usd": Decimal("120"), "evidence_sha256": "d" * 64,
-            "observed_at": now + timedelta(microseconds=3),
-        })
+            assert (
+                await connection.fetchval("SELECT count(*) FROM kairos_production_state_v1.risk_reservations")
+                == 0
+            )
+        current = current.model_copy(
+            update={
+                "sequence": 4,
+                "equity_usd": Decimal("120"),
+                "evidence_sha256": "d" * 64,
+                "observed_at": now + timedelta(microseconds=3),
+            }
+        )
         with pytest.raises(ProductionStateError, match=r"session \$5 loss limit reached"):
             await source.reserve_entry_async(request=request, binding=binding, evidence=evidence)
         # The real reservation callback returned before the outward exception,

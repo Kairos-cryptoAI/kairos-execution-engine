@@ -10,8 +10,12 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from datetime import UTC
+from typing import Protocol, runtime_checkable
 
-from kairos_core.contracts import TradeExecutionEventV1, TradeExecutionEventV2
+from kairos_core.contracts import TradeExecutionEventV1
+
+# The fee-v2 research source lock supplies this module.
+from kairos_core.contracts.execution_fee_v2 import TradeExecutionEventV2  # type: ignore[import-not-found]
 from kairos_core.enums import TradeExecutionEventType, TradeLifecycleState
 from kairos_core.topics import Topics
 
@@ -25,8 +29,21 @@ _V2 = "trade-execution-event.v2"
 _current_contract: ContextVar[str | None] = ContextVar("research_execution_contract", default=None)
 
 
+@runtime_checkable
+class _VersionedTradeReader(Protocol):
+    async def get_execution_contract_version(self, trade_id: str) -> str | None: ...
+
+
 class ResearchFeeV2ProductionEngine(ProductionLifecycleEngine):
     """Build V2 only for new research trades; existing trades keep their version."""
+
+    async def _existing_contract_version(self, trade_id: str) -> str:
+        if not isinstance(self.trades, _VersionedTradeReader):
+            raise PaperExecutionSafetyError("a version-aware research trade repository is required")
+        version = await self.trades.get_execution_contract_version(trade_id)
+        if version is None or version not in {_V1, _V2}:
+            raise PaperExecutionSafetyError("existing execution history has no verified event version")
+        return version
 
     async def _audit_scoped_public_facts(self):
         """Count lifecycle transitions separately from standalone fee facts."""
@@ -37,9 +54,7 @@ class ResearchFeeV2ProductionEngine(ProductionLifecycleEngine):
             include_terminal=True,
         )
         for trade in scoped:
-            version = await self.trades.get_execution_contract_version(trade.trade_id)
-            if version not in {_V1, _V2}:
-                raise PaperExecutionSafetyError("existing execution history has no verified event version")
+            version = await self._existing_contract_version(trade.trade_id)
             facts = await self.trades.list_execution_events(trade.trade_id)
             if [fact.event_seq for fact in facts] != list(range(1, len(facts) + 1)):
                 raise PaperExecutionSafetyError("public execution fact sequence is not contiguous")
@@ -77,9 +92,7 @@ class ResearchFeeV2ProductionEngine(ProductionLifecycleEngine):
                 raise PaperExecutionSafetyError("execution version is unavailable for an existing trade")
             version = _V2
         else:
-            version = await self.trades.get_execution_contract_version(trade_id)
-            if version not in {_V1, _V2}:
-                raise PaperExecutionSafetyError("existing execution history has no verified event version")
+            version = await self._existing_contract_version(trade_id)
         token = _current_contract.set(version)
         try:
             yield version

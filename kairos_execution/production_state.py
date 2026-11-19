@@ -2084,6 +2084,7 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
                         return "SESSION_INFRA_DENIED"
                 else:
                     await validate_and_reserve()
+                return None
 
             result = await self._write(reserve)
             if result == "SESSION_STOP":

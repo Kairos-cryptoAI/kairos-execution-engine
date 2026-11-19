@@ -6,6 +6,7 @@ snapshot watermark, retention, ordering or late-correction guarantee. In
 particular, identical funding rows must not be deduplicated: the venue schema
 does not supply a stable unique event ID for those rows.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -152,9 +153,15 @@ async def collect_history_window(
     if finished < started:
         raise ProductionReadUnavailable("history capture clock moved backwards")
     return ObservedHistoryWindow(
-        account_id=reads.expected_account_id, after=after, before=before,
-        started_at=started, finished_at=finished,
-        funding_pages=funding_pages, fill_pages=fill_pages,
-        funding_captures=funding_captures, fill_captures=fill_captures,
-        identity_before_capture=identity_before, identity_after_capture=identity_after,
+        account_id=reads.expected_account_id,
+        after=after,
+        before=before,
+        started_at=started,
+        finished_at=finished,
+        funding_pages=funding_pages,
+        fill_pages=fill_pages,
+        funding_captures=funding_captures,
+        fill_captures=fill_captures,
+        identity_before_capture=identity_before,
+        identity_after_capture=identity_after,
     )

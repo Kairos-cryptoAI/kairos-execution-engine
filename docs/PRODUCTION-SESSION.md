@@ -116,11 +116,13 @@ management policy as a soft stop through the early-exit request.
 
 ## Checks
 
-- `tests/test_integration_rest_session.py` (`KAIROS_REST_STAND=1` and the local
-  administrator DSN file): provisions an isolated database, issues stand evidence and
-  runs three complete sessions against a venue double that speaks EVEDEX's REST and
-  signs with a real EIP-712 key: exit by take-profit, by stop-loss and by an early exit,
-  each through terminal accounting and the closed-trade report.
+- `tests/test_integration_rest_session.py` provisions an isolated database, issues
+  stand evidence and runs three sessions against a venue double with a test EIP-712
+  key. Each take-profit, stop-loss and early exit reaches terminal accounting and
+  the closed-trade report. Set `KAIROS_REST_STAND=1` and point
+  `KAIROS_REST_STAND_ADMIN_DSN_FILE` to a file containing the admin DSN for a
+  disposable PostgreSQL server. The setup and recovery drills also use
+  `KAIROS_REST_STAND_CONTAINER` for that server's Docker container name.
 - `tests/test_integration_paper_engine.py`: the early exit on the shared engine with a
   disposable database.
 - `tests/test_production_session.py`, `tests/test_production_session_cli.py`: arm limits,

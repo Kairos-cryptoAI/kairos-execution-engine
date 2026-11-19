@@ -38,8 +38,12 @@ async def test_signer_never_releases_signature_when_journal_is_unknown(fail, exp
     claims, _ = claims_fixture(context=request.context)
     journal = SyntheticJournal(fail=fail)
     signer = ManagedSignerBoundary(
-        original.binding, backend=backend, verifier=verifier, claims=Claims(),
-        authorization=authorization, session_entry_io=journal,
+        original.binding,
+        backend=backend,
+        verifier=verifier,
+        claims=Claims(),
+        authorization=authorization,
+        session_entry_io=journal,
     )
     # Synthetic mechanics only; production runtime rejects this state.
     signer._require_session_entry_fence = False
@@ -59,9 +63,14 @@ async def test_wire_journal_failure_prevents_sender():
         return {"status": "SYNTHETIC"}
 
     dispatcher = ProductionEffectDispatcher(
-        authorization=CurrentState(), signature_verifier=SyntheticSignatureVerifier(),
-        claims=claims, database_uuid=claims.database_uuid, context=wire.context,
-        clock=lambda: now, sender=sender, session_entry_io=journal,
+        authorization=CurrentState(),
+        signature_verifier=SyntheticSignatureVerifier(),
+        claims=claims,
+        database_uuid=claims.database_uuid,
+        context=wire.context,
+        clock=lambda: now,
+        sender=sender,
+        session_entry_io=journal,
     )
     dispatcher._require_session_entry_fence = False  # synthetic mechanics only
     with pytest.raises(ProductionDispatchError, match="outcome is unresolved"):
@@ -80,9 +89,14 @@ async def test_journal_does_not_block_authorized_protection(operation):
         return {"status": "SYNTHETIC"}
 
     dispatcher = ProductionEffectDispatcher(
-        authorization=CurrentState(), signature_verifier=SyntheticSignatureVerifier(),
-        claims=claims, database_uuid=claims.database_uuid, context=wire.context,
-        clock=lambda: now, sender=sender, session_entry_io=journal,
+        authorization=CurrentState(),
+        signature_verifier=SyntheticSignatureVerifier(),
+        claims=claims,
+        database_uuid=claims.database_uuid,
+        context=wire.context,
+        clock=lambda: now,
+        sender=sender,
+        session_entry_io=journal,
     )
     assert await dispatcher.dispatch_one(wire) == {"status": "SYNTHETIC"}
     assert len(sends) == 1 and journal.calls == []

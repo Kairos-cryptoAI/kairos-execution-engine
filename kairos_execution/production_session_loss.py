@@ -12,7 +12,7 @@ from decimal import Decimal
 from typing import Literal, Protocol
 from uuid import UUID
 
-import asyncpg
+import asyncpg  # type: ignore[import-untyped]  # Upstream ships no typing marker/stubs.
 from pydantic import Field, field_validator
 
 from .production_readiness import StrictRecord

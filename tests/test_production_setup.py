@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import secrets
+import subprocess
+import sys
 import time
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -20,9 +21,9 @@ from kairos_execution.production_provisioning import ProvisionedDatabaseV1
 from kairos_execution.production_readiness import EvidenceKind, ProductionContextV1, ReceiptReferenceV1
 from kairos_execution.signed_evidence import FACT_SCHEMAS, DirectoryEvidenceResolver, IssuerPolicyV1
 from kairos_execution.technical_canary_readiness import TechnicalCanaryPreconditionsVerifier
-from tests.rest_stand import ADMIN_DSN_FILE
+from tests.rest_stand import stand_admin_dsn, stand_container
 from tests.test_integration_rest_session import _drop
-from tests.test_production_alerts import FakeTelegram
+from tests.test_production_alerts import SYNTHETIC_CHAT_ID, FakeTelegram
 
 OWNER_TELEGRAM_ID = 5
 
@@ -70,17 +71,44 @@ def test_account_identity_comes_from_user_me_without_echoing_the_key():
     assert "secret-key" not in str(refused.value)
 
 
-def _enabled() -> bool:
-    return os.getenv("KAIROS_REST_STAND") == "1" and ADMIN_DSN_FILE.exists()
+def _synthetic_workspace(root: Path) -> Path:
+    for name, filename in (
+        ("kairos-execution-engine", "docs/PRODUCTION-SESSION.md"),
+        ("kairos-autotrader", "kairos_autotrader/management.py"),
+    ):
+        repo = root / name
+        source = repo / filename
+        source.parent.mkdir(parents=True)
+        source.write_text("# Synthetic setup test source\n", encoding="utf-8")
+        subprocess.run(["git", "init", "--quiet", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "add", filename], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--quiet",
+                "--no-gpg-sign",
+                "-m",
+                "Add synthetic setup fixture",
+            ],
+            check=True,
+        )
+    return root
 
 
 @pytest.mark.integration
 def test_setup_produces_seven_receipts_the_system_accepts(tmp_path, monkeypatch):
-    if not _enabled():
-        pytest.skip("KAIROS_REST_STAND=1 and the local administrator DSN file are required")
+    admin_dsn = stand_admin_dsn()
+    container = stand_container()
+    workspace = _synthetic_workspace(tmp_path / "workspace")
     root = tmp_path / "prod"
     (root / "secrets").mkdir(parents=True)
-    admin_dsn = ADMIN_DSN_FILE.read_text(encoding="utf-8").strip()
     (root / "secrets" / "postgres-admin.dsn").write_text(admin_dsn, encoding="utf-8")
     keys = tmp_path / "keys.txt"
     wallet_key = "0x" + secrets.token_hex(32)
@@ -97,11 +125,11 @@ def test_setup_produces_seven_receipts_the_system_accepts(tmp_path, monkeypatch)
         api_line=9,
         owner_identity="owner",
         owner_telegram_id=OWNER_TELEGRAM_ID,
-        workspace=Path(r"D:\Kairos"),
+        workspace=workspace,
         instruments=("SOLUSD", "XRPUSD"),
         limits=limits,
-        node_executable=Path(r"D:\Kairos\runtime\node22\node-v22.23.5-win-x64\node.exe"),
-        quant_python=Path(r"D:\Kairos\kairos-quant-scouts\.venv\Scripts\python.exe"),
+        node_executable=tmp_path / "node",  # FakeReads supplies the venue response.
+        quant_python=Path(sys.executable),
         taker_fee_bps=4.5,
         exit_fee_rate=Decimal("0.00045"),
         adverse_slippage_rate=Decimal("0.0005"),
@@ -122,7 +150,7 @@ def test_setup_produces_seven_receipts_the_system_accepts(tmp_path, monkeypatch)
                 api_line=9,
                 owner_identity="owner",
                 owner_telegram_id=OWNER_TELEGRAM_ID,
-                workspace=Path(r"D:\Kairos"),
+                workspace=workspace,
                 instruments=("SOLUSD",),
                 limits=limits,
                 node_executable=Path("x"),
@@ -146,8 +174,8 @@ def test_setup_produces_seven_receipts_the_system_accepts(tmp_path, monkeypatch)
         monkeypatch.setattr(production_reads, "ProductionEvedexReads", FakeReads)
         done = production_setup.run_drills(
             root,
-            workspace=Path(r"D:\Kairos"),
-            container="kairos-execution-prod-db",
+            workspace=workspace,
+            container=container,
             only=("recovery", "operator", "custody", "pairing"),
         )
         assert len(done) == 4
@@ -176,9 +204,9 @@ def test_setup_produces_seven_receipts_the_system_accepts(tmp_path, monkeypatch)
         production_setup.security_review(
             root,
             reviewer="owner",
-            fix_commit="4ae2037",
+            fix_commit=summary["source_heads"]["kairos-execution-engine"],
             findings_fixed=4,
-            workspace=Path(r"D:\Kairos"),
+            workspace=workspace,
             statement="synthetic test record",
         )
         with pytest.raises(production_setup.SetupError, match="alert_delivery"):
@@ -199,7 +227,7 @@ def test_setup_produces_seven_receipts_the_system_accepts(tmp_path, monkeypatch)
             root,
             token_file=token,
             token_line=None,
-            chat_id=-1004475802889,
+            chat_id=SYNTHETIC_CHAT_ID,
             wait_s=60,
             sleep=owner_taps,
             channel_factory=lambda **kwargs: TelegramChannel(**kwargs, http=telegram),

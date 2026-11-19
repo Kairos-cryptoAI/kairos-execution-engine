@@ -3,12 +3,13 @@
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from eth_account import Account
-from eth_account.messages import encode_defunct
 
 from kairos_execution.local_custody import LocalCustodyError
 from kairos_execution.siwe_auth import evedex_siwe_message
 from tests.test_local_custody import CHAIN, REFERENCE, _backend
+
+Account = pytest.importorskip("eth_account").Account
+encode_defunct = pytest.importorskip("eth_account.messages").encode_defunct
 
 
 def stamp(delta=0):

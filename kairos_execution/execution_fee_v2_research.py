@@ -14,7 +14,11 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
-from kairos_core.contracts import ExecutionFeeBundleV2, TradeExecutionEventV2
+# The fee-v2 research source lock supplies this module.
+from kairos_core.contracts.execution_fee_v2 import (  # type: ignore[import-not-found]
+    ExecutionFeeBundleV2,
+    TradeExecutionEventV2,
+)
 from kairos_core.enums import TradeExecutionEventType, TradeLifecycleState
 
 

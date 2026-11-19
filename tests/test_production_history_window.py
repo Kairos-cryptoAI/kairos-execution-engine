@@ -1,4 +1,5 @@
 """Contract tests for read-only bounded pagination, never exchange authority."""
+
 from __future__ import annotations
 
 import asyncio
@@ -46,10 +47,13 @@ def make_reader(funding_pages, fill_pages, *, account_ids=("acct", "acct")):
         return copy.deepcopy(result)
 
     reads._read = AsyncMock(side_effect=identity)
+
     async def funding_call(**kw):
         return await page("funding_transfers", funding_pages, **kw)
+
     async def fill_call(**kw):
         return await page("fill_history", fill_pages, **kw)
+
     reads.fetch_funding_transfers = AsyncMock(side_effect=funding_call)
     reads.fetch_fill_history = AsyncMock(side_effect=fill_call)
     return reads, calls
@@ -70,11 +74,14 @@ async def test_reads_both_complete_reported_page_sets_without_claiming_history_c
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("bad", [
-    {"count": 4, "list": [funding()]},  # changed count
-    {"count": 3, "list": []},           # empty nonterminal
-    {"count": 3, "list": [funding()], "next": "opaque"},
-])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"count": 4, "list": [funding()]},  # changed count
+        {"count": 3, "list": []},  # empty nonterminal
+        {"count": 3, "list": [funding()], "next": "opaque"},
+    ],
+)
 async def test_refuses_unstable_or_unusable_pagination(bad):
     reads, _ = make_reader([{"count": 3, "list": [funding(), funding()]}, bad], [])
     with pytest.raises(ProductionReadUnavailable):
@@ -83,10 +90,13 @@ async def test_refuses_unstable_or_unusable_pagination(bad):
 
 @pytest.mark.asyncio
 async def test_refuses_duplicate_fill_ids_across_pages():
-    reads, _ = make_reader([{"count": 0, "list": []}], [
-        {"count": 3, "list": [fill("a"), fill("b")]},
-        {"count": 3, "list": [fill("a")]},
-    ])
+    reads, _ = make_reader(
+        [{"count": 0, "list": []}],
+        [
+            {"count": 3, "list": [fill("a"), fill("b")]},
+            {"count": 3, "list": [fill("a")]},
+        ],
+    )
     with pytest.raises(ProductionReadUnavailable, match="repeated across pages"):
         await collect_history_window(reads, after=AFTER, before=BEFORE, page_size=2)
 
@@ -97,8 +107,9 @@ async def test_refuses_row_outside_window_and_account_change():
     reads, _ = make_reader([{"count": 1, "list": [outside]}], [])
     with pytest.raises(ProductionReadUnavailable, match="outside"):
         await collect_history_window(reads, after=AFTER, before=BEFORE)
-    reads, _ = make_reader([{"count": 0, "list": []}], [{"count": 0, "list": []}],
-                           account_ids=("acct", "other"))
+    reads, _ = make_reader(
+        [{"count": 0, "list": []}], [{"count": 0, "list": []}], account_ids=("acct", "other")
+    )
     with pytest.raises(ProductionReadUnavailable, match="identity"):
         await collect_history_window(reads, after=AFTER, before=BEFORE)
 
@@ -148,5 +159,8 @@ async def test_real_reader_parses_wire_captures_before_collecting_pages():
     assert observation.funding_captures[0]["path"] == "/api/user/funding-transfer"
     assert observation.fill_captures[0]["path"] == "/api/fill"
     assert [call["source"] for call in calls[-4:]] == [
-        "account_identity", "funding_transfers", "fill_history", "account_identity"
+        "account_identity",
+        "funding_transfers",
+        "fill_history",
+        "account_identity",
     ]

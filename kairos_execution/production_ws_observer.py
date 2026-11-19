@@ -4,6 +4,7 @@ The current PROD runtime has no private WS adapter. This module will not open
 a socket or create a session; a future adapter must deliver actual channel
 acknowledgements and publications through the explicit stream interface.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -63,6 +64,7 @@ async def _safe_external_call(operation, *, message, timeout_seconds):
     Such a task is detached with its outcome consumed; no successful result
     or cleanup guarantee is claimed for that transport.
     """
+
     async def invoke():
         return await operation()
 
@@ -105,14 +107,16 @@ class _SafeStreamContext:
 
     async def __aenter__(self):
         await _safe_external_call(
-            lambda: self.stream.__aenter__(), message="private WS stream could not start",
+            lambda: self.stream.__aenter__(),
+            message="private WS stream could not start",
             timeout_seconds=self.timeout_seconds,
         )
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
         await _safe_external_call(
-            lambda: self.stream.__aexit__(exc_type, exc, tb), message="private WS stream could not close",
+            lambda: self.stream.__aexit__(exc_type, exc, tb),
+            message="private WS stream could not close",
             timeout_seconds=0.5,
         )
         # The transport does not get to suppress a gap, cancellation, or error.
@@ -217,14 +221,15 @@ async def capture_ws_rest_observation(
 
     started_at = datetime.now(UTC)
     started_monotonic = time.monotonic_ns()
-    previous_clock = [started_at, started_monotonic]
+    previous_at, previous_monotonic = started_at, started_monotonic
 
     def tick() -> tuple[datetime, int]:
+        nonlocal previous_at, previous_monotonic
         current_at = datetime.now(UTC)
         current_monotonic = time.monotonic_ns()
-        if current_at < previous_clock[0] or current_monotonic < previous_clock[1]:
+        if current_at < previous_at or current_monotonic < previous_monotonic:
             raise WsRestObservationError("local observation clock moved backwards")
-        previous_clock[:] = [current_at, current_monotonic]
+        previous_at, previous_monotonic = current_at, current_monotonic
         return current_at, current_monotonic
 
     subscribed: set[str] = set()
@@ -249,15 +254,22 @@ async def capture_ws_rest_observation(
                 if frame.channel not in CHANNELS:
                     raise WsRestObservationError("unknown private WS channel")
                 if frame.kind == "SUBSCRIBED":
-                    if (frame.channel in subscribed or frame.payload_json is not None
-                        or frame.epoch is not None or frame.offset is not None):
+                    if (
+                        frame.channel in subscribed
+                        or frame.payload_json is not None
+                        or frame.epoch is not None
+                        or frame.offset is not None
+                    ):
                         raise WsRestObservationError("duplicate or malformed channel acknowledgement")
                     subscribed.add(frame.channel)
                     received_at, monotonic_now = tick()
-                    acknowledgements.append(ObservedSubscription(
-                        channel=frame.channel, received_at=received_at,
-                        received_monotonic_ns=monotonic_now,
-                    ))
+                    acknowledgements.append(
+                        ObservedSubscription(
+                            channel=frame.channel,
+                            received_at=received_at,
+                            received_monotonic_ns=monotonic_now,
+                        )
+                    )
                     if subscribed == CHANNELS:
                         ready_or_failed.set()
                     continue
@@ -266,8 +278,13 @@ async def capture_ws_rest_observation(
                 if (frame.epoch is None) != (frame.offset is None):
                     raise WsRestObservationError("partial provider position is unusable")
                 if frame.epoch is not None:
-                    if (not isinstance(frame.epoch, str) or not frame.epoch or len(frame.epoch) > 256
-                        or type(frame.offset) is not int or frame.offset < 0):
+                    if (
+                        not isinstance(frame.epoch, str)
+                        or not frame.epoch
+                        or len(frame.epoch) > 256
+                        or type(frame.offset) is not int
+                        or frame.offset < 0
+                    ):
                         raise WsRestObservationError("provider position is malformed")
                     previous = positions.get(frame.channel)
                     if previous is not None and (
@@ -281,27 +298,40 @@ async def capture_ws_rest_observation(
                     raise WsRestObservationError("private WS publication is malformed")
                 encoded_size = len(frame.payload_json.encode("utf-8"))
                 retained_bytes += encoded_size
-                if (encoded_size > MAX_PUBLICATION_BYTES or retained_bytes > MAX_CAPTURE_BYTES
-                    or len(publications) >= max_publications):
+                if (
+                    encoded_size > MAX_PUBLICATION_BYTES
+                    or retained_bytes > MAX_CAPTURE_BYTES
+                    or len(publications) >= max_publications
+                ):
                     raise WsRestObservationError("private WS capture exceeded its buffer budget")
                 try:
                     json.loads(
-                        frame.payload_json, parse_constant=_reject_constant, parse_float=_finite_float,
+                        frame.payload_json,
+                        parse_constant=_reject_constant,
+                        parse_float=_finite_float,
                         object_pairs_hook=_unique_object,
                     )
                 except (TypeError, ValueError):
                     raise WsRestObservationError("private WS publication JSON is malformed") from None
                 received_at, current_mono = tick()
-                publications.append(ObservedWsPublication(
-                    channel=frame.channel, local_sequence=len(publications) + 1,
-                    received_at=received_at, received_monotonic_ns=current_mono,
-                    epoch=frame.epoch, offset=frame.offset, payload_json=frame.payload_json,
-                ))
+                publications.append(
+                    ObservedWsPublication(
+                        channel=frame.channel,
+                        local_sequence=len(publications) + 1,
+                        received_at=received_at,
+                        received_monotonic_ns=current_mono,
+                        epoch=frame.epoch,
+                        offset=frame.offset,
+                        payload_json=frame.payload_json,
+                    )
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            failure = exc if isinstance(exc, WsRestObservationError) else WsRestObservationError(
-                "private WS reader failed"
+            failure = (
+                exc
+                if isinstance(exc, WsRestObservationError)
+                else WsRestObservationError("private WS reader failed")
             )
             ready_or_failed.set()
 
@@ -322,7 +352,8 @@ async def capture_ws_rest_observation(
                     ensure_open()
                     snapshot_started, snapshot_started_monotonic = tick()
                     snapshot = await _safe_external_call(
-                        reads.fetch_paper_state, message="private account snapshot failed",
+                        reads.fetch_paper_state,
+                        message="private account snapshot failed",
                         timeout_seconds=timeout_seconds,
                     )
                     snapshot_finished, snapshot_finished_monotonic = tick()
@@ -333,8 +364,10 @@ async def capture_ws_rest_observation(
                     finished, finished_monotonic = tick()
                     if (
                         not started_at <= snapshot_started <= snapshot_finished <= finished
-                        or not started_monotonic <= snapshot_started_monotonic
-                        <= snapshot_finished_monotonic <= finished_monotonic
+                        or not started_monotonic
+                        <= snapshot_started_monotonic
+                        <= snapshot_finished_monotonic
+                        <= finished_monotonic
                         or any(
                             not started_at <= ack.received_at <= snapshot_started for ack in acknowledgements
                         )
@@ -342,14 +375,18 @@ async def capture_ws_rest_observation(
                     ):
                         raise WsRestObservationError("local UTC clock moved backwards")
                     return WsRestObservation(
-                        started_at=started_at, snapshot_started_at=snapshot_started,
-                        snapshot_finished_at=snapshot_finished, finished_at=finished,
+                        started_at=started_at,
+                        snapshot_started_at=snapshot_started,
+                        snapshot_finished_at=snapshot_finished,
+                        finished_at=finished,
                         started_monotonic_ns=started_monotonic,
                         snapshot_started_monotonic_ns=snapshot_started_monotonic,
                         snapshot_finished_monotonic_ns=snapshot_finished_monotonic,
                         finished_monotonic_ns=finished_monotonic,
-                        snapshot=snapshot, publications=tuple(publications),
-                        subscribed_channels=frozenset(subscribed), acknowledgements=tuple(acknowledgements),
+                        snapshot=snapshot,
+                        publications=tuple(publications),
+                        subscribed_channels=frozenset(subscribed),
+                        acknowledgements=tuple(acknowledgements),
                     )
                 finally:
                     task.cancel()

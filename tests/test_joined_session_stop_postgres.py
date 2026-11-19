@@ -39,8 +39,13 @@ async def test_real_latch_and_io_boundary_share_account_lock(monkeypatch):
             await connection.execute(DDL)
         signer, request, _, _, _ = setup_signer()
         source = AsyncPostgresProductionSigningStateSource(
-            pool, expected_database=DB, database_uuid=uuid4(), policy_namespace="synthetic:joined",
-            runtime_role="synthetic_reader", context=request.context, require_session_loss_latch=True,
+            pool,
+            expected_database=DB,
+            database_uuid=uuid4(),
+            policy_namespace="synthetic:joined",
+            runtime_role="synthetic_reader",
+            context=request.context,
+            require_session_loss_latch=True,
         )
 
         async def inspect_for_test(connection):
@@ -57,10 +62,15 @@ async def test_real_latch_and_io_boundary_share_account_lock(monkeypatch):
         account = _account_scope_sha256(request.context)
         session_id = UUID("d155f463-931f-4c62-871f-40fb9404d1f0")
         baseline = VerifiedSessionObservationV1(
-            account_sha256=account, session_id=session_id, sequence=1,
-            baseline_equity_usd=Decimal("100"), baseline_net_deposits_usd=Decimal("0"),
-            net_deposits_usd=Decimal("0"), equity_usd=Decimal("100"),
-            remaining_incremental_risk_usd=Decimal("0"), evidence_sha256="a" * 64,
+            account_sha256=account,
+            session_id=session_id,
+            sequence=1,
+            baseline_equity_usd=Decimal("100"),
+            baseline_net_deposits_usd=Decimal("0"),
+            net_deposits_usd=Decimal("0"),
+            equity_usd=Decimal("100"),
+            remaining_incremental_risk_usd=Decimal("0"),
+            evidence_sha256="a" * 64,
             observed_at=datetime.now(UTC),
         )
         observation = [baseline]
@@ -79,10 +89,14 @@ async def test_real_latch_and_io_boundary_share_account_lock(monkeypatch):
             return await source.observe_session_loss_async({})
 
         async with barrier.entry(context=request.context):
-            observation[0] = baseline.model_copy(update={
-                "sequence": 2, "equity_usd": Decimal("95"), "evidence_sha256": "b" * 64,
-                "observed_at": datetime.now(UTC),
-            })
+            observation[0] = baseline.model_copy(
+                update={
+                    "sequence": 2,
+                    "equity_usd": Decimal("95"),
+                    "evidence_sha256": "b" * 64,
+                    "observed_at": datetime.now(UTC),
+                }
+            )
             stop_task = asyncio.create_task(append_stop())
             await waiting.wait()
             with pytest.raises(TimeoutError):
@@ -101,9 +115,14 @@ async def test_real_latch_and_io_boundary_share_account_lock(monkeypatch):
             return {"status": "SYNTHETIC"}
 
         dispatcher = ProductionEffectDispatcher(
-            authorization=CurrentState(), signature_verifier=SyntheticSignatureVerifier(),
-            claims=claims, database_uuid=claims.database_uuid, context=wire.context,
-            clock=lambda: now, sender=sender, session_stop_boundary=barrier,
+            authorization=CurrentState(),
+            signature_verifier=SyntheticSignatureVerifier(),
+            claims=claims,
+            database_uuid=claims.database_uuid,
+            context=wire.context,
+            clock=lambda: now,
+            sender=sender,
+            session_stop_boundary=barrier,
         )
         with pytest.raises(ProductionDispatchError, match="atomic session entry fence is unavailable"):
             await dispatcher.dispatch_one(wire)

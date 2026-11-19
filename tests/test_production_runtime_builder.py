@@ -101,7 +101,10 @@ async def test_required_fence_keeps_exit_reservation_path_available(setup, opera
     _, pools, _, _, _, _, arguments = setup
     runtime = build_clocked_production_runtime(**arguments, require_session_entry_fence=True)
     _, request, binding, evidence, _ = signing_fixture(operation)
-    assert await runtime.state_source.reserve_entry_async(request=request, binding=binding, evidence=evidence) is None
+    assert (
+        await runtime.state_source.reserve_entry_async(request=request, binding=binding, evidence=evidence)
+        is None
+    )
     assert all(pool.calls == [] for pool in pools)
 
 

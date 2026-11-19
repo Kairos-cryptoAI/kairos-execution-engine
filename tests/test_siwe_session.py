@@ -93,8 +93,13 @@ async def test_nonce_claim_is_committed_before_siwe_and_reuse_refused(tmp_path, 
 
     monkeypatch.setattr(siwe_session, "_fetch_evedex_nonce", nonce)
     monkeypatch.setattr(claims, "claim", claim)
-    args = dict(backend=backend, claims=claims, expected_context=context, expected_wallet_address=wallet,
-                audit=siwe_session.AuthAuditJournal(claims))
+    args = dict(
+        backend=backend,
+        claims=claims,
+        expected_context=context,
+        expected_wallet_address=wallet,
+        audit=siwe_session.AuthAuditJournal(claims),
+    )
     message, signature = await siwe_session.prepare_evedex_siwe_once(**args)
     assert "Nonce: TestNonce12345678" in message and signature.startswith("0x")
     assert audit_stages == ["NONCE_CLAIMED", "SIGN_STARTED", "SIGNATURE_RECOVERED"]
@@ -255,7 +260,12 @@ async def test_session_rejects_wallet_mismatch_before_any_signing(tmp_path, monk
 @pytest.mark.parametrize("auth_requires_twofa", [True, False])
 @pytest.mark.parametrize("auth_success_status", [200, 201, 204, 302, 451])
 async def test_wallet_session_checks_server_account_before_return(
-    tmp_path, monkeypatch, session_account, should_succeed, with_refresh, auth_requires_twofa,
+    tmp_path,
+    monkeypatch,
+    session_account,
+    should_succeed,
+    with_refresh,
+    auth_requires_twofa,
     auth_success_status,
 ):
     import json
@@ -334,10 +344,12 @@ async def test_wallet_session_checks_server_account_before_return(
             return Response(
                 {
                     "user": {"wallet": wallet},
-                    "token": {"accessToken": "synthetic-access", **(
-                        {"refreshToken": "synthetic-refresh"} if with_refresh else {}
-                    )},
-                }, auth_success_status
+                    "token": {
+                        "accessToken": "synthetic-access",
+                        **({"refreshToken": "synthetic-refresh"} if with_refresh else {}),
+                    },
+                },
+                auth_success_status,
             )
 
         def get(self, url, **kwargs):
