@@ -53,6 +53,12 @@ def evidence(tmp_path, monkeypatch):
                 else None
             )
             exits, terminal, cover = {}, {}, {}
+            old_stop, new_stop, remaining_target = (
+                f"old-stop-{version}",
+                f"new-stop-{version}",
+                f"target-{version}",
+            )
+            stop_price, take_price = ("95", "105") if side == "BUY" else ("105", "95")
             entry = {**order(entry_id, 1, "manually", side, 0), "positionVersions": [version]}
             entries[entry_id] = entry
             records[version] = [entry]
@@ -71,6 +77,7 @@ def evidence(tmp_path, monkeypatch):
                     triggerOrder=entry_id if other == "BUY" else None,
                     triggeredQuantity=qty,
                     quantity=qty if ladder else "0",
+                    price=stop_price if group == "stop-loss" else take_price,
                 )
                 remaining -= Decimal(qty)
                 if ladder:
@@ -78,10 +85,15 @@ def evidence(tmp_path, monkeypatch):
                         remaining=str(remaining),
                         position_version=version,
                         position_id="position",
-                        stops=["new-stop"],
-                        remaining_targets=["remaining-target"],
+                        stops=[new_stop],
+                        remaining_targets=[remaining_target],
                     )
-            terminal["remaining-target"] = dict(status="cancelled", type="take-profit", side=other)
+            if ladder or kind == "stop-loss":
+                terminal[remaining_target] = dict(
+                    status="cancelled", type="take-profit", side=other, price=take_price
+                )
+            if ladder or kind == "take-profit":
+                terminal[old_stop] = dict(status="cancelled", type="stop-loss", side=other, price=stop_price)
             receipt = dict(
                 id=entry_id,
                 plan=dict(symbol="BTCUSD", side=side, ladder=ladder),
@@ -92,8 +104,7 @@ def evidence(tmp_path, monkeypatch):
             )
             if ladder:
                 close_id = f"timeout-{version}"
-                terminal["old-stop"] = dict(status="cancelled", type="stop-loss", side=other)
-                terminal["new-stop"] = dict(
+                terminal[new_stop] = dict(
                     status="cancelled", type="stop-loss", side=other, price=move["after"]
                 )
                 records[version].append(
@@ -109,9 +120,23 @@ def evidence(tmp_path, monkeypatch):
                     close_id=close_id,
                     close_qty=".7",
                     close_side=other,
-                    stop_move={**move, "from": "old-stop", "to": "new-stop"},
+                    stop_move={
+                        **move,
+                        "from": old_stop,
+                        "to": new_stop,
+                        "confirmed_at": "2026-01-01T10:00:00Z",
+                    },
+                    standalone_partial_ids=list(exits),
                 )
-            receipt["child_ids"] = dict.fromkeys(terminal)
+            for key, row in terminal.items():
+                row.update(id=key, instrument="BTCUSD")
+                row.setdefault("quantity", "0")
+            receipt["plan"]["children"] = [
+                dict(type=k, side=other, quantity="0", price=p)
+                for k, p in (("take-profit", take_price), ("stop-loss", stop_price))
+            ]
+            receipt["child_ids"] = {key: row.copy() for key, row in terminal.items()}
+            triggers.update(terminal)
             capture = dict(
                 schema="kairos.probe-capture.v1",
                 history_closed=True,
@@ -150,7 +175,9 @@ def evidence(tmp_path, monkeypatch):
     api.position_version_closed = AsyncMock(return_value=True)
     api.position_version_orders = AsyncMock(side_effect=lambda symbol, version: records[version])
 
-    api.protection_for_fill = AsyncMock(side_effect=lambda symbol, oid: triggers.get(oid))
+    api.target_history = AsyncMock(
+        side_effect=lambda symbol, ids: {key: triggers[key] for key in ids if key in triggers}
+    )
     return profile, api, manifest, records
 
 
@@ -301,3 +328,41 @@ async def test_terminal_native_id_beats_nullable_or_parent_link():
     ]
     api._request = AsyncMock(return_value={"list": rows, "next": None, "count": len(rows)})
     assert (await api.protection_for_fill("BTCUSD", "actual-child"))["id"] == "actual-child"
+
+
+@pytest.mark.parametrize("capability", ["move", "partials"])
+async def test_independent_management_evidence_with_own_expiry_close(evidence, tmp_path, capability):
+    profile, api, manifest, records = evidence
+    spec = manifest["cases"][2].copy()
+    capture = json.loads((tmp_path / "protection-evidence" / (spec["capture_sha256"] + ".json")).read_bytes())
+    r = capture["receipt"]
+    if capability == "move":
+        spec["partial_cover_verified"] = False
+        r["partial_cover_verified"] = False
+        del r["partial_cover_evidence"]
+        for child in spec["exits"].values():
+            del capture["terminal_native_orders"][child]
+            del r["child_ids"][child]
+        spec["exits"] = {}
+        r["close_qty"] = "1"
+        records[2][:] = [records[2][0], {**records[2][-1], "quantity": "1"}]
+    else:
+        spec["stop_move"] = None
+        del r["stop_move"]
+    case = checks.Case.model_validate_json(json.dumps(spec))
+    receipt = checks._check_capture(case, json.dumps(capture).encode())
+    result = await checks._case_features(api, case, profile.remote_account_id, receipt)
+    assert result == (
+        {("BUY", "stop-move")} if capability == "move" else {("BUY", "partial"), ("BUY", "protected-partial")}
+    )
+
+
+async def test_missing_resting_order_route_cannot_qualify_standalone_partials(evidence, tmp_path):
+    profile, api, manifest, _ = evidence
+    spec = manifest["cases"][2]
+    case = checks.Case.model_validate_json(json.dumps(spec))
+    payload = (tmp_path / "protection-evidence" / (spec["capture_sha256"] + ".json")).read_bytes()
+    receipt = checks._check_capture(case, payload)
+    del receipt["standalone_partial_ids"]
+    with pytest.raises(ValueError, match="retained protection"):
+        await checks._case_features(api, case, profile.remote_account_id, receipt)

@@ -38,7 +38,7 @@ class Case(_Record):
     stop_move: StopMove | None
     closed_clean: Literal[True]
     partial_cover_verified: bool = False
-    exits: dict[str, str] = Field(min_length=1)
+    exits: dict[str, str]
 
 
 class UniformContract(_Record):
@@ -73,6 +73,10 @@ def _capture(root: Path, digest: str, suffix: str) -> bytes:
     return payload
 
 
+def _trigger_shape(row: dict) -> tuple[str, str, Decimal, Decimal]:
+    return row["type"], row["side"], Decimal(str(row["quantity"])), Decimal(str(row["price"]))
+
+
 def _check_capture(case: Case, payload: bytes) -> dict:
     capture = json.loads(payload, object_pairs_hook=_unique_fields)
     receipt = capture["receipt"]
@@ -96,11 +100,27 @@ def _check_capture(case: Case, payload: bytes) -> dict:
         )
     ):
         raise ValueError("original probe capture does not match clean owned bracket settlement")
+    initial = receipt["plan"]["children"]
+    full = [child for child in initial if Decimal(str(child["quantity"])) == 0]
+    if len(full) != 2 or {row["type"] for row in full} != {"stop-loss", "take-profit"}:
+        raise ValueError("probe lacks its initial full stop and take")
+    confirmed = {_trigger_shape(row) for row in terminal.values()}
+    for row in full:
+        if row["side"] != reducing_side(case.position_side):
+            raise ValueError("initial probe protection faces the wrong side")
+        if _trigger_shape(row) not in confirmed and not (
+            case.stop_move
+            and row["type"] == "stop-loss"
+            and Decimal(str(row["price"])) == case.stop_move.before
+            and receipt["stop_move"]["from"] == receipt["stop_move"]["to"]
+        ):
+            raise ValueError("initial full protection is absent from owned trigger history")
     if case.stop_move:
         move = receipt["stop_move"]
         prev, new = terminal[move["from"]], terminal[move["to"]]
         if (
-            Decimal(move["before"]) != case.stop_move.before
+            not move.get("confirmed_at")
+            or Decimal(move["before"]) != case.stop_move.before
             or Decimal(move["after"]) != case.stop_move.after
             or new["type"] != "stop-loss"
             or prev["type"] != "stop-loss"
@@ -127,11 +147,21 @@ def _check_capture(case: Case, payload: bytes) -> dict:
 
 async def _case_features(api, case: Case, owner: str, receipt: dict) -> set[tuple[str, str]]:
     symbol, version = case.instrument, case.position_version
-    closed, rows, entry = await asyncio.gather(
+    closed, rows, entry, history = await asyncio.gather(
         api.position_version_closed(symbol, version),
         api.position_version_orders(symbol, version),
         api.order(case.entry_order_id),
+        api.target_history(symbol, set(receipt["child_ids"])),
     )
+    if set(history) != set(receipt["child_ids"]) or any(
+        actual.get("id") != key
+        or actual.get("instrument") != symbol
+        or actual.get("side") != reducing_side(case.position_side)
+        or actual.get("status") != ("done" if key in case.exits.values() else "cancelled")
+        or _trigger_shape(actual) != _trigger_shape(receipt["child_ids"][key])
+        for key, actual in history.items()
+    ):
+        raise ValueError("private native history differs from the owned probe bracket")
     if not (
         closed
         and entry
@@ -187,17 +217,19 @@ async def _case_features(api, case: Case, owner: str, receipt: dict) -> set[tupl
                 and row.get("type") in {"MARKET", "LIMIT"}
                 and row.get("side") == receipt.get("close_side")
                 and qty == Decimal(str(receipt["close_qty"]))
-                and case.partial_cover_verified
-                and case.stop_move
-                and len(observed_partials) >= 2
+                and (
+                    case.stop_move is not None
+                    or (case.partial_cover_verified and len(observed_partials) >= 2)
+                )
             ):
                 raise ValueError("foreign exit in protection probe generation")
             continue
-        trigger = await api.protection_for_fill(symbol, oid)
+        trigger = history.get(case.exits.get(oid, ""))
         if not (
             trigger
             and oid in case.exits
             and trigger.get("id") == case.exits[oid]
+            and (trigger["id"] == oid or trigger.get("triggerOrder") == oid)
             and trigger.get("triggerOrder") in {None, oid, case.entry_order_id}
             and row.get("type") == "MARKET"
             and trigger.get("instrument") == symbol
@@ -209,14 +241,15 @@ async def _case_features(api, case: Case, owner: str, receipt: dict) -> set[tupl
             raise ValueError("native execution does not match its witnessed terminal trigger")
         verified_exits.add(oid)
         trigger_qty = Decimal(str(trigger["quantity"]))
-        if trigger_qty == 0 and not remaining and not receipt["plan"]["ladder"]:
+        if trigger_qty == 0 and not remaining and not receipt["plan"]["ladder"] and not case.stop_move:
             features.add((case.position_side, group))
         elif group == "take-profit" and remaining and trigger_qty == qty:
             features.add((case.position_side, "partial"))
             if case.partial_cover_verified:
                 cover = receipt["partial_cover_evidence"][oid]
                 if (
-                    Decimal(str(cover["remaining"])) != remaining
+                    trigger["id"] not in receipt.get("standalone_partial_ids", ())
+                    or Decimal(str(cover["remaining"])) != remaining
                     or cover["position_version"] != version
                     or not receipt.get("position_id")
                     or cover["position_id"] != receipt["position_id"]
@@ -229,14 +262,14 @@ async def _case_features(api, case: Case, owner: str, receipt: dict) -> set[tupl
         if len(observed_partials) < 2:
             raise ValueError("qualified partial ladder requires distinct reducing fills")
         features.add((case.position_side, "protected-partial"))
-    if remaining or not features or verified_exits != set(case.exits):
-        raise ValueError("native exit did not reduce a reconciled probe position")
     if case.stop_move:
         move = case.stop_move
         tightened = move.after > move.before if case.position_side == "BUY" else move.after < move.before
         if not tightened:
             raise ValueError("probe stop moved away from the owned position")
         features.add((case.position_side, "stop-move"))
+    if remaining or not features or verified_exits != set(case.exits):
+        raise ValueError("native exit did not reduce a reconciled probe position")
     return features
 
 
