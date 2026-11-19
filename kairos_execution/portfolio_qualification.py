@@ -72,7 +72,7 @@ def _capture(root: Path, digest: str, suffix: str) -> bytes:
     return payload
 
 
-def _check_capture(case: Case, payload: bytes) -> None:
+def _check_capture(case: Case, payload: bytes) -> dict:
     capture = json.loads(payload, object_pairs_hook=_unique_fields)
     receipt = capture["receipt"]
     terminal = capture["terminal_native_orders"]
@@ -108,11 +108,23 @@ def _check_capture(case: Case, payload: bytes) -> None:
             or (move["from"] != move["to"] and prev["status"] != "cancelled")
         ):
             raise ValueError("original capture lacks the tightened protective stop")
-    if case.partial_cover_verified and receipt.get("partial_cover_verified") is not True:
-        raise ValueError("original capture lacks protected partial exits")
+    if case.partial_cover_verified:
+        if not receipt["plan"]["ladder"] or receipt.get("partial_cover_verified") is not True:
+            raise ValueError("original capture lacks protected partial exits")
+        for evidence in receipt["partial_cover_evidence"].values():
+            for key, kind in (("stops", "stop-loss"), ("remaining_targets", "take-profit")):
+                children = evidence[key]
+                if not children or any(
+                    child not in terminal
+                    or terminal[child]["type"] != kind
+                    or terminal[child]["side"] != reducing_side(case.position_side)
+                    for child in children
+                ):
+                    raise ValueError("partial exit lacks its original reducing stop or remaining target")
+    return receipt
 
 
-async def _case_features(api, case: Case, owner: str) -> set[tuple[str, str]]:
+async def _case_features(api, case: Case, owner: str, receipt: dict) -> set[tuple[str, str]]:
     symbol, version = case.instrument, case.position_version
     closed, rows, entry = await asyncio.gather(
         api.position_version_closed(symbol, version),
@@ -156,33 +168,64 @@ async def _case_features(api, case: Case, owner: str) -> set[tuple[str, str]]:
     _, _, remaining, first = amounts[0]
     if first.get("side") != case.position_side or first.get("group") != "manually":
         raise ValueError("wrong probe entry direction or origin")
-    features = set()
-    verified_exits = set()
+    features: set[tuple[str, str]] = set()
+    verified_exits: set[str] = set()
+    observed_partials: set[str] = set()
     for _, oid, qty, row in amounts[1:]:
         if row.get("side") != reducing_side(case.position_side) or qty > remaining:
             raise ValueError("probe exit increased or crossed the position")
         remaining -= qty
         group = row.get("group")
-        if group in {"take-profit", "stop-loss"}:
-            trigger = await api.protection_for_fill(symbol, oid)
+        if group not in {"take-profit", "stop-loss"}:
             if not (
-                trigger
-                and oid in case.exits
-                and trigger.get("id") == case.exits[oid]
-                and trigger.get("instrument") == symbol
-                and trigger.get("status") == "done"
-                and trigger.get("type") == group
-                and trigger.get("side") == row.get("side")
-                and Decimal(str(trigger["triggeredQuantity"])) == qty
+                group == "manually"
+                and row.get("status") == "FILLED"
+                and receipt.get("close_reason") == "expiry"
+                and oid == receipt.get("close_id")
+                and not remaining
+                and row.get("type") in {"MARKET", "LIMIT"}
+                and row.get("side") == receipt.get("close_side")
+                and qty == Decimal(str(receipt["close_qty"]))
+                and case.partial_cover_verified
+                and case.stop_move
+                and len(observed_partials) >= 2
             ):
-                raise ValueError("native execution does not match its witnessed terminal trigger")
-            verified_exits.add(oid)
-        if group in {"take-profit", "stop-loss"} and not remaining:
+                raise ValueError("foreign exit in protection probe generation")
+            continue
+        trigger = await api.protection_for_fill(symbol, oid)
+        if not (
+            trigger
+            and oid in case.exits
+            and trigger.get("id") == case.exits[oid]
+            and trigger.get("triggerOrder") in {None, oid, case.entry_order_id}
+            and row.get("type") == "MARKET"
+            and trigger.get("instrument") == symbol
+            and trigger.get("status") == "done"
+            and trigger.get("type") == group
+            and trigger.get("side") == row.get("side")
+            and Decimal(str(trigger["triggeredQuantity"])) == qty
+        ):
+            raise ValueError("native execution does not match its witnessed terminal trigger")
+        verified_exits.add(oid)
+        trigger_qty = Decimal(str(trigger["quantity"]))
+        if trigger_qty == 0 and not remaining and not receipt["plan"]["ladder"]:
             features.add((case.position_side, group))
-        elif group == "take-profit" and remaining:
+        elif group == "take-profit" and remaining and trigger_qty == qty:
             features.add((case.position_side, "partial"))
+            if case.partial_cover_verified:
+                cover = receipt["partial_cover_evidence"][oid]
+                if (
+                    Decimal(str(cover["remaining"])) != remaining
+                    or cover["position_version"] != version
+                    or not receipt.get("position_id")
+                    or cover["position_id"] != receipt["position_id"]
+                    or not cover["stops"]
+                    or not cover["remaining_targets"]
+                ):
+                    raise ValueError("missing retained protection after the native partial fill")
+                observed_partials.add(oid)
     if case.partial_cover_verified:
-        if sum(1 for *_, r in amounts[1:-1] if r.get("group") == "take-profit") < 2:
+        if len(observed_partials) < 2:
             raise ValueError("qualified partial ladder requires distinct reducing fills")
         features.add((case.position_side, "protected-partial"))
     if remaining or not features or verified_exits != set(case.exits):
@@ -223,8 +266,8 @@ async def qualified_instruments(api, profile: PortfolioProfile) -> tuple[frozens
         if case.instrument not in profile.symbols or key in entries:
             raise ValueError("duplicate or out-of-scope protection evidence")
         entries.add(key)
-        _check_capture(case, _capture(root, case.capture_sha256, ".json"))
-        features[case.instrument].update(await _case_features(api, case, q.remote_account_id))
+        receipt = _check_capture(case, _capture(root, case.capture_sha256, ".json"))
+        features[case.instrument].update(await _case_features(api, case, q.remote_account_id, receipt))
     required = {
         (side, kind)
         for side in ("BUY", "SELL")
