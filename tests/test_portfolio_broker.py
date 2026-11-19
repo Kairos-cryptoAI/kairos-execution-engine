@@ -1001,6 +1001,7 @@ async def test_stop_move_preserves_the_new_live_order_after_exchange_replacement
     original = s.v.post_tpsl
 
     async def replace(body):
+        assert "order" in body and body["order"] is None
         s.v.tpsl.pop(old_key)
         if not reuses_id:
             return await original(body)

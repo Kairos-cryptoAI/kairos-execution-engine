@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import replace
 from decimal import Decimal as D
 
@@ -69,6 +70,76 @@ async def open_targets(s, side, monkeypatch):
     }
 
 
+async def test_authenticated_risk_observations_read_concurrently_after_identity(system, monkeypatch):
+    s = system
+    requests = set()
+    all_started = asyncio.Event()
+
+    async def identity():
+        requests.add("identity")
+
+    def reader(name, result):
+        async def read():
+            assert "identity" in requests
+            requests.add(name)
+            if len(requests) == 4:
+                all_started.set()
+            await asyncio.wait_for(all_started.wait(), timeout=1)
+            return result
+
+        return read
+
+    monkeypatch.setattr(s.b, "_identity", identity)
+    monkeypatch.setattr(s.v, "balance", reader("balance", (D(100), D(98))))
+    monkeypatch.setattr(s.v, "positions", reader("positions", []))
+    monkeypatch.setattr(s.v, "open_orders", reader("orders", []))
+    assert await s.b.account_reads() == (D(100), D(98), [], [])
+
+
+async def test_waiting_acknowledged_stop_is_removed_without_touching_the_current_cover(
+    system, position_projection, monkeypatch
+):
+    s = system
+    fill = await s.enter()
+    item = s.j.trade(fill["trade_id"])
+    original = set(s.v.tpsl)
+    row = {
+        "id": "waiting",
+        "instrument": "BTCUSD",
+        "type": "stop-loss",
+        "status": "waitOrder",
+        "quantity": "0",
+        "side": "SELL",
+        "price": "97",
+        "order": item["entry_order_id"],
+    }
+    # Previous builds bound already-filled entries on the wire and could leave a dormant trigger.
+    eid = s.j.prepare_effect(
+        trade_id=item["trade_id"],
+        kind="STOP",
+        operation_key="97",
+        request={"order": item["entry_order_id"], "side": "SELL", "price": "97"},
+    )
+    s.j.finish_effect(eid, "ACCEPTED", "waiting")
+    s.v.tpsl["waiting"] = row
+    s.b._position_entries.clear()
+    trade = {
+        "id": item["entry_order_id"],
+        "symbol": "BTCUSD",
+        "side": "LONG",
+        "risk_trade_id": item["trade_id"],
+        "risk_decision_id": item["decision_id"],
+        "quantity": item["quantity"],
+        "stop": item["stop"],
+    }
+    await s.b.reconcile_start([trade], None)
+    assert set(s.v.tpsl) == original and D(trade["stop"]) == D(item["stop"])
+    assert s.b._tightest_stop(item) == D(item["stop"])
+    assert [e["request"]["id"] for e in s.j.effects(item["trade_id"]) if e["kind"] == "CANCEL_STOP"] == [
+        "waiting"
+    ]
+
+
 @pytest.mark.parametrize("side", ["LONG", "SHORT"])
 async def test_resting_ladder_restores_each_fill_once_and_keeps_full_stop(
     system, position_projection, side, monkeypatch
@@ -76,6 +147,9 @@ async def test_resting_ladder_restores_each_fill_once_and_keeps_full_stop(
     s = system
     trade = await open_targets(s, side, monkeypatch)
     effective = [r for r in s.v.tpsl.values() if D(r["quantity"]) > 0]
+    assert all("order" in r and r["order"] is None for r in effective)
+    owned = [e["request"] for e in s.j.effects("owned") if e["kind"] == "PARTIAL_TAKE"]
+    assert all(r["order"] == "entry" and r["wire_scope"] == "position" and r["version"] == 4 for r in owned)
     assert [(D(r["price"]), D(r["quantity"])) for r in effective] == (
         [(D("101.5"), D(".025")), (D(103), D(".025"))]
         if side == "LONG"

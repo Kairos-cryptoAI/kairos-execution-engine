@@ -251,8 +251,10 @@ class PortfolioBroker:
 
     async def account_reads(self) -> tuple[Decimal, Decimal, list[Position], list[dict[str, Any]]]:
         await self._identity()
-        balance, available = await self._api.balance()
-        return balance, available, await self._api.positions(), await self._api.open_orders()
+        (balance, available), positions, orders = await asyncio.gather(
+            self._api.balance(), self._api.positions(), self._api.open_orders()
+        )
+        return balance, available, positions, orders
 
     async def position(self, instrument: str, max_age: float = 0.0) -> Position | None:
         found = [p for p in await self._api.positions() if p.instrument == instrument]
@@ -303,10 +305,18 @@ class PortfolioBroker:
         )
 
     async def _protection_rows(
-        self, item: dict, rows: list[dict[str, Any]] | None = None, position: Position | None = None
+        self,
+        item: dict,
+        rows: list[dict[str, Any]] | None = None,
+        position: Position | None = None,
+        *,
+        clear_waiting: bool = False,
     ) -> list[dict[str, Any]]:
         if rows is None:
             rows = await self._api.active_tpsl(item["symbol"])
+        if clear_waiting and any(r.get("status") == "waitOrder" for r in rows):
+            rows = await self._clear_waiting_requests(item, rows)
+            position = None  # cancellation can change the position's own protection projection
         if all(r.get("order") or self._owned_protection(item, r) for r in rows):
             return rows
         if item.get("entry_order_id") in self._position_entries:
@@ -785,10 +795,14 @@ class PortfolioBroker:
         prices = [dec(item["stop"])]
         if runner_stop is not None:
             prices.append(runner_stop)
+        effects = self._journal.effects(item["trade_id"])
+        cancelled = {
+            e["request"]["id"] for e in effects if e["kind"] == "CANCEL_STOP" and e["status"] == "ACCEPTED"
+        }
         prices.extend(
             dec(e["request"]["price"])
-            for e in self._journal.effects(item["trade_id"])
-            if e["kind"] == "STOP" and e["status"] == "ACCEPTED"
+            for e in effects
+            if e["kind"] == "STOP" and e["status"] == "ACCEPTED" and e["venue_id"] not in cancelled
         )
         return max(prices) if item["side"] == "LONG" else min(prices)
 
@@ -797,8 +811,38 @@ class PortfolioBroker:
             # The caller already matched this live position. Keep it visible to the software
             # exits and explicit close path without adding or treating an unsafe trigger as cover.
             return True
+        rows = await self._protection_rows(item, position=position, clear_waiting=True)
+        scoped = {
+            e["venue_id"]: e["request"]
+            for e in self._journal.effects(item["trade_id"])
+            if e["status"] == "ACCEPTED"
+            and e["request"].get("wire_scope") == "position"
+            and e["request"].get("position_id")
+        }
+        if scoped:
+            fresh = await self._owned_position(item)
+            if fresh is None:
+                return False
+            await self._require_position_generation(item, fresh)
+            version = self._position_entries[item["entry_order_id"]][0]
+            if any(r["position_id"] != fresh.venue_id or r["version"] != version for r in scoped.values()):
+                raise PositionIdentityError("standalone protection belongs to another position generation")
+            for row in rows:
+                if (
+                    row["id"] in scoped
+                    and row.get("status") == "active"
+                    and not any(
+                        child.get("id") == row["id"]
+                        and child.get("status") == "active"
+                        and child.get("type") == row["type"]
+                        and child.get("side") == row["side"]
+                        and row_price(child) == row_price(row)
+                        and dec(child["quantity"]) == dec(row["quantity"])
+                        for child in fresh.protections
+                    )
+                ):
+                    raise ProtectionEvidenceError("standalone protection is absent from the owned position")
         stop = self._tightest_stop(item, dec(trade["stop"]))
-        rows = await self._protection_rows(item, position=position)
         if any(not self._usable_protection(item, r) for r in rows):
             raise NeedsOperator("foreign protection shares a managed instrument")
         if plan := self._journal.native_target_plan(item["trade_id"]):
@@ -1402,20 +1446,22 @@ class PortfolioBroker:
                 quantity=dec(level["quantity"]),
                 price=dec(level["price"]),
             )
-            body["order"] = item["entry_order_id"]
             request = {
                 **level,
                 "order": item["entry_order_id"],
                 "side": _exit_side(item),
                 "version": version,
                 "position_id": position.venue_id,
+                "wire_scope": "position",
             }
             await self._effect(
                 item,
                 "PARTIAL_TAKE",
                 level["price"],
                 request,
-                partial(self._api.post_partial_target, body),
+                partial(self._api.post_partial_target, body, expected=current)
+                if isinstance(self._api, Evedex)
+                else partial(self._api.post_partial_target, body),
                 returned_id=True,
             )
             # Confirm the new ID independently on both the active list and the exact same position.
@@ -1423,7 +1469,7 @@ class PortfolioBroker:
             if fresh is None or fresh.venue_id != position.venue_id or not self._match_position(item, fresh):
                 raise ProtectionEvidenceError("native target position changed before acknowledgement")
             await self._require_position_generation(item, fresh)
-            rows = await self._protection_rows(item, position=fresh)
+            rows = await self._protection_rows(item, position=fresh, clear_waiting=True)
             placements = [e for e in self._journal.effects(item["trade_id"]) if e["kind"] == "PARTIAL_TAKE"]
             if not all(
                 sum(target_matches(item, e, row) and row.get("status") == "active" for row in records) == 1
@@ -1603,21 +1649,86 @@ class PortfolioBroker:
         body = self._signer.tpsl(
             instrument=item["symbol"], kind=kind, side=_exit_side(item), quantity=Decimal(0), price=price
         )
-        body["order"] = item["entry_order_id"]
+        identity = self._position_entries.get(item["entry_order_id"])
+        request = {
+            "order": item["entry_order_id"],
+            "price": plain(price),
+            "side": _exit_side(item),
+            "version": identity[0] if identity else None,
+            "position_id": current.venue_id,
+            "wire_scope": "position",
+        }
         try:
-            await self._effect(
+            response = await self._effect(
                 item,
                 "STOP" if kind == "stop-loss" else "TAKE",
                 plain(price),
-                {"order": item["entry_order_id"], "price": plain(price), "side": _exit_side(item)},
-                lambda: self._api.post_tpsl(body),
+                request,
+                partial(self._api.post_tpsl, body, expected=current, entry_order_id=item["entry_order_id"])
+                if isinstance(self._api, Evedex)
+                else partial(self._api.post_tpsl, body),
                 returned_id=True,
             )
         except Rejected:
             return False
-        return any(
-            self._valid_protection(item, r, kind, price) for r in await self._api.active_tpsl(item["symbol"])
+        fresh, rows = await asyncio.gather(
+            self.position(item["symbol"]), self._api.active_tpsl(item["symbol"])
         )
+        if fresh is None or not self._match_position(item, fresh) or fresh.venue_id != current.venue_id:
+            return False
+        rows = await self._protection_rows(item, rows, fresh, clear_waiting=True)
+        projections = [rows]
+        if identity is not None:
+            await self._require_position_generation(item, fresh)
+            projections.append(list(fresh.protections))
+        return all(
+            sum(
+                r["id"] == response["id"]
+                and r.get("status") == "active"
+                and self._valid_protection(item, r, kind, price)
+                for r in projection
+            )
+            == 1
+            for projection in projections
+        )
+
+    async def _clear_waiting_requests(self, item: dict, rows: list[dict]) -> list[dict]:
+        # Only our individually acknowledged post-fill requests can be stranded waiting for an order.
+        # An entry-attached trigger in waitOrder can still be armed by its unfinished GTC.
+        effects = self._journal.effects(item["trade_id"])
+        placements = {
+            e["venue_id"]: e
+            for e in effects
+            if e["kind"] in {"PARTIAL_TAKE", "STOP", "TAKE"}
+            and e["status"] == "ACCEPTED"
+            and e["request"].get("order") == item["entry_order_id"]
+        }
+        candidates = {
+            r["id"]
+            for r in rows
+            if r.get("status") == "waitOrder"
+            and r.get("id") in placements
+            and self._owned_protection(item, r)
+        }
+        if not candidates:
+            return rows
+        refreshed = await self._api.active_tpsl(item["symbol"])
+        cancelled = {
+            e["request"]["id"]
+            for e in effects
+            if e["kind"] in {"CANCEL_TAKE", "CANCEL_STOP"} and e["status"] == "ACCEPTED"
+        }
+        for row in refreshed:
+            if (
+                row.get("id") in candidates
+                and row.get("status") == "waitOrder"
+                and row["id"] not in cancelled
+            ):
+                await self._cancel_protection(item, row)
+        after = await self._api.active_tpsl(item["symbol"])
+        if any(r.get("id") in candidates and r.get("status") == "waitOrder" for r in after):
+            raise ProtectionEvidenceError("acknowledged waiting protection has not cleared")
+        return after
 
     async def _cancel_protection(self, item: dict, row: dict) -> None:
         if not self._owned_protection(item, row):
@@ -1666,6 +1777,9 @@ class PortfolioBroker:
             if not (stop > max(known) if item["side"] == "LONG" else stop < min(known)):
                 raise ValueError("a stop may only move toward less risk")
             if not await self._ensure_price(item, "stop-loss", stop):
+                current = await self._owned_position(item)
+                if current:
+                    await self._maintain_protection(item, trade, current)
                 return False
             # A full-position replacement can cancel the old stop or reuse its
             # identity. Cancel only an old level still present after the move.

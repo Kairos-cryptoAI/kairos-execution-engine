@@ -195,7 +195,8 @@ async def test_signed_fill_matrix_and_native_child_admission(evidence, tmp_path,
     assert api.native_ladder_qualified_for("BTCUSD") and api.native_stop_move_qualified_for("BTCUSD")
     api._request = AsyncMock(return_value={})
     api.active_tpsl = AsyncMock(return_value=[])
-    api.positions = AsyncMock(return_value=[Position("BTCUSD", "SELL", Decimal(1), Decimal(100))])
+    expected = Position("BTCUSD", "SELL", Decimal(1), Decimal(100), venue_id="generation", user="owner")
+    api.positions = AsyncMock(return_value=[expected])
     body = {
         "instrument": "BTCUSD",
         "side": "SELL",
@@ -212,19 +213,30 @@ async def test_signed_fill_matrix_and_native_child_admission(evidence, tmp_path,
         "quantity": ".3",
         "side": "BUY",
         "price": "97",
-        "order": "existing",
+        "order": None,
     }
-    assert await api.post_partial_target(target) == {}
+    assert await api.post_partial_target(target, expected=expected) == {}
+    with pytest.raises(EvedexError):
+        await api.post_partial_target(target)
+    with pytest.raises(EvedexError):
+        await api.post_partial_target(
+            target,
+            expected=Position(
+                "BTCUSD", "SELL", Decimal(1), Decimal(100), venue_id="replacement", user="owner"
+            ),
+        )
+    with pytest.raises(EvedexError):
+        await api.post_partial_target({**target, "order": "filled-parent"}, expected=expected)
     for same_side in (body["tpsl"][0], body["tpsl"][1]):
         same_side["side"] = "SELL"
         with pytest.raises(EvedexError):
             await api.post_limit_order(body)
         same_side["side"] = "BUY"
     with pytest.raises(EvedexError):
-        await api.post_partial_target({**target, "side": "SELL"})
+        await api.post_partial_target({**target, "side": "SELL"}, expected=expected)
     api.active_tpsl.return_value = [{**target, "quantity": ".7"}]
     with pytest.raises(EvedexError, match="remainder"):
-        await api.post_partial_target(target)
+        await api.post_partial_target(target, expected=expected)
     assert api._request.await_count == 2
     records[0][1]["side"] = "BUY"
     with pytest.raises(ValueError, match="increased"):
@@ -252,18 +264,21 @@ async def test_incomplete_signatures_captures_and_fill_history_do_not_qualify(
         "instrument": "BTCUSD",
         "type": "stop-loss",
         "side": "SELL",
-        "order": "entry",
+        "order": None,
         "quantity": "0",
         "price": "95",
     }
     api._request = AsyncMock(return_value={})
-    api.positions = AsyncMock(return_value=[Position("BTCUSD", "BUY", Decimal(1), Decimal(100))])
+    expected = Position("BTCUSD", "BUY", Decimal(1), Decimal(100), venue_id="generation", user="owner")
+    api.positions = AsyncMock(return_value=[expected])
     api.order_with_protections = AsyncMock(
         return_value={"id": "entry", "instrument": "BTCUSD", "side": "BUY", "tpslList": [stop]}
     )
-    assert await api.post_tpsl(stop) == {}
+    assert await api.post_tpsl(stop, entry_order_id="entry", expected=expected) == {}
+    with pytest.raises(EvedexError):
+        await api.post_tpsl({**stop, "order": "entry"}, entry_order_id="entry", expected=expected)
     with pytest.raises(EvedexError, match="unqualified stop move"):
-        await api.post_tpsl({**stop, "price": "99"})
+        await api.post_tpsl({**stop, "price": "99"}, entry_order_id="entry", expected=expected)
     assert api._request.await_count == 1
     manifest["cases"][0]["capture_sha256"] = "0" * 64
     path.write_text(json.dumps(manifest))

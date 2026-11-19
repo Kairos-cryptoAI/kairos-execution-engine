@@ -318,6 +318,24 @@ def _complete_rows(value: Any) -> list[dict[str, Any]]:
     return rows
 
 
+def _same_exposure(actual: Position, expected: Position) -> bool:
+    return bool(expected.venue_id and expected.user) and (
+        actual.venue_id,
+        actual.user,
+        actual.instrument,
+        actual.side,
+        actual.quantity,
+        actual.avg_price,
+    ) == (
+        expected.venue_id,
+        expected.user,
+        expected.instrument,
+        expected.side,
+        expected.quantity,
+        expected.avg_price,
+    )
+
+
 class Evedex:
     """Small async client. ``api_key`` is needed only for private calls."""
 
@@ -828,7 +846,9 @@ class Evedex:
             "POST", f"{TRADING}/api/v2/position/{body['instrument']}/close", private=True, body=body
         )
 
-    async def post_tpsl(self, body: dict[str, Any]) -> dict[str, Any]:
+    async def post_tpsl(
+        self, body: dict[str, Any], *, expected: Position | None = None, entry_order_id: str | None = None
+    ) -> dict[str, Any]:
         instrument = body.get("instrument", "")
         if reason := self.protection_unavailable_for(instrument):
             raise EvedexError(reason)
@@ -836,17 +856,20 @@ class Evedex:
         if (
             len(positions) != 1
             or body.get("side") != reducing_side(positions[0].side)
-            or not body.get("order")
+            or "order" not in body
+            or body["order"] is not None
+            or expected is None
+            or not _same_exposure(positions[0], expected)
             or body.get("type") not in {"stop-loss", "take-profit"}
             or dec(body.get("price")) <= 0
             or dec(body.get("quantity")) != 0
         ):
             raise EvedexError("protective order does not reduce the open position")
         if body["type"] == "stop-loss" and not self.native_stop_move_qualified_for(instrument):
-            parent = await self.order_with_protections(instrument, body["order"])
+            parent = await self.order_with_protections(instrument, entry_order_id) if entry_order_id else None
             if not (
                 parent
-                and parent.get("id") == body["order"]
+                and parent.get("id") == entry_order_id
                 and parent.get("instrument") == instrument
                 and parent.get("side") == positions[0].side
                 and any(
@@ -860,7 +883,9 @@ class Evedex:
                 raise EvedexError("unqualified stop move differs from the owned parent bracket")
         return await self._request("POST", f"{TRADING}/api/tpsl/{instrument}", private=True, body=body)
 
-    async def post_partial_target(self, body: dict[str, Any]) -> dict[str, Any]:
+    async def post_partial_target(
+        self, body: dict[str, Any], *, expected: Position | None = None
+    ) -> dict[str, Any]:
         instrument = body.get("instrument", "")
         if not self.native_ladder_qualified_for(instrument):
             raise EvedexError("native partial targets have not been qualified for this instrument")
@@ -868,7 +893,10 @@ class Evedex:
         if (
             len(positions) != 1
             or body.get("side") != reducing_side(positions[0].side)
-            or not body.get("order")
+            or "order" not in body
+            or body["order"] is not None
+            or expected is None
+            or not _same_exposure(positions[0], expected)
             or body.get("type") != "take-profit"
             or dec(body.get("price")) <= 0
             or not 0 < dec(body.get("quantity")) < positions[0].quantity
