@@ -7,13 +7,23 @@ from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal as D
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from kairos_core.contracts import RiskTradeDecisionV1
 
 from kairos_execution import portfolio_broker as portfolio
-from kairos_execution.portfolio_evedex import TRADING, Book, Evedex, Instrument, Position, Rejected, Unknown
+from kairos_execution.native_protection import EVEDEX_NATIVE_PROTECTION_UNAVAILABLE
+from kairos_execution.portfolio_evedex import (
+    TRADING,
+    Book,
+    Evedex,
+    EvedexError,
+    Instrument,
+    Position,
+    Rejected,
+    Unknown,
+)
 from kairos_execution.portfolio_journal import PortfolioJournal
 from kairos_execution.prod_universe import PROD_INSTRUMENTS, PROD_SYMBOL_MAP
 from tests.test_production_lifecycle_binding import _decision
@@ -22,6 +32,9 @@ Account = pytest.importorskip("eth_account").Account
 
 
 class Venue:
+    # This test venue implements a reducing native bracket. Production does not.
+    native_protection_unavailable: str | None = None
+
     def __init__(self, clock):
         self.clock = clock
         self.records = {}
@@ -224,6 +237,62 @@ def runner_trade(s, fill):
         "quantity": str(fill["quantity"]),
         "stop": "95",
     }
+
+
+async def test_unqualified_bracket_blocks_before_reserving_or_dispatching(system):
+    s = system
+    s.v.native_protection_unavailable = EVEDEX_NATIVE_PROTECTION_UNAVAILABLE
+    assert await s.enter() is None
+    assert s.v.leverages == s.v.sent == s.j.active_trades() == []
+    s.store.journal.assert_called_with("entry_skipped", reason=EVEDEX_NATIVE_PROTECTION_UNAVAILABLE)
+
+
+async def test_unqualified_bracket_keeps_owned_close_available_without_rearming(system):
+    s = system
+    trade = runner_trade(s, await s.enter())
+    s.v.native_protection_unavailable = EVEDEX_NATIVE_PROTECTION_UNAVAILABLE
+    # Both parent-linked, full-size native triggers can be active even on a venue
+    # that later executes them in the same direction as the opening order.
+    assert len(s.v.tpsl) == 2
+    assert EVEDEX_NATIVE_PROTECTION_UNAVAILABLE in await s.b.foreign_exposure({"BTCUSD"})
+    assert not await s.b.ensure_stop(trade)
+    s.v.tpsl.clear()
+    assert await s.b.position_open(trade)
+    assert not await s.b.ensure_stop(trade)
+    assert not await s.b.move_stop(trade, D("96"))
+    assert s.v.tpsl == {}
+    original = s.v.held["BTCUSD"]
+    quantity = original.quantity
+    s.v.held["BTCUSD"] = Position("BTCUSD", "BUY", 2 * quantity, D("100.3"))
+    with pytest.raises(portfolio.NeedsOperator, match="differs from the owned entry"):
+        await s.b.position_open(trade)
+    assert D(s.j.trade(s.risk.trade_id)["quantity"]) == quantity
+    s.v.held["BTCUSD"] = original
+    await s.b.close(trade, await s.v.book("BTCUSD"), "OPERATOR_CLOSE")
+    assert s.v.held == {}
+
+
+@pytest.mark.parametrize("side", ["BUY", "SELL"])
+async def test_production_wire_cannot_open_or_send_full_size_native_trigger(side):
+    api = Evedex(Mock())
+    api._request = AsyncMock(return_value={"id": "accepted"})
+    for kind in ("take-profit", "stop-loss"):
+        trigger = {"instrument": "OPUSD", "side": side, "type": kind, "quantity": "0"}
+        for send, body in (
+            (api.post_limit_order, {"side": side, "tpsl": [trigger]}),
+            (api.post_market_order, {"side": side}),
+            (api.post_tpsl, trigger),
+        ):
+            with pytest.raises(EvedexError, match="not qualified"):
+                await send(body)
+    api._request.assert_not_awaited()
+    body = {"instrument": "OPUSD", "quantity": "1"}
+    assert await api.post_close(body) == {"id": "accepted"}
+    api._request.assert_awaited_once_with(
+        "POST", f"{TRADING}/api/v2/position/OPUSD/close", private=True, body=body
+    )
+    await api.cancel_tpsl("OPUSD", "existing")
+    api._request.assert_awaited_with("DELETE", f"{TRADING}/api/tpsl/OPUSD/existing", private=True)
 
 
 @pytest.mark.parametrize("lost_ack", [False, True])

@@ -13,6 +13,7 @@ from typing import Any
 
 from kairos_core.contracts import RiskTradeDecisionV1
 
+from .native_protection import EVEDEX_NATIVE_PROTECTION_UNAVAILABLE
 from .one_canary_account import EvedexCanaryAccountSource
 from .portfolio_evedex import (
     Book,
@@ -139,6 +140,10 @@ class PortfolioBroker:
         # Only immutable terminal entry facts are cached. Active children, the live position,
         # generation fills and closure are checked on every use of position-level cover.
         self._position_entries: dict[str, tuple[int, Decimal, Decimal, str]] = {}
+
+    @property
+    def native_protection_unavailable(self) -> str | None:
+        return getattr(self._api, "native_protection_unavailable", EVEDEX_NATIVE_PROTECTION_UNAVAILABLE)
 
     def pilot_status(self) -> dict[str, Any] | None:
         return self._journal.pilot_status()
@@ -595,7 +600,9 @@ class PortfolioBroker:
             if not item or any(not self._usable_protection(item, r) for r in scope):
                 issues.append("unowned venue protection")
             projected.extend(scope)
-        if check_protected:
+        if check_protected and tracked and self.native_protection_unavailable:
+            issues.append(self.native_protection_unavailable)
+        elif check_protected:
             for symbol, item in tracked.items():
                 stop = self._tightest_stop(item)
                 if (
@@ -722,6 +729,10 @@ class PortfolioBroker:
         return max(prices) if item["side"] == "LONG" else min(prices)
 
     async def _maintain_protection(self, item: dict, trade: dict, position: Position) -> bool:
+        if self.native_protection_unavailable:
+            # The caller already matched this live position. Keep it visible to the software
+            # exits and explicit close path without adding or treating an unsafe trigger as cover.
+            return True
         stop = self._tightest_stop(item, dec(trade["stop"]))
         rows = await self._protection_rows(item, position=position)
         if any(not self._usable_protection(item, r) for r in rows):
@@ -880,6 +891,9 @@ class PortfolioBroker:
         decision: RiskTradeDecisionV1,
     ) -> dict[str, Any] | None:
         async with self._lock:
+            if reason := self.native_protection_unavailable:
+                self._store.journal("entry_skipped", reason=reason)
+                return None
             active = {t["symbol"] for t in self._journal.active_trades()}
             issues, positions = await self._inspect(active, check_protected=True)
             if issues:
@@ -1126,6 +1140,8 @@ class PortfolioBroker:
         raise NeedsOperator("entry outcome needs order-specific reconciliation")
 
     async def _ensure_entry_protection(self, item: dict, *, position: Position | None = None) -> bool:
+        if self.native_protection_unavailable:
+            return False
         # Attached and separately placed protection must refer to the same entry.
         rows = await self._protection_rows(item, position=position)
         if all(self._usable_protection(item, r) for r in rows) and all(
@@ -1140,6 +1156,8 @@ class PortfolioBroker:
     async def _ensure_price(
         self, item: dict, kind: str, price: Decimal, rows: list[dict[str, Any]] | None = None
     ) -> bool:
+        if self.native_protection_unavailable:
+            return False
         rows = rows if rows is not None else await self._protection_rows(item)
         if any(not self._usable_protection(item, r) for r in rows):
             raise NeedsOperator("an unowned protection shares this instrument")
