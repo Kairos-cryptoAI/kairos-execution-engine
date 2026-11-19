@@ -31,8 +31,8 @@ test("Axios resolves patched follow-redirects without upgrading the venue SDK", 
   const require = createRequire(import.meta.url);
   const sdkRequire = createRequire(require.resolve("@evedex/exchange-bot-sdk"));
   const axiosRequire = createRequire(sdkRequire.resolve("axios"));
-  assert.equal(manifest.overrides["follow-redirects"], "1.16.1");
-  assert.equal(lock.packages["node_modules/follow-redirects"].version, "1.16.1");
+  assert.equal(manifest.overrides["follow-redirects"], "1.16.3");
+  assert.equal(lock.packages["node_modules/follow-redirects"].version, "1.16.3");
   assert.match(lock.packages["node_modules/follow-redirects"].integrity, /^sha512-/);
-  assert.equal(axiosRequire("follow-redirects/package.json").version, "1.16.1");
+  assert.equal(axiosRequire("follow-redirects/package.json").version, "1.16.3");
 });

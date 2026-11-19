@@ -17,6 +17,7 @@ published `^1.8.1` range. This replaces vulnerable `1.19.0` without changing the
 SDK, endpoints, authentication or trading protocol. The lockfile retains npm
 integrity hashes, the dependency regression test checks the SDK's resolved
 Axios version, and CI still runs `npm audit --omit=dev` without suppressions.
+Axios resolves `follow-redirects` 1.16.3 to protect sensitive headers across redirects.
 See the [upstream security fixes](https://github.com/axios/axios/releases/tag/v1.20.0).
 
 Startup performs SIWE authentication, API-key authentication, dedicated account
