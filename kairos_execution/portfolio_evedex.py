@@ -326,6 +326,7 @@ class Evedex:
         self._api_key = api_key
         self._qualified_instruments: frozenset[str] = frozenset()
         self._ladder_instruments: frozenset[str] = frozenset()
+        self._stop_move_instruments: frozenset[str] = frozenset()
 
     @property
     def native_protection_unavailable(self) -> str | None:
@@ -337,10 +338,18 @@ class Evedex:
     def native_ladder_qualified_for(self, instrument: str) -> bool:
         return instrument in self._ladder_instruments
 
+    def native_stop_move_qualified_for(self, instrument: str) -> bool:
+        return instrument in self._stop_move_instruments
+
     async def verify_native_protection(self, profile) -> None:
         self._qualified_instruments = frozenset()
         self._ladder_instruments = frozenset()
-        self._qualified_instruments, self._ladder_instruments = await qualified_instruments(self, profile)
+        self._stop_move_instruments = frozenset()
+        (
+            self._qualified_instruments,
+            self._ladder_instruments,
+            self._stop_move_instruments,
+        ) = await qualified_instruments(self, profile)
 
     async def _request(
         self,
@@ -833,6 +842,22 @@ class Evedex:
             or dec(body.get("quantity")) != 0
         ):
             raise EvedexError("protective order does not reduce the open position")
+        if body["type"] == "stop-loss" and not self.native_stop_move_qualified_for(instrument):
+            parent = await self.order_with_protections(instrument, body["order"])
+            if not (
+                parent
+                and parent.get("id") == body["order"]
+                and parent.get("instrument") == instrument
+                and parent.get("side") == positions[0].side
+                and any(
+                    row.get("type") == "stop-loss"
+                    and row.get("side") == body["side"]
+                    and dec(row.get("quantity")) == 0
+                    and dec(row.get("price")) == dec(body["price"])
+                    for row in parent.get("tpslList") or ()
+                )
+            ):
+                raise EvedexError("unqualified stop move differs from the owned parent bracket")
         return await self._request("POST", f"{TRADING}/api/tpsl/{instrument}", private=True, body=body)
 
     async def post_partial_target(self, body: dict[str, Any]) -> dict[str, Any]:

@@ -48,6 +48,7 @@ class UniformContract(_Record):
     source_url: str
     source_sha256: Digest
     includes_partial_ladder: bool = False
+    includes_stop_move: bool = False
 
 
 class Qualification(_Record):
@@ -239,12 +240,14 @@ async def _case_features(api, case: Case, owner: str, receipt: dict) -> set[tupl
     return features
 
 
-async def qualified_instruments(api, profile: PortfolioProfile) -> tuple[frozenset[str], frozenset[str]]:
+async def qualified_instruments(
+    api, profile: PortfolioProfile
+) -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
     profile = verify_profile(profile)
     root = profile.journal_path.parent
     path = root / "native-protection.json"
     if not path.exists():
-        return frozenset(), frozenset()
+        return frozenset(), frozenset(), frozenset()
     if path != path.resolve() or path.stat().st_size > 262144:
         raise ValueError("invalid qualification file")
     data = path.read_bytes()
@@ -268,16 +271,17 @@ async def qualified_instruments(api, profile: PortfolioProfile) -> tuple[frozens
         entries.add(key)
         receipt = _check_capture(case, _capture(root, case.capture_sha256, ".json"))
         features[case.instrument].update(await _case_features(api, case, q.remote_account_id, receipt))
-    required = {
-        (side, kind)
-        for side in ("BUY", "SELL")
-        for kind in ("stop-loss", "take-profit", "partial", "stop-move")
-    }
+    required = {(side, kind) for side in ("BUY", "SELL") for kind in ("stop-loss", "take-profit")}
     qualified = {symbol for symbol, actual in features.items() if required <= actual}
     ladder = {
         symbol
         for symbol in qualified
         if all((side, "protected-partial") in features[symbol] for side in ("BUY", "SELL"))
+    }
+    stop_moves = {
+        symbol
+        for symbol in qualified
+        if all((side, "stop-move") in features[symbol] for side in ("BUY", "SELL"))
     }
     if q.uniform_contract:
         shared = q.uniform_contract
@@ -294,5 +298,7 @@ async def qualified_instruments(api, profile: PortfolioProfile) -> tuple[frozens
         _capture(root, shared.source_sha256, ".source")
         if shared.includes_partial_ladder and ladder:
             ladder.update(shared.instruments)
+        if shared.includes_stop_move and stop_moves:
+            stop_moves.update(shared.instruments)
         qualified.update(shared.instruments)
-    return frozenset(qualified), frozenset(ladder)
+    return frozenset(qualified), frozenset(ladder), frozenset(stop_moves)

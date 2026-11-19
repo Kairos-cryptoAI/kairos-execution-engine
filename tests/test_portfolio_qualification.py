@@ -165,7 +165,7 @@ async def test_signed_fill_matrix_and_native_child_admission(evidence, tmp_path,
     await api.verify_native_protection(profile)
     approve.assert_called_once_with(path, path.read_bytes())
     assert api.protection_unavailable_for("BTCUSD") is None and api.protection_unavailable_for("ETHUSD")
-    assert api.native_ladder_qualified_for("BTCUSD")
+    assert api.native_ladder_qualified_for("BTCUSD") and api.native_stop_move_qualified_for("BTCUSD")
     api._request = AsyncMock(return_value={})
     api.active_tpsl = AsyncMock(return_value=[])
     api.positions = AsyncMock(return_value=[Position("BTCUSD", "SELL", Decimal(1), Decimal(100))])
@@ -219,7 +219,25 @@ async def test_incomplete_signatures_captures_and_fill_history_do_not_qualify(
     manifest["cases"].pop()
     path.write_text(json.dumps(manifest))
     await api.verify_native_protection(profile)
-    assert api.protection_unavailable_for("BTCUSD") and not api.native_ladder_qualified_for("BTCUSD")
+    assert api.protection_unavailable_for("BTCUSD") is None
+    assert not api.native_ladder_qualified_for("BTCUSD") and not api.native_stop_move_qualified_for("BTCUSD")
+    stop = {
+        "instrument": "BTCUSD",
+        "type": "stop-loss",
+        "side": "SELL",
+        "order": "entry",
+        "quantity": "0",
+        "price": "95",
+    }
+    api._request = AsyncMock(return_value={})
+    api.positions = AsyncMock(return_value=[Position("BTCUSD", "BUY", Decimal(1), Decimal(100))])
+    api.order_with_protections = AsyncMock(
+        return_value={"id": "entry", "instrument": "BTCUSD", "side": "BUY", "tpslList": [stop]}
+    )
+    assert await api.post_tpsl(stop) == {}
+    with pytest.raises(EvedexError, match="unqualified stop move"):
+        await api.post_tpsl({**stop, "price": "99"})
+    assert api._request.await_count == 1
     manifest["cases"][0]["capture_sha256"] = "0" * 64
     path.write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="evidence"):
@@ -272,6 +290,7 @@ async def test_reviewed_uniform_contract_has_its_own_feature_scope(evidence, tmp
     monkeypatch.setattr(checks, "_require_owner_signature", Mock())
     await api.verify_native_protection(profile)
     assert api.protection_unavailable_for("ETHUSD") is None and not api.native_ladder_qualified_for("ETHUSD")
+    assert not api.native_stop_move_qualified_for("ETHUSD")
 
 
 async def test_terminal_native_id_beats_nullable_or_parent_link():

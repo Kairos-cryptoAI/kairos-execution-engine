@@ -40,8 +40,10 @@ At startup the broker verifies an optional detached owner signature on
 the account, adapter revision and archived probe captures to closed position
 generations on EVEDEX. The broker reads the authenticated order history and
 checks whether stops and targets reduced both long and short positions.
-Partial targets require additional evidence of ongoing protection for the
-remainder. An owner-reviewed venue contract can extend a verified sample to
+Initial brackets qualify after all four full exits have been witnessed. Tightening
+a stop requires separate long and short replacement evidence. Resting partial
+targets require two reductions on each side, each with active cover and a
+remaining target. An owner-reviewed venue contract can extend a verified sample to
 the explicitly listed instruments. Store captures under `protection-evidence`
 in the private portfolio directory. Missing or incomplete evidence blocks new
 entries for the affected instruments. Account reads and explicit closes remain

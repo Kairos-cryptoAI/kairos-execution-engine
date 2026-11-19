@@ -170,6 +170,10 @@ class PortfolioBroker:
         check = getattr(self._api, "native_ladder_qualified_for", None)
         return check is not None and check(instrument) is True
 
+    def native_stop_move_qualified_for(self, instrument: str) -> bool:
+        check = getattr(self._api, "native_stop_move_qualified_for", None)
+        return check is not None and check(instrument) is True
+
     def pilot_status(self) -> dict[str, Any] | None:
         return self._journal.pilot_status()
 
@@ -1448,6 +1452,12 @@ class PortfolioBroker:
             raise NeedsOperator("an unowned protection shares this instrument")
         if any(self._valid_protection(item, r, kind, price) for r in rows):
             return True
+        if (
+            kind == "stop-loss"
+            and price != dec(item["stop"])
+            and not self.native_stop_move_qualified_for(item["symbol"])
+        ):
+            return False
         if item["state"] != "OPEN":
             return False  # cancel the GTC remainder and reconcile its terminal fill first
         current = await self._owned_position(item)
@@ -1512,6 +1522,8 @@ class PortfolioBroker:
         async with self._lock:
             item = self._owned(trade)
             if not await self._owned_position(item):
+                return False
+            if not self.native_stop_move_qualified_for(item["symbol"]):
                 return False
             previous = dec(trade["stop"])
             stops = [

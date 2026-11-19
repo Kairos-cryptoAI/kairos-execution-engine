@@ -32,7 +32,7 @@ Account = pytest.importorskip("eth_account").Account
 
 
 class Venue:
-    # This test venue implements a reducing native bracket. Production does not.
+    # Model a venue with independently qualified reducing brackets and replacement stops.
     native_protection_unavailable: str | None = None
 
     def __init__(self, clock):
@@ -46,6 +46,9 @@ class Venue:
         self.cash = D(100)
         self.drop_ack = False
         self.omit_parent = False
+
+    def native_stop_move_qualified_for(self, instrument):
+        return self.native_protection_unavailable is None
 
     async def server_time_ms(self):
         return self.clock()
@@ -1010,3 +1013,14 @@ async def test_stop_move_preserves_the_new_live_order_after_exchange_replacement
     active = list(s.v.tpsl.values())
     assert {r["type"] for r in active} == {"stop-loss", "take-profit"}
     assert D(next(r["price"] for r in active if r["type"] == "stop-loss")) == D("97")
+
+
+async def test_qualified_initial_bracket_retained_when_stop_move_unproven(system):
+    s = system
+    s.v.native_stop_move_qualified_for = lambda symbol: False
+    trade = runner_trade(s, await s.enter())
+    original = dict(s.v.tpsl)
+    assert await s.b.ensure_stop(trade)
+    assert not await s.b.move_stop(trade, D("97"))
+    assert not await s.b.ensure_stop({**trade, "stop": "97"})
+    assert s.v.tpsl == original and trade["stop"] == "95"
