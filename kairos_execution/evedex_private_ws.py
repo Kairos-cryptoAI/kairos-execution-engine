@@ -5,6 +5,7 @@ module neither obtains a session nor authorizes trading. A successful capture
 does not establish stream completeness, account equity, or exchange readiness.
 The adapter never reconnects: any connection/subscription loss is terminal.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -12,6 +13,7 @@ import json
 import math
 import re
 from collections import deque
+from contextlib import suppress
 from typing import Any
 
 import aiohttp
@@ -65,10 +67,10 @@ async def _external(operation):
     except asyncio.CancelledError:
         raise
     except Exception:
-        pass
+        error = PrivateWsUnavailable("private WS transport failed")
     # Do not retain an untrusted exception, even if it happens to be the same
     # exception type we use locally. It may contain private headers or data.
-    raise PrivateWsUnavailable("private WS transport failed") from None
+    raise error from None
 
 
 class EvedexPrivateWsStream:
@@ -85,22 +87,24 @@ class EvedexPrivateWsStream:
         account_id = reads.expected_account_id
         if not isinstance(account_id, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", account_id) is None:
             raise ValueError("a bounded normalized EVEDEX account ID is required")
-        if (not isinstance(access_token, str) or not 1 <= len(access_token) <= 8192
-                or any(ord(c) < 33 or ord(c) > 126 for c in access_token)):
+        if (
+            not isinstance(access_token, str)
+            or not 1 <= len(access_token) <= 8192
+            or any(ord(c) < 33 or ord(c) > 126 for c in access_token)
+        ):
             raise ValueError("a bounded existing access token is required")
         self._access_token = access_token
         self._reads = reads
         self._account_id = account_id
         self._channels = {
-            f"futures-perp:{prefix}-{account_id}": name
-            for name, prefix in _CHANNEL_PREFIXES.items()
+            f"futures-perp:{prefix}-{account_id}": name for name, prefix in _CHANNEL_PREFIXES.items()
         }
         self._pending = {index + 2: wire for index, wire in enumerate(self._channels)}
         self._subscribed: set[str] = set()
         self._epochs: dict[str, str] = {}
         self._replies: deque[dict[str, Any]] = deque()
-        self._session = None
-        self._socket = None
+        self._session: aiohttp.ClientSession | None = None
+        self._socket: aiohttp.ClientWebSocketResponse | None = None
         self._open_attempted = False
         self._closed = False
         self._pong_required = False
@@ -109,9 +113,12 @@ class EvedexPrivateWsStream:
         return "EvedexPrivateWsStream(<private>)"
 
     def require_reader(self, reads: ProductionEvedexReads) -> None:
-        if (reads is not self._reads or not reads._preflight_complete
-                or reads.expected_account_id != self._account_id
-                or reads.client.expected_account_id != self._account_id):
+        if (
+            reads is not self._reads
+            or not reads._preflight_complete
+            or reads.expected_account_id != self._account_id
+            or reads.client.expected_account_id != self._account_id
+        ):
             raise PrivateWsUnavailable("private WS and REST reader scopes differ")
 
     async def __aenter__(self):
@@ -119,21 +126,25 @@ class EvedexPrivateWsStream:
             raise PrivateWsUnavailable("private WS stream cannot be reopened")
         self._open_attempted = True
         try:
+
             async def refuse_redirect(_session, _context, _params):
                 raise PrivateWsUnavailable("private WS redirects are not permitted")
 
             trace = aiohttp.TraceConfig()
             trace.on_request_redirect.append(refuse_redirect)
             self._session = aiohttp.ClientSession(
-                trust_env=False, cookie_jar=aiohttp.DummyCookieJar(),
-                timeout=aiohttp.ClientTimeout(total=30), trace_configs=[trace],
+                trust_env=False,
+                cookie_jar=aiohttp.DummyCookieJar(),
+                timeout=aiohttp.ClientTimeout(total=30),
+                trace_configs=[trace],
             )
             self.require_reader(self._reads)
             # The token's account must match the preflighted API-key reader.
             # Never follow a redirect with the bearer token in HTTP headers.
             identity_confirmed = False
             async with self._session.get(
-                _PROD_IDENTITY_URL, headers={"Authorization": f"Bearer {self._access_token}"},
+                _PROD_IDENTITY_URL,
+                headers={"Authorization": f"Bearer {self._access_token}"},
                 allow_redirects=False,
             ) as response:
                 if response.status != 200 or str(response.url) != _PROD_IDENTITY_URL:
@@ -145,20 +156,24 @@ class EvedexPrivateWsStream:
                         raise PrivateWsUnavailable("private WS token identity exceeds its bound")
                 try:
                     identity = json.loads(
-                        bytes(body), object_pairs_hook=_pairs, parse_constant=_bad_constant,
+                        bytes(body),
+                        object_pairs_hook=_pairs,
+                        parse_constant=_bad_constant,
                         parse_float=_finite_float,
                     )
                 except (TypeError, ValueError):
                     identity = None
                 exchange_id = identity.get("exchangeId") if type(identity) is dict else None
-                if (type(exchange_id) not in (int, str) or str(exchange_id) != self._account_id):
+                if type(exchange_id) not in (int, str) or str(exchange_id) != self._account_id:
                     raise PrivateWsUnavailable("private WS token account differs from REST reader")
                 identity_confirmed = True
             if not identity_confirmed:
                 raise PrivateWsUnavailable("private WS token identity was not confirmed")
             self.require_reader(self._reads)
             self._socket = await self._session.ws_connect(
-                _PROD_WS_URL, max_msg_size=_MAX_FRAME_BYTES, autoping=True,
+                _PROD_WS_URL,
+                max_msg_size=_MAX_FRAME_BYTES,
+                autoping=True,
             )
             # Check the final URL after any HTTP redirect *before* sending the
             # access token or a protocol command to the established socket.
@@ -166,27 +181,30 @@ class EvedexPrivateWsStream:
                 raise PrivateWsUnavailable("private WS destination changed")
             await self._socket.send_json({"id": 1, "connect": {"name": "js"}})
             reply = await self._next_reply()
-            if (type(reply.get("id")) is not int or reply["id"] != 1
-                    or type(reply.get("connect")) is not dict or "error" in reply):
+            if (
+                type(reply.get("id")) is not int
+                or reply["id"] != 1
+                or type(reply.get("connect")) is not dict
+                or "error" in reply
+            ):
                 raise PrivateWsUnavailable("private WS connection was not acknowledged")
             self._pong_required = reply["connect"].get("pong") is True
             for request_id, wire in self._pending.items():
-                await self._socket.send_json({
-                    "id": request_id,
-                    "subscribe": {"channel": wire, "data": {"accessToken": self._access_token}},
-                })
+                await self._socket.send_json(
+                    {
+                        "id": request_id,
+                        "subscribe": {"channel": wire, "data": {"accessToken": self._access_token}},
+                    }
+                )
             return self
         except asyncio.CancelledError:
-            try:
+            # Keep the opening failure or cancellation when cleanup also fails.
+            with suppress(Exception):
                 await self._close()
-            except Exception:
-                pass
             raise
         except Exception:
-            try:
+            with suppress(Exception):
                 await self._close()
-            except Exception:
-                pass
         # Raise outside the external exception handler: exception objects from
         # an untrusted client may contain headers, tokens, URLs, or payloads.
         raise PrivateWsUnavailable("private WS could not start") from None
@@ -203,7 +221,8 @@ class EvedexPrivateWsStream:
 
     async def _close(self) -> None:
         self._closed = True
-        self._access_token = ""
+        # Drop the session credential when the stream closes.
+        self._access_token = ""  # nosec B105
         self._replies.clear()
         try:
             if self._socket is not None:
@@ -227,7 +246,9 @@ class EvedexPrivateWsStream:
             for line in lines:
                 try:
                     item = json.loads(
-                        line, object_pairs_hook=_pairs, parse_constant=_bad_constant,
+                        line,
+                        object_pairs_hook=_pairs,
+                        parse_constant=_bad_constant,
                         parse_float=_finite_float,
                     )
                 except (TypeError, ValueError):
@@ -246,7 +267,10 @@ class EvedexPrivateWsStream:
                 reply = await self._next_reply()
                 if not reply:  # Centrifugo server heartbeat
                     if self._pong_required:
-                        await _external(lambda: self._socket.send_json({}))
+                        socket = self._socket
+                        if socket is None:
+                            raise PrivateWsUnavailable("private WS is closed")
+                        await _external(lambda socket=socket: socket.send_json({}))
                     continue
                 if "error" in reply:
                     raise PrivateWsUnavailable("private WS request was refused")
@@ -275,7 +299,10 @@ class EvedexPrivateWsStream:
                 if wire not in self._subscribed or type(publication) is not dict or "data" not in publication:
                     raise PrivateWsUnavailable("private WS publication is malformed")
                 payload = json.dumps(
-                    publication["data"], ensure_ascii=False, allow_nan=False, separators=(",", ":"),
+                    publication["data"],
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
                 )
                 if len(payload.encode("utf-8")) > _MAX_FRAME_BYTES:
                     raise PrivateWsUnavailable("private WS publication exceeded its bound")
@@ -285,10 +312,15 @@ class EvedexPrivateWsStream:
                     raise PrivateWsUnavailable("private WS position is incomplete")
                 if offset is None:
                     epoch = None
-                return WsFrame(kind="PUBLICATION", channel=self._channels[wire],
-                               payload_json=payload, epoch=epoch, offset=offset)
+                return WsFrame(
+                    kind="PUBLICATION",
+                    channel=self._channels[wire],
+                    payload_json=payload,
+                    epoch=epoch,
+                    offset=offset,
+                )
         except PrivateWsUnavailable:
             raise
         except Exception:
-            pass
-        raise PrivateWsUnavailable("private WS reader failed") from None
+            error = PrivateWsUnavailable("private WS reader failed")
+        raise error from None

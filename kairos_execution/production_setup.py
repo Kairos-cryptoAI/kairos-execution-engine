@@ -31,7 +31,10 @@ import hashlib
 import json
 import re
 import secrets
-import subprocess  # nosec B404 - fixed git and Node commands of the owner's own checkouts
+import shutil
+
+# Run a resolved Git executable with a fixed argument list.
+import subprocess  # nosec B404
 import sys
 import time
 import urllib.request
@@ -146,9 +149,16 @@ def keys_file_value(keys_file: Path, line: int, what: str) -> str:
     return value
 
 
-def _git_head(repository: Path) -> str:
-    completed = subprocess.run(  # noqa: S603 # nosec B603 - fixed git command
-        ["git", "-C", str(repository), "rev-parse", "HEAD"], capture_output=True, timeout=30, check=False
+def _git_revision(repository: Path, revision: str = "HEAD") -> str:
+    git = shutil.which("git")
+    if git is None or not Path(git).is_absolute():
+        raise SetupError("Git executable unavailable")
+    # Resolve a commit from the owner's checkout using a fixed shell-free command.
+    completed = subprocess.run(  # nosec B603
+        [git, "-C", str(repository), "rev-parse", "--verify", "--end-of-options", f"{revision}^{{commit}}"],
+        capture_output=True,
+        timeout=30,
+        check=False,
     )
     head = completed.stdout.decode().strip()
     if completed.returncode != 0 or re.fullmatch(r"[0-9a-f]{40}", head) is None:
@@ -162,7 +172,8 @@ def evedex_account_id(api_key: str, *, opener=urllib.request.urlopen) -> str:
         f"{TRADING}/api/user/me", headers={"x-api-key": api_key, "accept": "application/json"}
     )
     try:
-        with opener(request, timeout=20) as response:  # nosec B310 - fixed HTTPS venue origin
+        # The HTTPS account endpoint is fixed by the venue adapter.
+        with opener(request, timeout=20) as response:  # nosec B310
             body = json.loads(response.read(65_536).decode("utf-8"))
     except Exception as exc:  # noqa: BLE001 - never echo a request that carries the key
         raise SetupError(f"the EVEDEX account read failed: {type(exc).__name__}") from None
@@ -226,7 +237,7 @@ def init(
     admin_dsn = read_private_file(paths["admin_dsn"]).decode("utf-8").strip()
 
     # The source set the receipts attest: the exact commits of every layer that trades.
-    heads = {name: _git_head(workspace / name) for name in REPOSITORIES if (workspace / name).exists()}
+    heads = {name: _git_revision(workspace / name) for name in REPOSITORIES if (workspace / name).exists()}
     evidence = paths["evidence"]
     source_set = store_artifact(
         evidence, _canonical({"version": "kairos.live-source-set.v1", "heads": heads})
@@ -474,18 +485,7 @@ def security_review(
         raise SetupError("name the commit that fixed the findings and how many there were")
     context = ProductionContextV1.model_validate_json(paths["context"].read_text(encoding="utf-8"))
     repository = workspace / "kairos-execution-engine"
-    full = (
-        subprocess.run(  # noqa: S603 # nosec B603 - fixed git command
-            ["git", "-C", str(repository), "rev-parse", fix_commit],
-            capture_output=True,
-            timeout=30,
-            check=False,
-        )
-        .stdout.decode()
-        .strip()
-    )
-    if re.fullmatch(r"[0-9a-f]{40}", full) is None:
-        raise SetupError("the fix commit is not in the Execution Engine repository")
+    full = _git_revision(repository, fix_commit)
     evidence = paths["evidence"]
     threat = store_artifact(
         evidence, (repository / "docs" / "PRODUCTION-SESSION.md").read_bytes(), suffix=".artifact"

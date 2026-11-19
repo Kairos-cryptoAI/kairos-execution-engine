@@ -3,6 +3,7 @@
 Only fixed public/private reads, SIWE authentication and WebSocket observation
 are available. This process has no order submission command.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -12,7 +13,10 @@ import json
 import os
 import re
 import secrets
-import subprocess
+import shutil
+
+# The operator selects the Node binary. Docker commands use fixed argument lists.
+import subprocess  # nosec B404
 import sys
 import threading
 import time
@@ -22,12 +26,11 @@ from urllib.parse import quote
 from uuid import UUID, uuid4
 
 import aiohttp
-import asyncpg
+import asyncpg  # type: ignore[import-untyped]  # Upstream does not ship stubs.
 
 from .auth_audit import AuthAuditJournal, authorize_one_auth_followup
 from .auth_orchestration import ProtectedAuthMaterial as Material
 from .auth_orchestration import (
-    _private_acl,
     _write_new_private_file,
     authenticate_and_capture_once,
     build_auth_custody,
@@ -40,15 +43,27 @@ from .production_readiness import ProductionContextV1, canonical_digest
 from .production_reads import ProductionEvedexReads
 from .production_transport import ProductionEvedexSdkClient
 from .production_ws_observer import capture_ws_rest_observation
+from .protected_files import create_private_directory
 from .siwe_session import WalletSessionRegionForbidden, WalletSessionTwofaRequired, _unique_object
 
 IMAGE = "timescale/timescaledb:2.29.1-pg16"
 PARAMS_URL = "https://raw.githubusercontent.com/evedex-official/exchange-bot-sdk/master/src/params.ts"
 SOURCE_NAMES = (
-    "auth_observation_cli.py", "auth_orchestration.py", "auth_audit.py", "siwe_session.py", "siwe_auth.py",
-    "local_custody.py", "_local_custody_worker.py", "evedex_private_ws.py", "production_ws_observer.py",
-    "production_reads.py", "production_transport.py", "production_claims.py", "production_readiness.py",
-    "crypto.py", "protected_files.py",
+    "auth_observation_cli.py",
+    "auth_orchestration.py",
+    "auth_audit.py",
+    "siwe_session.py",
+    "siwe_auth.py",
+    "local_custody.py",
+    "_local_custody_worker.py",
+    "evedex_private_ws.py",
+    "production_ws_observer.py",
+    "production_reads.py",
+    "production_transport.py",
+    "production_claims.py",
+    "production_readiness.py",
+    "crypto.py",
+    "protected_files.py",
 )
 
 
@@ -56,9 +71,11 @@ def _emit(event: str, **values):
     print(json.dumps({"event": event, **values}, separators=(",", ":")), flush=True)
 
 
-def _command(*arguments):
-    return subprocess.run(
-        list(arguments), check=True, capture_output=True, text=True, timeout=30
+def _command(executable: str, *arguments: str) -> str:
+    if not Path(executable).is_absolute():
+        raise ValueError("an absolute executable path is required")
+    return subprocess.run(  # nosec B603
+        [executable, *arguments], check=True, capture_output=True, text=True, timeout=30
     ).stdout.strip()
 
 
@@ -86,21 +103,30 @@ def _validate_credential_labels(lines, *, wallet_key_line, wallet_address_line, 
     # Wallet labels can be generic, so require the closest preceding empty
     # section header to identify the EVEDEX production section explicitly.
     for number in (wallet_key_line, wallet_address_line):
-        headers = [re.split(r"[:=]", line, maxsplit=1)[0] for line in lines[:number - 1]
-                   if len(re.split(r"[:=]", line, maxsplit=1)) == 2
-                   and not re.split(r"[:=]", line, maxsplit=1)[1].strip()]
-        if (not headers or not re.search(r"evedex", headers[-1], re.I)
-                or re.search(r"dev|demo|test", headers[-1], re.I)):
+        headers = [
+            re.split(r"[:=]", line, maxsplit=1)[0]
+            for line in lines[: number - 1]
+            if len(re.split(r"[:=]", line, maxsplit=1)) == 2
+            and not re.split(r"[:=]", line, maxsplit=1)[1].strip()
+        ]
+        if (
+            not headers
+            or not re.search(r"evedex", headers[-1], re.I)
+            or re.search(r"dev|demo|test", headers[-1], re.I)
+        ):
             raise ValueError("production wallet section unavailable")
 
 
 async def _get_json(url, *, api_key=None):
     async with aiohttp.ClientSession(
-        trust_env=False, cookie_jar=aiohttp.DummyCookieJar(),
+        trust_env=False,
+        cookie_jar=aiohttp.DummyCookieJar(),
         timeout=aiohttp.ClientTimeout(total=10),
     ) as session:
         async with session.get(
-            url, headers={"x-api-key": api_key} if api_key else {}, allow_redirects=False,
+            url,
+            headers={"x-api-key": api_key} if api_key else {},
+            allow_redirects=False,
         ) as response:
             if response.status != 200:
                 raise ValueError("fixed read refused")
@@ -119,24 +145,44 @@ def _dsn(port, database, role, password):
 async def _provision_claims(runtime: Path, container: str):
     if re.fullmatch(r"kairos-auth-[a-z0-9-]{8,45}", container) is None:
         raise ValueError("explicit isolated container name required")
+    docker = shutil.which("docker")
+    if docker is None or not Path(docker).is_absolute():
+        raise ValueError("Docker executable unavailable")
     volume = container + "-data"
     for kind, name in (("container", container), ("volume", volume)):
-        exists = subprocess.run(
-            ["docker", kind, "inspect", name], capture_output=True, timeout=10,
-        ).returncode == 0
+        exists = (
+            # Fixed Docker inspect operation on validated local resource names.
+            subprocess.run(  # nosec B603
+                [docker, kind, "inspect", name],
+                capture_output=True,
+                timeout=10,
+            ).returncode
+            == 0
+        )
         if exists:
             raise ValueError("auth container/volume already exists; inspect rather than retry")
     admin_password = secrets.token_urlsafe(40)
     password_file = runtime / "postgres-admin-password.txt"
     _write_new_private_file(password_file, (admin_password + "\n").encode())
     _command(
-        "docker", "run", "--detach", "--name", container, "--restart", "unless-stopped",
-        "--mount", f"type=volume,src={volume},dst=/var/lib/postgresql/data",
-        "--mount", f"type=bind,src={password_file},dst=/run/secrets/postgres-password,readonly",
-        "--env", "POSTGRES_PASSWORD_FILE=/run/secrets/postgres-password",
-        "--publish", "127.0.0.1::5432", IMAGE,
+        docker,
+        "run",
+        "--detach",
+        "--name",
+        container,
+        "--restart",
+        "unless-stopped",
+        "--mount",
+        f"type=volume,src={volume},dst=/var/lib/postgresql/data",
+        "--mount",
+        f"type=bind,src={password_file},dst=/run/secrets/postgres-password,readonly",
+        "--env",
+        "POSTGRES_PASSWORD_FILE=/run/secrets/postgres-password",
+        "--publish",
+        "127.0.0.1::5432",
+        IMAGE,
     )
-    port_text = _command("docker", "port", container, "5432/tcp")
+    port_text = _command(docker, "port", container, "5432/tcp")
     match = re.fullmatch(r"127\.0\.0\.1:([0-9]{1,5})", port_text)
     if match is None:
         raise ValueError("local dedicated database port unavailable")
@@ -156,8 +202,8 @@ async def _provision_claims(runtime: Path, container: str):
     owner, role = "auth_owner_" + suffix, "auth_runtime_" + suffix
     owner_password, role_password = secrets.token_urlsafe(40), secrets.token_urlsafe(40)
     try:
-        await admin.execute(f'CREATE ROLE "{owner}" LOGIN PASSWORD \'{owner_password}\'')
-        await admin.execute(f'CREATE ROLE "{role}" LOGIN PASSWORD \'{role_password}\'')
+        await admin.execute(f"CREATE ROLE \"{owner}\" LOGIN PASSWORD '{owner_password}'")
+        await admin.execute(f"CREATE ROLE \"{role}\" LOGIN PASSWORD '{role_password}'")
         await admin.execute(f'CREATE DATABASE "{database}" OWNER "{owner}"')
     finally:
         await admin.close()
@@ -170,19 +216,31 @@ async def _provision_claims(runtime: Path, container: str):
     connection = await asyncpg.connect(owner_dsn, timeout=5)
     try:
         await provision_isolated_schema(
-            connection, expected_database=database, database_uuid=database_uuid,
-            policy_namespace=namespace, owner_role=owner, runtime_role=role,
+            connection,
+            expected_database=database,
+            database_uuid=database_uuid,
+            policy_namespace=namespace,
+            owner_role=owner,
+            runtime_role=role,
         )
     finally:
         await connection.close()
-    return {"container": container, "volume": volume, "database": database,
-            "database_uuid": str(database_uuid), "namespace": namespace, "runtime_role": role}
+    return {
+        "container": container,
+        "volume": volume,
+        "database": database,
+        "database_uuid": str(database_uuid),
+        "namespace": namespace,
+        "runtime_role": role,
+    }
 
 
 def _reader(plan, runtime):
     client = ProductionEvedexSdkClient(
-        node_executable=Path(plan["node"]), api_key_file=runtime / "auth" / "api-key.txt",
-        expected_account_id=plan["context"]["remote_account_id"], script=Path(plan["sidecar"]),
+        node_executable=Path(plan["node"]),
+        api_key_file=runtime / "auth" / "api-key.txt",
+        expected_account_id=plan["context"]["remote_account_id"],
+        script=Path(plan["sidecar"]),
     )
     return client, ProductionEvedexReads(client, symbol_map={"BTCUSDT": "BTCUSD"})
 
@@ -208,6 +266,7 @@ def _sidecar_fingerprint(script: Path) -> dict[str, str]:
 
 async def prepare(args):
     from eth_account import Account
+
     runtime = Path(args.runtime_dir)
     if not runtime.is_absolute() or runtime.exists() or not runtime.parent.is_dir():
         raise ValueError("a new absolute private runtime directory is required")
@@ -223,7 +282,9 @@ async def prepare(args):
         raise ValueError("official auth parameter source changed; review before preparing")
     lines = Path(args.keys_file).read_text(encoding="utf-8-sig").splitlines()
     _validate_credential_labels(
-        lines, wallet_key_line=args.wallet_key_line, wallet_address_line=args.wallet_address_line,
+        lines,
+        wallet_key_line=args.wallet_key_line,
+        wallet_address_line=args.wallet_address_line,
         api_key_line=args.api_key_line,
     )
     key, api_key = _credential_line(lines, args.wallet_key_line), _credential_line(lines, args.api_key_line)
@@ -235,32 +296,50 @@ async def prepare(args):
         await _get_json("https://exchange-api.evedex.com/api/user/me", api_key=api_key),
         object_pairs_hook=_unique_object,
     )
-    if (type(identity) is not dict or not identity.get("exchangeId")
-            or str(identity.get("wallet", "")).casefold() != wallet.casefold()):
+    if (
+        type(identity) is not dict
+        or not identity.get("exchangeId")
+        or str(identity.get("wallet", "")).casefold() != wallet.casefold()
+    ):
         raise ValueError("API key and source wallet account differ")
-    runtime.mkdir(mode=0o700)
-    _private_acl(runtime, directory=True)
+    create_private_directory(runtime)
     material = provision_existing_auth_material(
-        destination=runtime / "auth", wallet_private_key=key, api_key=api_key, expected_wallet_address=wallet,
+        destination=runtime / "auth",
+        wallet_private_key=key,
+        api_key=api_key,
+        expected_wallet_address=wallet,
     )
     claims = await _provision_claims(runtime, args.container)
-    policy = {"purpose": "one_wallet_login_readonly_observation", "auth_chain_id": args.auth_chain_id,
-              "params_url": PARAMS_URL, "params_sha256": args.params_sha256, "order_methods": []}
+    policy = {
+        "purpose": "one_wallet_login_readonly_observation",
+        "auth_chain_id": args.auth_chain_id,
+        "params_url": PARAMS_URL,
+        "params_sha256": args.params_sha256,
+        "order_methods": [],
+    }
     source_hashes = {
-        name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
-        for name in SOURCE_NAMES
+        name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest() for name in SOURCE_NAMES
     }
     context = ProductionContextV1(
-        remote_account_id=str(identity["exchangeId"]), adaptive_system_id="evedex_auth_observation_v1",
+        remote_account_id=str(identity["exchangeId"]),
+        adaptive_system_id="evedex_auth_observation_v1",
         frozen_policy_sha256=hashlib.sha256(json.dumps(policy, sort_keys=True).encode()).hexdigest(),
         source_set_sha256=hashlib.sha256(json.dumps(source_hashes, sort_keys=True).encode()).hexdigest(),
     )
-    plan = {"version": "kairos.auth-observation-plan.v1", "context": context.model_dump(mode="json"),
-            "wallet": material.wallet_address, "node": str(Path(args.node)),
-            "sidecar": str(Path(args.sidecar)),
-            "auth_chain_id": args.auth_chain_id, "policy": policy, "source_hashes": source_hashes,
-            "sidecar_hashes": sidecar_hashes, "node_sha256": node_sha256,
-            "claims": claims, "created_at": datetime.now(UTC).isoformat()}
+    plan = {
+        "version": "kairos.auth-observation-plan.v1",
+        "context": context.model_dump(mode="json"),
+        "wallet": material.wallet_address,
+        "node": str(Path(args.node)),
+        "sidecar": str(Path(args.sidecar)),
+        "auth_chain_id": args.auth_chain_id,
+        "policy": policy,
+        "source_hashes": source_hashes,
+        "sidecar_hashes": sidecar_hashes,
+        "node_sha256": node_sha256,
+        "claims": claims,
+        "created_at": datetime.now(UTC).isoformat(),
+    }
     client, reads = _reader(plan, runtime)
     try:
         await reads.preflight()
@@ -271,15 +350,24 @@ async def prepare(args):
         await client.close()
     encoded = json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()
     _write_new_private_file(runtime / "plan.json", encoded)
-    _emit("PREPARED_NO_AUTH", plan_sha256=hashlib.sha256(encoded).hexdigest(),
-          runtime_dir=str(runtime), credentials_private=True, real_auth_attempts=0, trading_authority=False)
+    _emit(
+        "PREPARED_NO_AUTH",
+        plan_sha256=hashlib.sha256(encoded).hexdigest(),
+        runtime_dir=str(runtime),
+        credentials_private=True,
+        real_auth_attempts=0,
+        trading_authority=False,
+    )
 
 
 def _capture_summary(observation):
-    return {"subscribed_channels": len(observation.subscribed_channels),
-            "publications": len(observation.publications),
-            "finished_at": observation.finished_at.isoformat(), "trading_authority": False,
-            "continuity_proven": observation.sequence_continuity_proven}
+    return {
+        "subscribed_channels": len(observation.subscribed_channels),
+        "publications": len(observation.publications),
+        "finished_at": observation.finished_at.isoformat(),
+        "trading_authority": False,
+        "continuity_proven": observation.sequence_continuity_proven,
+    }
 
 
 async def revise_preauth_plan(args):
@@ -308,8 +396,12 @@ async def revise_preauth_plan(args):
     dsn = _regular_protected_file(runtime / "runtime-dsn.txt").read_text().strip()
     pool = await asyncpg.create_pool(dsn, min_size=1, max_size=1)
     claims = PostgresProductionClaims(
-        pool, expected_database=info["database"], database_uuid=UUID(info["database_uuid"]),
-        policy_namespace=info["namespace"], runtime_role=info["runtime_role"], context=context,
+        pool,
+        expected_database=info["database"],
+        database_uuid=UUID(info["database_uuid"]),
+        policy_namespace=info["namespace"],
+        runtime_role=info["runtime_role"],
+        context=context,
     )
     try:
         async with pool.acquire() as connection:
@@ -331,9 +423,7 @@ async def revise_preauth_plan(args):
                 backup = runtime / ("plan.pre-auth-" + args.plan_sha256[:16] + ".json")
                 _write_new_private_file(backup, original)
                 source_digest = hashlib.sha256(json.dumps(source_hashes, sort_keys=True).encode()).hexdigest()
-                updated_context = context.model_copy(update={
-                    "source_set_sha256": source_digest
-                })
+                updated_context = context.model_copy(update={"source_set_sha256": source_digest})
                 plan["context"] = updated_context.model_dump(mode="json")
                 plan["source_hashes"] = source_hashes
                 plan["preauth_revision"] = {
@@ -346,9 +436,14 @@ async def revise_preauth_plan(args):
                 pending = runtime / ("plan.next-" + hashlib.sha256(encoded).hexdigest()[:16] + ".json")
                 _write_new_private_file(pending, encoded)
                 os.replace(pending, plan_file)
-        _emit("PREAUTH_PLAN_REVISED_NO_AUTH", plan_sha256=hashlib.sha256(encoded).hexdigest(),
-              original_plan_sha256=args.plan_sha256, claims_before_revision=0,
-              real_auth_attempts=0, trading_authority=False)
+        _emit(
+            "PREAUTH_PLAN_REVISED_NO_AUTH",
+            plan_sha256=hashlib.sha256(encoded).hexdigest(),
+            original_plan_sha256=args.plan_sha256,
+            claims_before_revision=0,
+            real_auth_attempts=0,
+            trading_authority=False,
+        )
     finally:
         await pool.close()
 
@@ -376,8 +471,12 @@ async def prepare_auth_followup(args):
     dsn = _regular_protected_file(runtime / "runtime-dsn.txt").read_text().strip()
     pool = await asyncpg.create_pool(dsn, min_size=1, max_size=1)
     prior_claims = PostgresProductionClaims(
-        pool, expected_database=info["database"], database_uuid=UUID(info["database_uuid"]),
-        policy_namespace=info["namespace"], runtime_role=info["runtime_role"], context=prior_context,
+        pool,
+        expected_database=info["database"],
+        database_uuid=UUID(info["database_uuid"]),
+        policy_namespace=info["namespace"],
+        runtime_role=info["runtime_role"],
+        context=prior_context,
     )
     try:
         async with pool.acquire() as connection:
@@ -393,8 +492,11 @@ async def prepare_auth_followup(args):
                     "siwe-session:" + canonical_digest(prior_context),
                 )
                 expected = hashlib.sha256((canonical_digest(prior_context) + "\n" + plan["wallet"]).encode())
-                if (prior is None or prior["request_sha256"] != expected.hexdigest()
-                        or prior["context_sha256"] != canonical_digest(prior_context)):
+                if (
+                    prior is None
+                    or prior["request_sha256"] != expected.hexdigest()
+                    or prior["context_sha256"] != canonical_digest(prior_context)
+                ):
                     raise ValueError("retained prior auth attempt does not match")
                 used = await connection.fetchval(
                     "SELECT EXISTS(SELECT 1 FROM kairos_production_evidence_v1.claims "
@@ -407,28 +509,42 @@ async def prepare_auth_followup(args):
                     name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
                     for name in SOURCE_NAMES
                 }
-                followup_policy = {"purpose": "one_operator_auth_followup_after_unknown",
-                                   "maximum_attempts": 1,
-                                   "prior_plan_sha256": args.prior_plan_sha256, "order_methods": []}
+                followup_policy = {
+                    "purpose": "one_operator_auth_followup_after_unknown",
+                    "maximum_attempts": 1,
+                    "prior_plan_sha256": args.prior_plan_sha256,
+                    "order_methods": [],
+                }
                 policy_bytes = json.dumps(followup_policy, sort_keys=True).encode()
                 policy_digest = hashlib.sha256(policy_bytes).hexdigest()
                 source_digest = hashlib.sha256(json.dumps(source_hashes, sort_keys=True).encode()).hexdigest()
-                context = prior_context.model_copy(update={
-                    "frozen_policy_sha256": policy_digest,
-                    "source_set_sha256": source_digest,
-                })
+                context = prior_context.model_copy(
+                    update={
+                        "frozen_policy_sha256": policy_digest,
+                        "source_set_sha256": source_digest,
+                    }
+                )
                 plan["context"] = context.model_dump(mode="json")
                 plan["source_hashes"] = source_hashes
                 plan["attempt_mode"] = "OPERATOR_AUTH_FOLLOWUP"
-                plan["prior_unknown"] = {"plan_sha256": args.prior_plan_sha256,
-                                         "context": prior_context.model_dump(mode="json"),
-                                         "outcome": "UNKNOWN", "operator_reference": args.operator_reference}
+                plan["prior_unknown"] = {
+                    "plan_sha256": args.prior_plan_sha256,
+                    "context": prior_context.model_dump(mode="json"),
+                    "outcome": "UNKNOWN",
+                    "operator_reference": args.operator_reference,
+                }
                 plan["followup_policy"] = followup_policy
                 encoded = json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()
                 _write_new_private_file(runtime / "followup-plan.json", encoded)
-        _emit("OPERATOR_AUTH_FOLLOWUP_PREPARED_NO_AUTH", plan_sha256=hashlib.sha256(encoded).hexdigest(),
-              prior_plan_sha256=args.prior_plan_sha256, prior_outcome="UNKNOWN", real_auth_attempts=0,
-              maximum_followups=1, trading_authority=False)
+        _emit(
+            "OPERATOR_AUTH_FOLLOWUP_PREPARED_NO_AUTH",
+            plan_sha256=hashlib.sha256(encoded).hexdigest(),
+            prior_plan_sha256=args.prior_plan_sha256,
+            prior_outcome="UNKNOWN",
+            real_auth_attempts=0,
+            maximum_followups=1,
+            trading_authority=False,
+        )
     finally:
         await pool.close()
 
@@ -442,9 +558,11 @@ async def login_capture(args):
         raise ValueError("prepared plan differs from reviewed digest")
     plan = json.loads(encoded)
     if followup:
-        if (args.acknowledge_prior_unknown is not True
-                or plan.get("attempt_mode") != "OPERATOR_AUTH_FOLLOWUP"
-                or plan.get("prior_unknown", {}).get("outcome") != "UNKNOWN"):
+        if (
+            args.acknowledge_prior_unknown is not True
+            or plan.get("attempt_mode") != "OPERATOR_AUTH_FOLLOWUP"
+            or plan.get("prior_unknown", {}).get("outcome") != "UNKNOWN"
+        ):
             raise ValueError("explicit reviewed auth follow-up unavailable")
         prior_bytes = _regular_protected_file(runtime / "plan.json").read_bytes()
         if hashlib.sha256(prior_bytes).hexdigest() != plan["prior_unknown"]["plan_sha256"]:
@@ -459,8 +577,13 @@ async def login_capture(args):
     if hashlib.sha256(Path(plan["node"]).read_bytes()).hexdigest() != plan["node_sha256"]:
         raise ValueError("prepared Node executable changed")
     context = ProductionContextV1.model_validate(plan["context"])
-    material = Material(runtime / "auth", runtime / "auth/wallet.json", runtime / "auth/unlock.txt",
-                        runtime / "auth/api-key.txt", plan["wallet"])
+    material = Material(
+        runtime / "auth",
+        runtime / "auth/wallet.json",
+        runtime / "auth/unlock.txt",
+        runtime / "auth/api-key.txt",
+        plan["wallet"],
+    )
     backend = build_auth_custody(
         material, chain_id=plan["auth_chain_id"], custody_reference="auth:existing-wallet"
     )
@@ -474,8 +597,12 @@ async def login_capture(args):
         await reads.preflight()
         info = plan["claims"]
         claims = PostgresProductionClaims(
-            pool, expected_database=info["database"], database_uuid=UUID(info["database_uuid"]),
-            policy_namespace=info["namespace"], runtime_role=info["runtime_role"], context=context,
+            pool,
+            expected_database=info["database"],
+            database_uuid=UUID(info["database_uuid"]),
+            policy_namespace=info["namespace"],
+            runtime_role=info["runtime_role"],
+            context=context,
         )
         lease = await pool.acquire(timeout=5)
         await claims.inspect(lease)
@@ -486,16 +613,22 @@ async def login_capture(args):
             raise ValueError("prepared plan changed before authentication")
         if followup:
             await authorize_one_auth_followup(
-                claims=claims, current_context=context,
+                claims=claims,
+                current_context=context,
                 prior_context=ProductionContextV1.model_validate(plan["prior_unknown"]["context"]),
-                prior_plan_sha256=plan["prior_unknown"]["plan_sha256"], followup_plan_sha256=args.plan_sha256,
+                prior_plan_sha256=plan["prior_unknown"]["plan_sha256"],
+                followup_plan_sha256=args.plan_sha256,
                 expected_wallet_address=material.wallet_address,
                 operator_reference=plan["prior_unknown"]["operator_reference"],
             )
         audit = AuthAuditJournal(claims)
         captured = await authenticate_and_capture_once(
-            backend=backend, claims=claims, reads=reads, expected_context=context,
-            expected_wallet_address=material.wallet_address, allow_session_creation=True,
+            backend=backend,
+            claims=claims,
+            reads=reads,
+            expected_context=context,
+            expected_wallet_address=material.wallet_address,
+            allow_session_creation=True,
             audit=audit,
         )
         _emit("AUTH_CAPTURED_SESSION_IN_MEMORY", **_capture_summary(captured.observation))
@@ -602,9 +735,13 @@ def main():
     twofa_required = False
     region_forbidden = False
     try:
-        action = {"prepare": prepare, "login-capture": login_capture,
-                  "revise-preauth-plan": revise_preauth_plan, "prepare-auth-followup": prepare_auth_followup,
-                  "login-followup-capture": login_capture}[args.action]
+        action = {
+            "prepare": prepare,
+            "login-capture": login_capture,
+            "revise-preauth-plan": revise_preauth_plan,
+            "prepare-auth-followup": prepare_auth_followup,
+            "login-followup-capture": login_capture,
+        }[args.action]
         asyncio.run(action(args))
     except WalletSessionTwofaRequired:
         twofa_required = True

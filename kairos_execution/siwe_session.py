@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import json
 import re
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -95,10 +96,10 @@ async def _fetch_evedex_nonce() -> str:
             raise ValueError("nonce response malformed")
         return data["nonce"]
     except Exception:
-        pass
+        error = LocalCustodyError("EVEDEX nonce is unavailable")
     # Raised outside the external exception handler: no secret-bearing
     # exception is retained in the exception context.
-    raise LocalCustodyError("EVEDEX nonce is unavailable") from None
+    raise error from None
 
 
 async def prepare_evedex_siwe_once(
@@ -270,8 +271,9 @@ async def _create_evedex_wallet_session_impl(
                     refusal = await _bounded_json(response, expected_status=response.status)
                     if audit is not None:
                         await audit.record(
-                            "AUTH_ERROR_CODE", http_status=response.status,
-                            code=public_auth_error_code(refusal.get("label"))
+                            "AUTH_ERROR_CODE",
+                            http_status=response.status,
+                            code=public_auth_error_code(refusal.get("label")),
                         )
                     if response.status == 400 and refusal.get("label") == "twofa_code_required_error":
                         return _ConfirmedTwofaRefusal()
@@ -289,11 +291,15 @@ async def _create_evedex_wallet_session_impl(
                 or str(user.get("wallet", "")).casefold() != expected_wallet_address.casefold()
                 or not isinstance(token.get("accessToken"), str)
                 or not token["accessToken"]
-                or ("refreshToken" in token and (
-                    not isinstance(token["refreshToken"], str) or not token["refreshToken"]
-                    or any(c in token["refreshToken"] for c in "\r\n")
-                    or len(token["refreshToken"]) > 8192
-                ))
+                or (
+                    "refreshToken" in token
+                    and (
+                        not isinstance(token["refreshToken"], str)
+                        or not token["refreshToken"]
+                        or any(c in token["refreshToken"] for c in "\r\n")
+                        or len(token["refreshToken"]) > 8192
+                    )
+                )
                 or any(c in token["accessToken"] for c in "\r\n")
                 or len(token["accessToken"]) > 8192
             ):
@@ -319,8 +325,8 @@ async def _create_evedex_wallet_session_impl(
     except asyncio.CancelledError:
         raise
     except Exception:
-        pass
-    raise LocalCustodyError("wallet session refused or outcome unknown; do not retry blindly") from None
+        error = LocalCustodyError("wallet session refused or outcome unknown; do not retry blindly")
+    raise error from None
 
 
 async def create_evedex_wallet_session(
@@ -334,7 +340,6 @@ async def create_evedex_wallet_session(
     audit: AuthAuditJournal | None = None,
 ) -> VerifiedWalletSession:
     """Explicitly create a wallet session; never submit orders or grant LIVE."""
-    result = None
     try:
         result = await _create_evedex_wallet_session_impl(
             backend=backend,
@@ -348,7 +353,7 @@ async def create_evedex_wallet_session(
     except asyncio.CancelledError:
         raise
     except Exception:
-        pass
+        result = None
     if type(result) is _ConfirmedTwofaRefusal:
         raise WalletSessionTwofaRequired() from None
     if type(result) is _ConfirmedRegionalRefusal:
@@ -356,9 +361,8 @@ async def create_evedex_wallet_session(
     if type(result) is VerifiedWalletSession:
         return result
     if audit is not None:
-        try:
+        # A journal failure cannot replace the sanitized refusal below.
+        with suppress(Exception):
             await audit.record("AUTH_UNKNOWN")
-        except Exception:
-            pass
     # Do not retain the inner traceback, which can contain temporary tokens.
     raise LocalCustodyError("wallet session refused or outcome unknown; do not retry blindly") from None
