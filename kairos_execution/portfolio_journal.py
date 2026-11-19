@@ -646,13 +646,13 @@ class PortfolioJournal:
         )
 
     def reconcile_effect(self, effect_id: str, *, venue_id: str) -> None:
-        """Record the broker's exact-ID venue readback of a previously ambiguous entry/cancel."""
+        """Record the broker's exact-ID venue readback of a previously ambiguous owned order."""
         _identifier(venue_id, "venue ID")
         with self._write() as db:
             row = db.execute("SELECT * FROM effects WHERE effect_id=?", (effect_id,)).fetchone()
             if (
                 not row
-                or row["kind"] not in {"ENTRY", "CANCEL_ENTRY"}
+                or row["kind"] not in {"ENTRY", "CANCEL_ENTRY", "CLOSE", "PARTIAL_CLOSE"}
                 or json.loads(row["request"]).get("id") != venue_id
                 or row["venue_id"] not in (None, venue_id)
                 or row["status"] == "REJECTED"

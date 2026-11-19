@@ -123,7 +123,10 @@ def test_partial_close_delta_once_and_daily_limit(tmp_path):
         op = j.prepare_effect(
             trade_id="t0", kind="PARTIAL_CLOSE", operation_key="half", request={"id": "reduce1"}
         )
-        j.finish_effect(op, "ACCEPTED", "reduce1")
+        j.finish_effect(op, "UNKNOWN", "reduce1")
+        with pytest.raises(PortfolioJournalError):
+            j.reconcile_effect(op, venue_id="foreign-order")
+        j.reconcile_effect(op, venue_id="reduce1")
         j.reduced("t0", close_order_id="reduce1", quantity=D(".8"))
         j.reduced("t0", close_order_id="reduce1", quantity=D(".8"))
         assert D(j.trade("t0")["quantity"]) == D("1.2")
