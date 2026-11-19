@@ -122,7 +122,7 @@ def test_builds_deterministic_entry_protection_and_close_bindings():
             assert message["chainId"] == custody.chain_id
         elif role in {"STOP_LOSS", "TAKE_PROFIT"}:
             assert message["quantity"] == 0
-            assert message["side"] == "BUY"
+            assert message["side"] == "SELL"
             assert message["order"] == client_order_id(
                 f"{decision.trade_id}:ENTRY", "evedex", occurred_at=deadline
             )

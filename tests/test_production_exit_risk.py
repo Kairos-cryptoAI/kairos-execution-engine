@@ -289,7 +289,7 @@ def _setup(role="TIMEOUT_EXIT", *, state=None, quantity=0.05, filled_quantity=0.
             "client_order_id": client_id,
             "parent_order_id": entry_id,
             "venue_symbol": trade.venue_symbol,
-            "side": trade.side,
+            "side": "SELL" if trade.side == "BUY" else "BUY",
             "tpsl_type": role,
             "quantity_hex": float(0).hex(),
             "price_hex": float(trade.stop_price if role == "STOP_LOSS" else trade.target_price).hex(),
