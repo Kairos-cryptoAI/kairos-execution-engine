@@ -4,7 +4,31 @@
 (no LLM). Legacy `DRY_RUN` consumes `ValidatedOrder`; strict `PAPER` consumes only
 `RiskTradeDecisionV1` and preserves full strategy/intent/trade/order lineage.
 
-## Authority modes
+## EVEDEX portfolio pilot
+
+The autotrader calls `kairos_execution.portfolio_broker.PortfolioBroker` for live order
+writes. A signed local owner profile binds the EVEDEX account, signer, runtime directory,
+SQLite journal, instrument list and entry deadline. The portfolio pilot has a 100 USDT
+capital basis, up to ten distinct positions, adaptive leverage up to 30×, a 25 USDT
+notional limit per entry and an aggregate planned stop risk of 1 USDT. Risk Manager
+must approve each entry. The signed mandate limits the ability to submit orders.
+Venue liquidity and fills determine realized losses.
+
+The broker records an order's identity before submission. An ambiguous response
+requires a readback of that order. A missing position alone cannot identify who
+closed it. The portfolio journal survives runner restarts. It measures the change in
+funding balance from a verified flat baseline, subtracts net deposits, and reports
+open exposure separately. The adverse equity estimate includes unrealized losses.
+External model-provider charges are billed outside the exchange account.
+
+The operator prepares the profile with `python -m kairos_execution.portfolio_profile
+prepare --help`, signs the resulting JSON with a detached OpenPGP signature, and
+verifies it with `python -m kairos_execution.portfolio_profile verify <owner.json>`.
+Account-specific profiles, signatures and execution journals are local runtime files.
+The November 2026 pilot admits new entries before 22 November at 21:00 UTC. Existing
+positions remain under management through their exit.
+
+## Service authority modes
 
 - `DRY_RUN` keeps the existing synthetic adapter path unchanged.
 - `PAPER` is restricted to the exact EVEDEX DEV URLs, chain `16182`, five `*:DEV`
