@@ -528,6 +528,141 @@ async def test_start_reinstalls_both_missing_protections_and_poll_keeps_tight_st
     assert (await s.b.settle(trade))["exit_origin"] == "unknown"
 
 
+@pytest.fixture
+def position_projection(system, monkeypatch):
+    """Pinned SDK projections: parent empty, full-position children have no parent/order."""
+    s = system
+    s.v.omit_parent = True
+    sdk_parent = s.v.order_with_protections
+    api = Evedex(Mock())
+    config = {"fault": "", "reads": []}
+
+    async def history(symbol, order_id):
+        record = await sdk_parent(symbol, order_id)
+        return {**record, "tpslList": []}
+
+    async def order_detail(order_id):
+        return {**s.v.records[order_id], "user": "test-account", "positionVersions": [4]}
+
+    async def get(method, url, *, private, params):
+        assert method == "GET" and private
+        fault = config["fault"]
+        if url == f"{TRADING}/api/position":
+            assert params == {"withTpSL": "yes"}
+            positions = []
+            for pos in s.v.held.values():
+                children = [dict(r) for r in s.v.tpsl.values() if r["instrument"] == pos.instrument]
+                if fault == "missing":
+                    children.clear()
+                if fault == "swapped":
+                    children[0]["id"] = "different"
+                if fault == "mismatch":
+                    children[0]["price"] = "17"
+                positions.append(
+                    dict(
+                        id="position",
+                        user="foreign" if fault == "account" else "test-account",
+                        instrument=pos.instrument,
+                        side=pos.side,
+                        quantity=str(pos.quantity),
+                        avgPrice=str(pos.avg_price),
+                        tpslList=children,
+                    )
+                )
+            return {"list": positions}
+        config["reads"].append(url)
+        assert params["version"] == 4 and params["instrument"] == "BTCUSD"
+        if url == f"{TRADING}/api/position/history":
+            rows = (
+                [{"instrument": "BTCUSD", "version": 4, "closeAt": "2026-11-19T10:10:00Z"}]
+                if fault == "closed"
+                else []
+            )
+            # The real filtered history returns count=1 even for nonexistent versions.
+            return {"count": 1, "list": rows}
+        assert url == f"{TRADING}/api/order"
+        rows = [{**r, "user": "test-account"} for r in s.v.records.values()]
+        if fault == "foreign_fill":
+            rows.append({**rows[0], "id": "other"})
+        return {"count": len(rows), "list": rows}
+
+    monkeypatch.setattr(api, "_request", get)
+    monkeypatch.setattr(s.v, "order", order_detail)
+    monkeypatch.setattr(s.v, "positions", api.positions)
+    monkeypatch.setattr(s.v, "position_version_orders", api.position_version_orders, raising=False)
+    monkeypatch.setattr(s.v, "position_version_closed", api.position_version_closed, raising=False)
+    monkeypatch.setattr(s.v, "order_with_protections", history)
+    return config
+
+
+@pytest.mark.parametrize("entry_status", ["FILLED", "PARTIALLY_FILLED"])
+async def test_position_cover_is_read_only_on_entry_restart_tightening_and_close(
+    system, position_projection, entry_status
+):
+    s = system
+    s.v.response = entry_status
+    trade = runner_trade(s, await s.enter())
+    if entry_status == "PARTIALLY_FILLED":
+        assert [e["kind"] for e in s.j.effects(s.risk.trade_id)].count("CANCEL_ENTRY") == 1
+    assert not s.j.attached(s.risk.trade_id)
+    original = set(s.v.tpsl)
+    s.b._position_entries.clear()  # process restart must independently reconstruct cover
+    await s.b.reconcile_start([trade], None)
+    assert await s.b.prepare_admission({"BTCUSD"}) == D(100)
+    assert await s.b.position_open(trade) and await s.b.move_stop(trade, D(97))
+    assert original < set(s.v.tpsl) and not s.j.attached(s.risk.trade_id)
+    assert await s.b.position_open(trade)
+    await s.b.close(trade, await s.v.book("BTCUSD"), "TIMEOUT")
+    with pytest.raises(portfolio.NeedsOperator):
+        await s.b.settle(trade)  # an external protection lingering after flatness cannot be cancelled
+    assert original.issubset(s.v.tpsl)
+    s.v.tpsl.clear()  # real venue cancels the full-position pair when its generation closes
+    await s.b.settle(trade)
+    assert not any(e["kind"] in {"CANCEL_STOP", "CANCEL_TAKE"} for e in s.j.effects(s.risk.trade_id))
+
+
+async def test_position_coverage_rechecks_generation_before_reducing_same_price_exposure(
+    system, position_projection
+):
+    s = system
+    trade = runner_trade(s, await s.enter())
+    assert await s.b.partial_close(trade, await s.v.book("BTCUSD"), D("0.005"))
+    reads_before = len(position_projection["reads"])
+    assert await s.b.position_open(trade)
+    assert len(position_projection["reads"]) - reads_before == 2
+    # An externally closed generation cannot authorize a reduction of an identical new position.
+    position_projection["fault"] = "closed"
+    with pytest.raises(portfolio.PositionIdentityError, match="already closed"):
+        await s.b.close(trade, await s.v.book("BTCUSD"), "TIMEOUT")
+    assert s.v.held and not any(e["kind"] == "CLOSE" for e in s.j.effects(s.risk.trade_id))
+
+
+@pytest.mark.parametrize(
+    ("fault", "reason"),
+    [
+        ("missing", "position lists no protection IDs"),
+        ("swapped", "protection IDs differ"),
+        ("mismatch", "does not match the initial"),
+        ("account", "authenticated open position does not match"),
+        ("closed", "generation is already closed"),
+        ("foreign_fill", "fills outside the owned entry"),
+    ],
+)
+async def test_position_projection_ambiguity_closes_fill_without_adopting_or_deleting(
+    system, position_projection, fault, reason
+):
+    s = system
+    position_projection["fault"] = fault
+    with pytest.raises(portfolio.NeedsOperator, match=reason):
+        await s.enter()
+    assert len(s.v.tpsl) == 2 and not s.j.attached(s.risk.trade_id)
+    kinds = [e["kind"] for e in s.j.effects(s.risk.trade_id)]
+    if fault in {"closed", "foreign_fill", "account"}:
+        assert s.v.held and kinds == ["LEVERAGE", "ENTRY"]
+    else:
+        assert not s.v.held and kinds == ["LEVERAGE", "ENTRY", "CLOSE"]
+
+
 async def test_venue_clock_leading_host_allows_fresh_approval_and_expiration_does_not_halt(
     system, monkeypatch
 ):

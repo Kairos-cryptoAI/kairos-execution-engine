@@ -172,6 +172,9 @@ class Position:
     avg_price: Decimal
     has_stop: bool = False  # an active stop-loss is attached on the venue
     stop_id: str | None = None  # the venue's identity of that stop-loss
+    venue_id: str | None = None
+    user: str | None = None
+    protections: tuple[dict[str, Any], ...] = ()
 
 
 class OrderSigner:
@@ -520,6 +523,10 @@ class Evedex:
                 if (
                     not isinstance(row.get("instrument"), str)
                     or not row["instrument"]
+                    or not isinstance(row.get("id"), str)
+                    or not row["id"]
+                    or row.get("user") is None
+                    or not str(row["user"])
                     or row.get("side") not in {"BUY", "SELL"}
                     or dec(row.get("avgPrice")) <= 0
                 ):
@@ -543,12 +550,47 @@ class Evedex:
                         dec(row.get("avgPrice", 0)),
                         has_stop,
                         stop_id,
+                        row.get("id"),
+                        str(row["user"]) if row.get("user") is not None else None,
+                        tuple(attached) if all(isinstance(child, dict) for child in attached) else (),
                     )
                 )
         return result
 
     async def open_orders(self) -> list[dict[str, Any]]:
         return _complete_rows(await self._request("GET", f"{TRADING}/api/order/opened", private=True))
+
+    async def position_version_closed(self, instrument: str, version: int) -> bool:
+        """Check the actual filtered history rows. EVEDEX's count can include other versions."""
+        page = await self._request(
+            "GET",
+            f"{TRADING}/api/position/history",
+            private=True,
+            params={"instrument": instrument, "version": version, "limit": 2, "offset": 0},
+        )
+        if not isinstance(page, dict) or not isinstance(page.get("list"), list) or page.get("next"):
+            raise EvedexError("position history lacks its filtered list")
+        rows = _rows(page)
+        if rows and (
+            len(rows) != 1
+            or rows[0].get("instrument") != instrument
+            or rows[0].get("version") != version
+            or not rows[0].get("closeAt")
+        ):
+            raise EvedexError("position history returned an ambiguous generation")
+        return bool(rows)
+
+    async def position_version_orders(self, instrument: str, version: int) -> list[dict[str, Any]]:
+        """A generation with more than one complete page needs manual reconciliation."""
+        page = await self._request(
+            "GET",
+            f"{TRADING}/api/order",
+            private=True,
+            params={"instrument": instrument, "version": version, "limit": 100, "offset": 0},
+        )
+        if not isinstance(page, dict) or type(page.get("count")) is not int:
+            raise EvedexError("position generation order list lacks a count")
+        return _complete_rows(page)
 
     async def order(self, order_id: str) -> dict[str, Any] | None:
         try:
