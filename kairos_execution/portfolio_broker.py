@@ -881,6 +881,17 @@ class PortfolioBroker:
                 current = await self._owned_position(item)
                 if current:
                     await self._close_quantity(item, current, current.quantity)
+                    # The exact full close was confirmed before the runner received a trade.
+                    # Settle only a clean instrument. Recovery owns any effects still in doubt.
+                    if (
+                        await self._flat_without_resting_order(symbol)
+                        and not await self._api.active_tpsl(symbol)
+                        and all(
+                            e["status"] not in {"UNKNOWN", "PREPARED"}
+                            for e in self._journal.effects(trade_id)
+                        )
+                    ):
+                        self._journal.closed(trade_id, exit_origin="system")
                 raise NeedsOperator(failure)
             return {
                 "quantity": filled,
@@ -1071,14 +1082,17 @@ class PortfolioBroker:
         if await self._api.active_tpsl(item["symbol"]):
             raise NeedsOperator("venue still reports protective orders on the settled instrument")
 
+    async def _flat_without_resting_order(self, symbol: str) -> bool:
+        return await self.position(symbol) is None and not any(
+            order.get("instrument") == symbol for order in await self._api.open_orders()
+        )
+
     async def settle(self, trade: dict) -> dict[str, Any]:
         async with self._lock:
             await self._identity()
             item = self._owned(trade, allow_closed=True)
             if item["state"] != "CLOSED":
-                if await self.position(item["symbol"]) is not None or any(
-                    o.get("instrument") == item["symbol"] for o in await self._api.open_orders()
-                ):
+                if not await self._flat_without_resting_order(item["symbol"]):
                     raise NeedsOperator("cannot settle a position or resting order")
                 await self._remove_leftovers(item)
                 origin = "unknown"

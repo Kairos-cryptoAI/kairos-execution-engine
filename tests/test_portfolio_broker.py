@@ -385,6 +385,42 @@ async def test_crash_after_durable_open_before_runner_save_closes_proven_orphan_
     assert [e["kind"] for e in s.j.effects(s.risk.trade_id)].count("CLOSE") == 1
 
 
+@pytest.mark.parametrize("leftover", [None, "resting", "protection", "unknown"])
+async def test_full_emergency_exit_settles_before_runner_records_entry(system, monkeypatch, leftover):
+    s = system
+    post_close = s.v.post_close
+
+    async def unverified(item):
+        return False
+
+    async def close(body):
+        row = await post_close(body)
+        s.v.tpsl.clear()  # EVEDEX cancels attached protection when the position closes.
+        if leftover == "resting":
+            s.v.records["foreign"] = {"instrument": "BTCUSD", "status": "NEW"}
+        elif leftover == "protection":
+            s.v.tpsl["foreign"] = {"id": "foreign", "instrument": "BTCUSD", "status": "active"}
+        elif leftover == "unknown":
+            effect = s.j.prepare_effect(
+                trade_id=s.risk.trade_id, kind="STOP", operation_key="stop", request={}
+            )
+            s.j.finish_effect(effect, "UNKNOWN")
+        return row
+
+    monkeypatch.setattr(s.b, "_ensure_entry_protection", unverified)
+    monkeypatch.setattr(s.v, "post_close", close)
+    with pytest.raises(portfolio.NeedsOperator, match="protection could not be verified"):
+        await s.enter()
+    settled = s.j.trade(s.risk.trade_id)
+    if leftover is None:
+        assert settled["state"] == "CLOSED" and settled["exit_origin"] == "system"
+        assert settled["net_pnl"] is None and settled["pnl_basis"] == "unknown"
+        await s.b.reconcile_start([], None)
+    else:
+        assert settled["state"] == "OPEN" and settled["exit_origin"] is None
+    assert [e["kind"] for e in s.j.effects(s.risk.trade_id)].count("CLOSE") == 1
+
+
 async def test_missing_runner_and_mismatched_venue_never_closes_other_exposure(system):
     s = system
     await s.enter()
