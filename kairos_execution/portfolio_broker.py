@@ -1102,15 +1102,19 @@ class PortfolioBroker:
                     await self._close_quantity(item, current, current.quantity)
                     # The exact full close was confirmed before the runner received a trade.
                     # Settle only a clean instrument. Recovery owns any effects still in doubt.
-                    if (
-                        await self._flat_without_resting_order(symbol)
-                        and not await self._api.active_tpsl(symbol)
-                        and all(
-                            e["status"] not in {"UNKNOWN", "PREPARED"}
-                            for e in self._journal.effects(trade_id)
-                        )
+                    try:
+                        flat = await self._flat_without_resting_order(
+                            symbol
+                        ) and not await self._api.active_tpsl(symbol)
+                    except (EvedexError, TimeoutError, ValueError) as exc:
+                        raise NeedsOperator(
+                            f"{failure}; emergency close filled, settlement read unavailable"
+                        ) from exc
+                    if flat and all(
+                        e["status"] not in {"UNKNOWN", "PREPARED"} for e in self._journal.effects(trade_id)
                     ):
                         self._journal.closed(trade_id, exit_origin="system")
+                        self._position_entries.pop(order_id, None)
                 raise NeedsOperator(failure)
             return {
                 "quantity": filled,

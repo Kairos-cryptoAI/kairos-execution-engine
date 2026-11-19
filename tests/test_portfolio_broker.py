@@ -385,7 +385,7 @@ async def test_crash_after_durable_open_before_runner_save_closes_proven_orphan_
     assert [e["kind"] for e in s.j.effects(s.risk.trade_id)].count("CLOSE") == 1
 
 
-@pytest.mark.parametrize("leftover", [None, "resting", "protection", "unknown"])
+@pytest.mark.parametrize("leftover", [None, "resting", "protection", "unknown", "read_failure"])
 async def test_full_emergency_exit_settles_before_runner_records_entry(system, monkeypatch, leftover):
     s = system
     post_close = s.v.post_close
@@ -394,6 +394,9 @@ async def test_full_emergency_exit_settles_before_runner_records_entry(system, m
         assert position is not None and position.instrument == item["symbol"]
         return False
 
+    async def unavailable(symbol):
+        raise portfolio.EvedexError("protection read timed out")
+
     async def close(body):
         row = await post_close(body)
         s.v.tpsl.clear()  # EVEDEX cancels attached protection when the position closes.
@@ -401,6 +404,8 @@ async def test_full_emergency_exit_settles_before_runner_records_entry(system, m
             s.v.records["foreign"] = {"instrument": "BTCUSD", "status": "NEW"}
         elif leftover == "protection":
             s.v.tpsl["foreign"] = {"id": "foreign", "instrument": "BTCUSD", "status": "active"}
+        elif leftover == "read_failure":
+            monkeypatch.setattr(s.v, "active_tpsl", unavailable)
         elif leftover == "unknown":
             effect = s.j.prepare_effect(
                 trade_id=s.risk.trade_id, kind="STOP", operation_key="stop", request={}
