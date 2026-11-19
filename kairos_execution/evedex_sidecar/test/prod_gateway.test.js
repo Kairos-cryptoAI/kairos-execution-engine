@@ -17,6 +17,7 @@ const cases = [
   ["/api/tpsl/BTCUSD", { instrument: "BTCUSD", type: "stop-loss", side: "BUY", quantity: "0.25", price: "59000", order: "entry-1", signature: SIGNATURE }, "createTpSl"],
   ["/api/v2/order/limit", { id: "gtc-entry-1", instrument: "BTCUSD", side: "BUY", leverage: 1, quantity: "0.25", limitPrice: "60000", chainId: 42161, signature: SIGNATURE }, "createLimitOrderV2"],
 ];
+const [closePath, closeBody] = cases.find(([, , method]) => method === "closePositionV2");
 
 function fixture({ exchangeId = "acct-prod-1", orderRecord = null, tpslPage = null } = {}) {
   const calls = [];
@@ -81,7 +82,7 @@ test("uses the pinned PROD SDK profile and only the API-key account constructor"
   const { gateway, optionsSeen } = fixture();
   await gateway.preflight();
   assert.deepEqual(await gateway.preflight(), { exchangeId: "acct-prod-1" });
-  await gateway.sendSignedPost({ method: "POST", path: cases[0][0], body: cases[0][1], deadline_ms: Date.now() + 2_000 });
+  await gateway.sendSignedPost({ method: "POST", path: closePath, body: closeBody });
   assert.deepEqual({
     authURI: optionsSeen[0].authURI,
     exchangeURI: optionsSeen[0].exchangeURI,
@@ -114,11 +115,11 @@ test("real pinned SDK Gateway uses isolated bounded HTTPS transport and x-api-ke
   });
   assert.equal(gateway.gatewayFactory instanceof Function, true);
   await gateway.preflight();
-  await gateway.sendSignedPost({ method: "POST", path: cases[0][0], body: cases[0][1], deadline_ms: Date.now() + 2_000 });
+  await gateway.sendSignedPost({ method: "POST", path: closePath, body: closeBody });
 
   assert.equal(requests.length, 2);
   assert.equal(requests[0].url, "https://trading-api.evedex.com/api/user/me");
-  assert.equal(requests[1].url, "https://trading-api.evedex.com/api/v2/order/market");
+  assert.equal(requests[1].url, "https://trading-api.evedex.com/api/v2/position/BTCUSD/close");
   for (const request of requests) {
     assert.equal(request.maxRedirects, 0);
     assert.equal(request.proxy, false);
@@ -129,7 +130,7 @@ test("real pinned SDK Gateway uses isolated bounded HTTPS transport and x-api-ke
     assert.equal(request.headers.get("x-api-key"), "api-key-test");
     assert.equal(request.headers.get("Authorization"), undefined);
   }
-  assert.equal(requests[1].data, JSON.stringify(cases[0][1]));
+  assert.deepEqual(JSON.parse(requests[1].data), closeBody);
   assert.deepEqual(
     { proxy: axios.defaults.proxy, timeout: axios.defaults.timeout, maxRedirects: axios.defaults.maxRedirects },
     axiosDefaultsBefore,
@@ -166,17 +167,25 @@ test("API-key 401 failure is not retried by the SDK auth client", async () => {
   assert.equal(attempts, 1);
 });
 
-test("passes exact pre-signed bodies through the corresponding SDK API method", async () => {
+test("passes only explicit closes to the SDK and refuses entries and protective triggers", async () => {
   const { gateway, calls } = fixture();
   await gateway.preflight();
   for (const [path, body, method] of cases) {
-    const result = await gateway.sendSignedPost({ method: "POST", path, body, ...(path === cases[0][0] ? { deadline_ms: Date.now() + 2_000 } : {}) });
-    assert.deepEqual(result, { accepted: true });
-    assert.equal(calls.at(-1)[0], method);
-    assert.equal(calls.at(-1)[1], body);
-    assert.equal(calls.at(-1)[1].signature, SIGNATURE);
+    if (method === "closePositionV2") continue;
+    const deadline = method === "createMarketOrderV2" ? { deadline_ms: Date.now() + 2_000 } : {};
+    const bodies = method === "createTpSl" ? ["stop-loss", "take-profit"].flatMap(type =>
+      ["BUY", "SELL"].flatMap(side => ["0", "0.25"].map(quantity => ({ ...body, type, side, quantity })))
+    ) : ["BUY", "SELL"].map(side => ({ ...body, side }));
+    for (const entry of bodies) {
+      await assert.rejects(gateway.sendSignedPost({ method: "POST", path, body: entry, ...deadline }),
+        /not qualified to reduce/);
+    }
   }
-  assert.equal(calls.length, cases.length);
+  assert.deepEqual(calls, []);
+  await assert.rejects(gateway.sendSignedPost({ method: "POST", path: "/api/v2/position/{instrument}/close", body: closeBody }), /concrete/);
+  await assert.rejects(gateway.sendSignedPost({ method: "POST", path: "/api/v2/position/ETHUSD/close", body: closeBody }), /allowlist/);
+  assert.deepEqual(await gateway.sendSignedPost({ method: "POST", path: closePath, body: closeBody }), { accepted: true });
+  assert.deepEqual(calls, [["closePositionV2", closeBody]]);
   await gateway.close();
 });
 

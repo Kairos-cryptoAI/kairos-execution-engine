@@ -85,18 +85,17 @@ test("PROD actual HTTP budget preserves entry/protection/compensation headroom a
   const send = (method, path) => gateway.httpClient.authRequest({
     method, url: `https://trading-api.evedex.com${path}`, headers: {}, body: "{}",
   });
-  for (let i = 0; i < 24; i++) await send("POST", "/api/v2/order/limit");
-  assert.equal(gateway.readHealth().local_mutation_rate_limit_reserve, 6);
   const beforeDenied = requests.length;
+  await assert.rejects(send("POST", "/api/v2/order/limit"), /not qualified to reduce/);
   gateway.httpClient.beginMarketDeadline({}, now + 2_000);
-  await assert.rejects(send("POST", "/api/v2/order/market"), /mandatory STOP and TARGET/);
+  await assert.rejects(send("POST", "/api/v2/order/market"), /not qualified to reduce/);
   gateway.httpClient.endMarketDeadline();
-  await assert.rejects(send("POST", "/api/v2/order/stop-limit"), /mandatory STOP and TARGET/);
+  await assert.rejects(send("POST", "/api/v2/order/stop-limit"), /not qualified to reduce/);
+  await assert.rejects(send("POST", "/api/tpsl/BTCUSD"), /not qualified to reduce/);
   assert.equal(requests.length, beforeDenied);
-  await send("POST", "/api/tpsl/BTCUSD");
-  await send("POST", "/api/tpsl/BTCUSD");
+  assert.equal(gateway.readHealth().local_mutation_rate_limit_reserve, 30);
+  for (let i = 0; i < 26; i++) await send("DELETE", `/api/order/cancel-${i}`);
   assert.equal(gateway.readHealth().local_mutation_rate_limit_reserve, 4);
-  await assert.rejects(send("POST", "/api/tpsl/BTCUSD"), /held for exposure compensation/);
   await send("POST", "/api/v2/position/BTCUSD/close");
   await send("DELETE", "/api/order/entry-1");
   await send("DELETE", "/api/tpsl/BTCUSD/stop-1");
@@ -122,7 +121,7 @@ test("failed/ambiguous PROD mutation consumes one HTTP reservation with no retry
   } });
   client.setSession({ apiKey: "offline-key" });
   await assert.rejects(client.authRequest({
-    method: "POST", url: "https://trading-api.evedex.com/api/v2/order/limit", headers: {}, body: "{}",
+    method: "POST", url: "https://trading-api.evedex.com/api/v2/position/BTCUSD/close", headers: {}, body: "{}",
   }), /transport failed/);
   assert.equal(attempts, 1);
   assert.equal(client.mutationBudget.remaining(), 29);

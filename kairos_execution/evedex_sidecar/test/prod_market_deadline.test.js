@@ -31,9 +31,8 @@ test("market HTTP requires same frozen body and a current bounded deadline", asy
   client.beginMarketDeadline(body, 102_000);
   await assert.rejects(client.authRequest(request({ ...body, cashQuantity: "11" })), /body changed/);
   assert.equal(calls.length, 0);
-  await client.authRequest(request());
-  assert.equal(calls.length, 1);
-  assert.deepEqual(JSON.parse(calls[0].data), body);
+  await assert.rejects(client.authRequest(request()), /not qualified to reduce/);
+  assert.equal(calls.length, 0);
   client.endMarketDeadline();
 });
 
@@ -54,16 +53,16 @@ test("expiry while awaiting a queued operation or rollback stops before market H
       method: "POST", url: "https://trading-api.evedex.com/api/v2/position/BTCUSD/close",
       headers: {}, body: "{}",
     });
-    await client.authRequest({
+    await assert.rejects(client.authRequest({
       method: "POST", url: "https://trading-api.evedex.com/api/tpsl/BTCUSD",
       headers: {}, body: "{}",
-    });
-    assert.equal(calls.length, 2);
+    }), /not qualified to reduce/);
+    assert.equal(calls.length, 1);
   }
 });
 
-test("rollback between separate pre-budget and pre-axios checks is refused", async () => {
-  const clockValues = [100_000, 100_000, 101_500, 101_000];
+test("rollback between request preparation and the last market deadline check is refused", async () => {
+  const clockValues = [100_000, 101_500, 101_000];
   let calls = 0;
   const client = new PinnedProdRestClient({
     clock: () => clockValues.shift(),
