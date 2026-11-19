@@ -23,6 +23,7 @@ from typing import Any
 import aiohttp
 
 from .crypto import EIP712_SCHEMAS
+from .native_protection import EVEDEX_NATIVE_PROTECTION_UNAVAILABLE
 
 MARKET_DATA = "https://market-data-api.evedex.com"
 EXCHANGE = "https://exchange-api.evedex.com"
@@ -318,6 +319,8 @@ def _complete_rows(value: Any) -> list[dict[str, Any]]:
 
 class Evedex:
     """Small async client. ``api_key`` is needed only for private calls."""
+
+    native_protection_unavailable = EVEDEX_NATIVE_PROTECTION_UNAVAILABLE
 
     def __init__(self, session: aiohttp.ClientSession, api_key: str | None = None) -> None:
         self._session = session
@@ -660,13 +663,13 @@ class Evedex:
     # ---- signed writes ------------------------------------------------------
 
     async def post_limit_order(self, body: dict[str, Any]) -> dict[str, Any]:
-        return await self._request("POST", f"{TRADING}/api/v2/order/limit", private=True, body=body)
+        raise EvedexError(EVEDEX_NATIVE_PROTECTION_UNAVAILABLE)
 
     async def cancel_order(self, order_id: str) -> None:
         await self._request("DELETE", f"{TRADING}/api/order/{order_id}", private=True)
 
     async def post_market_order(self, body: dict[str, Any]) -> dict[str, Any]:
-        return await self._request("POST", f"{TRADING}/api/v2/order/market", private=True, body=body)
+        raise EvedexError(EVEDEX_NATIVE_PROTECTION_UNAVAILABLE)
 
     async def post_close(self, body: dict[str, Any]) -> dict[str, Any]:
         return await self._request(
@@ -674,9 +677,7 @@ class Evedex:
         )
 
     async def post_tpsl(self, body: dict[str, Any]) -> dict[str, Any]:
-        return await self._request(
-            "POST", f"{TRADING}/api/tpsl/{body['instrument']}", private=True, body=body
-        )
+        raise EvedexError(EVEDEX_NATIVE_PROTECTION_UNAVAILABLE)
 
     async def set_leverage(self, instrument: str, leverage: int) -> None:
         """Change the account's leverage setting for one instrument (an API-key call, not signed)."""
