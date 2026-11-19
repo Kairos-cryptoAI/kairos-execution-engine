@@ -106,6 +106,10 @@ CREATE TABLE IF NOT EXISTS effects (
     venue_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
     UNIQUE(trade_id,kind,operation_key)
 );
+CREATE TABLE IF NOT EXISTS attached_protection (
+    venue_id TEXT PRIMARY KEY NOT NULL, trade_id TEXT NOT NULL REFERENCES trades(trade_id),
+    entry_order_id TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('STOP','TAKE')), price TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS reductions (
     close_order_id TEXT PRIMARY KEY NOT NULL, trade_id TEXT NOT NULL REFERENCES trades(trade_id),
     quantity TEXT NOT NULL
@@ -715,4 +719,59 @@ class PortfolioJournal:
                 db,
                 "QUANTITY_REDUCED",
                 {"trade_id": trade_id, "order_id": close_order_id, "quantity": quantity},
+            )
+
+    def attached(self, trade_id: str) -> list[dict[str, Any]]:
+        rows = self._connection().execute(
+            "SELECT * FROM attached_protection WHERE trade_id=? ORDER BY venue_id", (trade_id,)
+        )
+        return [dict(r) for r in rows]
+
+    def record_attached(
+        self,
+        trade_id: str,
+        *,
+        entry_order_id: str,
+        venue_id: str,
+        kind: str,
+        price: Decimal,
+    ) -> None:
+        """Persist native child IDs read back from this trade's exact, acknowledged parent order."""
+        _identifier(venue_id, "protection ID")
+        px = _amount(price)
+        if kind not in {"STOP", "TAKE"} or venue_id == entry_order_id:
+            raise PortfolioJournalError("invalid attached protection")
+        with self._write() as db:
+            trade = self.trade(trade_id)
+            if (
+                not trade
+                or trade["state"] not in _OPEN
+                or not self._accepted_order(trade_id, "ENTRY", entry_order_id)
+                or Decimal(trade["stop" if kind == "STOP" else "take"]) != price
+            ):
+                raise PortfolioJournalError("attached child does not match its approved entry")
+            prior = db.execute("SELECT * FROM attached_protection WHERE venue_id=?", (venue_id,)).fetchone()
+            if prior:
+                if (prior["trade_id"], prior["entry_order_id"], prior["kind"], Decimal(prior["price"])) != (
+                    trade_id,
+                    entry_order_id,
+                    kind,
+                    price,
+                ):
+                    raise PortfolioJournalError("conflicting attachment identity")
+                return
+            db.execute(
+                "INSERT INTO attached_protection VALUES(?,?,?,?,?)",
+                (venue_id, trade_id, entry_order_id, kind, px),
+            )
+            self._event(
+                db,
+                "ATTACHED_PROTECTION_VERIFIED",
+                {
+                    "trade_id": trade_id,
+                    "entry_order_id": entry_order_id,
+                    "venue_id": venue_id,
+                    "kind": kind,
+                    "price": px,
+                },
             )

@@ -174,3 +174,19 @@ def test_stale_read_and_signed_entry_window(tmp_path):
         observation(j, deadline=deadline)
         with pytest.raises(PortfolioAdmissionRefused, match="window"):
             reserve(j)
+
+
+def test_attached_order_children_require_proven_parent_and_keep_identity(tmp_path):
+    with owner(tmp_path / "pilot.db") as j:
+        observation(j)
+        open_trade(j)
+        args = dict(entry_order_id="q0", venue_id="stop-a", kind="STOP", price=D(9))
+        j.record_attached("t0", **args)
+        j.record_attached("t0", **args)
+        assert len(j.attached("t0")) == 1
+        for unexpected in [dict(price=D(8)), dict(entry_order_id="other"), dict(kind="TAKE", price=D(11))]:
+            with pytest.raises(PortfolioJournalError):
+                j.record_attached("t0", **(args | unexpected))
+        open_trade(j, 1)
+        with pytest.raises(PortfolioJournalError):
+            j.record_attached("t1", **(args | dict(entry_order_id="q1")))
