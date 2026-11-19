@@ -1,6 +1,9 @@
 """Portfolio integration with synthetic EVEDEX and authentic Core Risk contracts; no network."""
 
 import hashlib
+import json
+import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal as D
 from types import SimpleNamespace
@@ -10,7 +13,7 @@ import pytest
 from kairos_core.contracts import RiskTradeDecisionV1
 
 from kairos_execution import portfolio_broker as portfolio
-from kairos_execution.portfolio_evedex import Book, Instrument, Position, Unknown
+from kairos_execution.portfolio_evedex import Book, Instrument, Position, Rejected, Unknown
 from kairos_execution.portfolio_journal import PortfolioJournal
 from kairos_execution.prod_universe import PROD_INSTRUMENTS, PROD_SYMBOL_MAP
 from tests.test_production_lifecycle_binding import _decision
@@ -445,3 +448,52 @@ async def test_admission_requires_current_tightened_stop_and_correct_target(syst
     with pytest.raises(portfolio.NeedsOperator, match="confirmed stop and take"):
         await s.b.prepare_admission({"BTCUSD"})
     assert len(s.v.sent) == 1
+
+
+def refused_effect(journal):
+    with closing(sqlite3.connect(journal.path.as_uri() + "?mode=ro", uri=True)) as db:
+        rows = db.execute("SELECT payload FROM events WHERE event='EFFECT_RESULT'").fetchall()
+    return next(row for (value,) in rows if (row := json.loads(value))["status"] == "REJECTED")
+
+
+@pytest.mark.parametrize("cause", ["local_deadline", "local_operator_stop"])
+async def test_refusal_after_durable_preparation_records_local_cause_without_http(system, monkeypatch, cause):
+    s = system
+    prepare = s.j.prepare_effect
+
+    def before_dispatch(**kwargs):
+        effect_id = prepare(**kwargs)
+        if kwargs["kind"] == "ENTRY":
+            if cause == "local_deadline":
+                monkeypatch.setattr(portfolio, "_now", lambda: s.risk.venue_quality.expires_at_ms + 1)
+            else:
+                s.store.state["halted"] = True
+        return effect_id
+
+    monkeypatch.setattr(s.j, "prepare_effect", before_dispatch)
+    assert await s.enter() is None and not s.v.sent
+    result = refused_effect(s.j)
+    assert result["reason"] == cause and "http_status" not in result
+    entry = next(e for e in s.j.effects(s.risk.trade_id) if e["kind"] == "ENTRY")
+    assert entry["request"]["venue_checked_at_ms"] < entry["request"]["expires_at_ms"]
+
+
+@pytest.mark.parametrize(
+    ("label", "reason"),
+    [
+        ("invalid_signature_error", "venue_invalid_signature"),
+        ("unreviewed_sensitive_response_value", "venue_other"),
+    ],
+)
+async def test_http_refusal_records_safe_reason_without_venue_response(system, monkeypatch, label, reason):
+    s = system
+
+    async def reject(body):
+        s.v.sent.append(body)
+        raise Rejected("refused", status=422, body=json.dumps({"label": label, "detail": "private-response"}))
+
+    monkeypatch.setattr(s.v, "post_limit_order", reject)
+    assert await s.enter() is None and len(s.v.sent) == 1
+    row = refused_effect(s.j)
+    assert row["reason"] == reason and row["http_status"] == 422
+    assert "private-response" not in str(row) and label not in row.values()

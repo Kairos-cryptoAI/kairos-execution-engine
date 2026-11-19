@@ -27,7 +27,7 @@ from .portfolio_evedex import (
     new_order_id,
     plain,
 )
-from .portfolio_journal import PortfolioAdmissionRefused, PortfolioJournal
+from .portfolio_journal import PortfolioAdmissionRefused, PortfolioJournal, RefusalReason
 from .portfolio_performance import observe_pilot
 from .portfolio_profile import PortfolioProfile, verify_profile
 from .prod_universe import PROD_SYMBOL_MAP
@@ -62,6 +62,17 @@ def wrong_protection_side(exc: Rejected) -> bool:
         bool(re.fullmatch(r"(stop_loss|take_profit)_price_(above|below)_(last|order)_price_error", exc.label))
         or "price should be" in exc.body.lower()
     )
+
+
+def _venue_refusal(exc: Rejected) -> RefusalReason:
+    # The response body can contain a request or account details. Only publish reviewed categories.
+    if exc.label == "invalid_signature_error":
+        return RefusalReason.SIGNING
+    if exc.label == "invalid_order_leverage_error":
+        return RefusalReason.LEVERAGE
+    if wrong_protection_side(exc):
+        return RefusalReason.PROTECTION_PRICE
+    return RefusalReason.OTHER
 
 
 def _side(trade: dict) -> str:
@@ -470,6 +481,14 @@ class PortfolioBroker:
             await self._close_quantity(item, current, current.quantity, origin="unknown")
         return False
 
+    def _dispatch_refusal(self, expires_ms: int | None, now_ms: int) -> RefusalReason | None:
+        if expires_ms is not None:
+            if now_ms >= expires_ms:
+                return RefusalReason.DEADLINE
+            if self._entry_stopped():
+                return RefusalReason.OPERATOR
+        return None
+
     async def _effect(
         self,
         item: dict,
@@ -484,16 +503,21 @@ class PortfolioBroker:
         venue_now: Callable[[], int] = _now,
     ) -> Any:
         await self._identity()
-        if expires_ms is not None and (venue_now() >= expires_ms or self._entry_stopped()):
-            self._journal.release_refused(item["trade_id"])
-            raise EntryExpired("entry deadline or operator stop before dispatch")
+        checked_at = venue_now()
+        reason = self._dispatch_refusal(expires_ms, checked_at)
+        if reason is not None:
+            self._journal.release_refused(item["trade_id"], reason=reason)
+            raise EntryExpired(reason.value)
+        if expires_ms is not None:
+            request = {**request, "expires_at_ms": expires_ms, "venue_checked_at_ms": checked_at}
         eid = self._journal.prepare_effect(
             trade_id=item["trade_id"], kind=kind, operation_key=key, request=request
         )
-        if expires_ms is not None and (venue_now() >= expires_ms or self._entry_stopped()):
-            self._journal.finish_effect(eid, "REJECTED")
-            self._journal.release_refused(item["trade_id"])
-            raise EntryExpired("entry expired while recording the venue request")
+        reason = self._dispatch_refusal(expires_ms, venue_now())
+        if reason is not None:
+            self._journal.finish_effect(eid, "REJECTED", refusal=reason)
+            self._journal.release_refused(item["trade_id"], reason=reason)
+            raise EntryExpired(reason.value)
         try:
             response = await call()
             venue_id = expected_id
@@ -501,8 +525,8 @@ class PortfolioBroker:
                 venue_id = response.get("id") if isinstance(response, dict) else None
                 if not isinstance(venue_id, str) or not venue_id or (expected_id and venue_id != expected_id):
                     raise NeedsOperator("venue did not acknowledge the exact request identity")
-        except Rejected:
-            self._journal.finish_effect(eid, "REJECTED")
+        except Rejected as exc:
+            self._journal.finish_effect(eid, "REJECTED", refusal=_venue_refusal(exc), http_status=exc.status)
             raise
         except BaseException:
             self._journal.finish_effect(eid, "UNKNOWN", expected_id)
@@ -654,7 +678,7 @@ class PortfolioBroker:
                 int(self._profile.entry_deadline_utc.timestamp() * 1000),
             )
             if venue_now() >= deadline_ms:
-                self._journal.release_refused(decision.trade_id)
+                self._journal.release_refused(decision.trade_id, reason=RefusalReason.DEADLINE)
                 return None
             order_id = new_order_id()
             attached = [

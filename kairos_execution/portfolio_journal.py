@@ -15,6 +15,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,32 @@ class PortfolioJournalError(RuntimeError):
 
 class PortfolioAdmissionRefused(PortfolioJournalError):
     """A known pre-dispatch portfolio limit prevented opening a new position."""
+
+
+class RefusalReason(StrEnum):
+    DEADLINE = "local_deadline"
+    OPERATOR = "local_operator_stop"
+    SIGNING = "venue_invalid_signature"
+    LEVERAGE = "venue_invalid_leverage"
+    PROTECTION_PRICE = "venue_protection_price"
+    OTHER = "venue_other"
+
+
+def _refusal_fields(reason: RefusalReason | None, http_status: int | None = None) -> dict[str, Any]:
+    if reason is None and http_status is None:
+        return {}
+    if not isinstance(reason, RefusalReason):
+        raise PortfolioJournalError("unsupported refusal classification")
+    data: dict[str, Any] = {"reason": reason.value}
+    if http_status is not None:
+        if (
+            reason in {RefusalReason.DEADLINE, RefusalReason.OPERATOR}
+            or type(http_status) is not int
+            or not 400 <= http_status < 500
+        ):
+            raise PortfolioJournalError("invalid venue refusal HTTP status")
+        data["http_status"] = http_status
+    return data
 
 
 def _timestamp() -> str:
@@ -436,8 +463,19 @@ class PortfolioJournal:
             )
         return effect_id
 
-    def finish_effect(self, effect_id: str, status: str, venue_id: str | None = None) -> None:
+    def finish_effect(
+        self,
+        effect_id: str,
+        status: str,
+        venue_id: str | None = None,
+        *,
+        refusal: RefusalReason | None = None,
+        http_status: int | None = None,
+    ) -> None:
         status = status.upper()
+        diagnostics = _refusal_fields(refusal, http_status)
+        if diagnostics and status != "REJECTED":
+            raise PortfolioJournalError("refusal details require a rejected effect")
         if status not in {"ACCEPTED", "REJECTED", "UNKNOWN"}:
             raise PortfolioJournalError("unknown venue disposition")
         if venue_id is not None:
@@ -463,7 +501,11 @@ class PortfolioJournal:
                 "UPDATE effects SET status=?,venue_id=?,updated_at=? WHERE effect_id=?",
                 (status, venue_id, _timestamp(), effect_id),
             )
-            self._event(db, "EFFECT_RESULT", {"effect_id": effect_id, "status": status, "venue_id": venue_id})
+            self._event(
+                db,
+                "EFFECT_RESULT",
+                {"effect_id": effect_id, "status": status, "venue_id": venue_id, **diagnostics},
+            )
 
     def opened(self, trade_id: str, *, entry_order_id: str, quantity: Decimal, price: Decimal) -> None:
         _identifier(entry_order_id, "entry order ID")
@@ -495,7 +537,8 @@ class PortfolioJournal:
                 {"trade_id": trade_id, "order_id": entry_order_id, "quantity": qty, "price": px},
             )
 
-    def release_refused(self, trade_id: str) -> None:
+    def release_refused(self, trade_id: str, *, reason: RefusalReason | None = None) -> None:
+        diagnostics = _refusal_fields(reason)
         with self._write() as db:
             trade = self.trade(trade_id)
             if (
@@ -511,7 +554,7 @@ class PortfolioJournal:
             db.execute(
                 "UPDATE trades SET state='REFUSED',finished_at=? WHERE trade_id=?", (_timestamp(), trade_id)
             )
-            self._event(db, "ENTRY_REFUSED", {"trade_id": trade_id})
+            self._event(db, "ENTRY_REFUSED", {"trade_id": trade_id, **diagnostics})
 
     def closed(
         self,
