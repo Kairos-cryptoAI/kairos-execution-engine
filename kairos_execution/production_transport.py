@@ -990,6 +990,8 @@ class ProductionEvedexSdkClient:
         wire_token: _WireToken | None = None,
     ) -> dict[str, Any]:
         operation, _ = _validate_signed_post(method, path, body)
+        if operation == "/api/v2/order/market" and type(wire_token) is not _WireToken:
+            raise ProductionTransportError("market IPC requires one-use wire authorization")
         if operation != "close":
             raise ProductionTransportError(EVEDEX_NATIVE_PROTECTION_UNAVAILABLE)
         _market_deadline_ms(path, expires_at)
