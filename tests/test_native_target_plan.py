@@ -124,6 +124,98 @@ async def test_resting_ladder_restores_each_fill_once_and_keeps_full_stop(
         await s.b.partial_close(trade, await s.v.book("BTCUSD"), D(".01"))
 
 
+@pytest.mark.parametrize(
+    "side,kind,linked,restart",
+    [
+        ("LONG", "take-profit", True, False),
+        ("SHORT", "stop-loss", True, False),
+        ("SHORT", "stop-loss", False, False),
+        ("SHORT", "stop-loss", True, True),
+    ],
+)
+async def test_bracket_closes_before_first_position_read(
+    system, position_projection, monkeypatch, side, kind, linked, restart
+):
+    s = system
+    await s.b.reconcile_start([], None)
+    buy = side == "LONG"
+    entry_side, exit_side = ("BUY", "SELL") if buy else ("SELL", "BUY")
+    stop, take = (D(95), D(105)) if buy else (D(105), D(95))
+    s.j.reserve_entry(
+        trade_id="fast",
+        decision_id="decision",
+        symbol="BTCUSD",
+        side=side,
+        quantity=D(".1"),
+        leverage=1,
+        stop=stop,
+        take=take,
+        worst_case_loss=D(".1"),
+        notional=D(10),
+        equity=D(100),
+    )
+    eid = s.j.prepare_effect(
+        trade_id="fast",
+        kind="ENTRY",
+        operation_key="enter",
+        request={"id": "entry", "price": "100", "partial_targets": partial_target_spec(TARGETS, TICK)},
+    )
+    s.j.finish_effect(eid, "ACCEPTED", "entry")
+    s.v.records["entry"] = dict(
+        id="entry",
+        instrument="BTCUSD",
+        side=entry_side,
+        status="FILLED",
+        type="LIMIT",
+        limitPrice="100",
+        quantity=".1",
+        unFilledQuantity="0",
+        filledAvgPrice="100",
+    )
+    s.v.records["exit"] = dict(
+        id="exit",
+        instrument="BTCUSD",
+        side=exit_side,
+        status="FILLED",
+        type="MARKET",
+        group=kind,
+        hasOpenedPosition=False,
+        quantity=".1",
+        unFilledQuantity="0",
+        filledAvgPrice="105.01",
+    )
+
+    async def terminal(symbol, key):
+        assert symbol == "BTCUSD" and key == "exit"
+        return {
+            "id": key,
+            "instrument": symbol,
+            "side": exit_side,
+            "status": "done",
+            "price": "105",
+            "quantity": "0",
+            "triggeredQuantity": ".1",
+            "type": kind,
+            "triggerOrder": "entry" if linked else "other-entry",
+        }
+
+    monkeypatch.setattr(s.v, "protection_for_fill", terminal, raising=False)
+    if restart:
+        s.j.opened("fast", entry_order_id="entry", quantity=D(".1"), price=D(100))
+        await s.b.reconcile_start([], None)
+        assert s.j.trade("fast")["exit_origin"] == "system" and not s.j.active_trades()
+    elif linked:
+        fill = await s.b._confirm_entry(s.j.trade("fast"), "entry", D(100))
+        assert fill["closed_at_entry"] == ("TAKE" if buy else "STOP")
+        assert fill["exit_price"] == D("105.01") and not s.j.active_trades()
+        assert s.j.trade("fast")["exit_origin"] == "system" and s.j.native_target_plan("fast") is None
+    else:
+        with pytest.raises(NeedsOperator):
+            await s.b._confirm_entry(s.j.trade("fast"), "entry", D(100))
+        assert s.j.trade("fast")["state"] == "RESERVED"
+    assert not s.v.sent and not s.v.tpsl and not s.v.held
+
+
 def test_small_fill_never_overallocates_native_targets():
     spec = partial_target_spec(TARGETS, TICK)
     assert sized_targets(spec, "LONG", D(100), D(95), D(105), D(".001")) == []

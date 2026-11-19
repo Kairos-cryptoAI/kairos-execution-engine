@@ -742,6 +742,9 @@ class PortfolioBroker:
         position = await self._owned_position(item)
         if position:
             await self._close_quantity(item, position, position.quantity, origin="unknown")
+        elif await self._completed_entry_bracket(item, order, filled, dec(item["price"])):
+            # A process exit between recording the entry and its proven native close is recoverable.
+            return
         await self.settle(
             {
                 "id": order_id,
@@ -1114,6 +1117,126 @@ class PortfolioBroker:
             raise NeedsOperator("entry has an inconsistent status or remaining quantity")
         return status, supplied - remaining
 
+    async def _completed_entry_bracket(
+        self, item: dict, record: dict, filled: Decimal, avg: Decimal
+    ) -> dict[str, Any] | None:
+        """An attached full bracket can close the position before the first open-position read."""
+        symbol, order_id = item["symbol"], item["entry_order_id"]
+        versions = record.get("positionVersions")
+        if not (
+            isinstance(versions, list)
+            and len(versions) == 1
+            and type(versions[0]) is int
+            and versions[0] >= 0
+            and str(record.get("user", "")) == self._profile.remote_account_id
+            and avg > 0
+            and hasattr(self._api, "protection_for_fill")
+        ):
+            return None
+        version = versions[0]
+
+        async def observation():
+            if not await self._api.position_version_closed(symbol, version):
+                return None
+            rows, flat, active = await asyncio.gather(
+                self._api.position_version_orders(symbol, version),
+                self._flat_without_resting_order(symbol),
+                self._api.active_tpsl(symbol),
+            )
+            if not flat or active or len(rows) != 2:
+                return None
+            entry = next((r for r in rows if r.get("id") == order_id), None)
+            child = next((r for r in rows if r.get("id") and r["id"] != order_id), None)
+            if not entry or not child or child.get("group") not in {"stop-loss", "take-profit"}:
+                return None
+            if any(
+                str(r.get("user")) != self._profile.remote_account_id or r.get("instrument") != symbol
+                for r in rows
+            ):
+                return None
+            if any(
+                record.get(k) != entry.get(k)
+                for k in ("side", "status", "quantity", "unFilledQuantity", "filledAvgPrice")
+            ):
+                return None
+            detail, trigger = await asyncio.gather(
+                self._api.order(child["id"]),
+                self._api.protection_for_fill(symbol, child["id"]),
+            )
+            if not detail or not trigger:
+                return None
+            kind = child["group"]
+            px = dec(item["stop"] if kind == "stop-loss" else item["take"])
+            if not (
+                detail.get("id") == child["id"]
+                and str(detail.get("user")) == self._profile.remote_account_id
+                and detail.get("instrument") == symbol
+                and detail.get("positionVersions") == [version]
+                and detail.get("side") == _exit_side(item)
+                and detail.get("status") == "FILLED"
+                and detail.get("hasOpenedPosition") is False
+                and detail.get("group") == kind
+                and dec(detail["quantity"]) == filled
+                and dec(detail["unFilledQuantity"]) == 0
+                and dec(detail["filledAvgPrice"]) > 0
+                and all(
+                    detail.get(k) == child.get(k)
+                    for k in ("side", "status", "quantity", "unFilledQuantity", "filledAvgPrice")
+                )
+                and trigger.get("status") == "done"
+                and trigger.get("instrument") == symbol
+                and trigger.get("side") == _exit_side(item)
+                and trigger.get("type") == kind
+                and dec(trigger["price"]) == px
+                and dec(trigger["quantity"]) == 0
+                and dec(trigger["triggeredQuantity"]) == filled
+                and (trigger.get("id") == child["id"] or trigger.get("triggerOrder") == child["id"])
+                and trigger.get("order") in (None, order_id)
+                and trigger.get("triggerOrder") in (None, order_id, child["id"])
+            ):
+                return None
+            if order_id not in (trigger.get("triggerOrder"), trigger.get("order")):
+                parent = await self._api.order_with_protections(symbol, order_id)
+                if not (
+                    parent
+                    and parent.get("id") == order_id
+                    and str(parent.get("user")) == self._profile.remote_account_id
+                    and any(
+                        r.get("id") == trigger["id"]
+                        and r.get("type") == kind
+                        and r.get("side") == _exit_side(item)
+                        and row_price(r) == px
+                        and dec(r["quantity"]) == 0
+                        for r in parent.get("tpslList", [])
+                    )
+                ):
+                    return None
+            return trigger["id"], child["id"], kind, dec(detail["filledAvgPrice"])
+
+        first = await observation()
+        if first is None or first != await observation():
+            return None
+        self._journal.opened(item["trade_id"], entry_order_id=order_id, quantity=filled, price=avg)
+        self._journal.closed(item["trade_id"], exit_origin="system")
+        self._position_entries.pop(order_id, None)
+        self._store.journal(
+            "portfolio_bracket_completed_at_entry",
+            trade_id=item["trade_id"],
+            symbol=symbol,
+            generation=version,
+            exit_trigger_id=first[0],
+            exit_order_id=first[1],
+        )
+        return {
+            "order_id": order_id,
+            "trade_id": item["trade_id"],
+            "price": avg,
+            "quantity": filled,
+            "protected": True,
+            "closed_at_entry": "STOP" if first[2] == "stop-loss" else "TAKE",
+            "exit_price": first[3],
+        }
+
     async def _confirm_entry(self, item: dict, order_id: str, price: Decimal) -> dict[str, Any] | None:
         trade_id, symbol = item["trade_id"], item["symbol"]
         item = {**item, "entry_order_id": order_id}
@@ -1166,6 +1289,8 @@ class PortfolioBroker:
                 self._journal.no_fill(trade_id, entry_order_id=order_id)
                 return None
             avg = dec(record.get("filledAvgPrice"))
+            if pos is None and (completed := await self._completed_entry_bracket(item, record, filled, avg)):
+                return completed
             if (
                 pos is None
                 or pos.side != _side(item)
@@ -1194,6 +1319,8 @@ class PortfolioBroker:
                 protected = False
                 failure = str(exc)
             except PositionIdentityError:
+                if completed := await self._completed_entry_bracket(item, record, filled, avg):
+                    return completed
                 raise
             except (EvedexError, ValueError, ArithmeticError, RuntimeError):
                 protected = False
@@ -1216,11 +1343,15 @@ class PortfolioBroker:
                     ):
                         self._journal.closed(trade_id, exit_origin="system")
                         self._position_entries.pop(order_id, None)
+                elif completed := await self._completed_entry_bracket(item, record, filled, avg):
+                    return completed
                 raise NeedsOperator(failure)
             if spec := entry["request"].get("partial_targets"):
                 try:
                     await self._place_native_targets(item, pos, spec)
                 except (EvedexError, ValueError, ArithmeticError) as exc:
+                    if completed := await self._completed_entry_bracket(item, record, filled, avg):
+                        return completed
                     raise ProtectionEvidenceError("native partial target plan needs reconciliation") from exc
             return {
                 "quantity": filled,
