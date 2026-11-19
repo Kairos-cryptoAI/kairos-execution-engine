@@ -95,7 +95,7 @@ jobs:
         run: |
           uv sync --locked --extra evedex
           uv run --locked --extra evedex python -c "import eth_account, coincurve; from tests.test_managed_sdk_schema import PINNED_SDK_AVAILABLE; assert PINNED_SDK_AVAILABLE"
-          uv run --locked --extra evedex pytest -q tests/test_managed_sdk_schema.py
+          uv run --locked --extra evedex pytest -q tests/test_managed_sdk_schema.py tests/test_portfolio_broker.py
 
   optional-adapters:
     name: All exchange adapters
