@@ -7,6 +7,25 @@ import json
 from kairos_execution import production_session_cli as cli
 
 
+def test_production_entry_refused_before_database_or_custody_access(tmp_path, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text("{}", encoding="utf-8")
+    config = SimpleNamespace(limits={}, settings=settings_file)
+    settings = SimpleNamespace(expected_health=SimpleNamespace(exchange_url=cli.PROD_EXCHANGE_ORIGIN))
+    monkeypatch.setattr(cli, "candidate_limits", lambda limits, candidate: object())
+    monkeypatch.setattr(cli.ProductionLifecycleConfigV1, "model_validate_json", lambda data: settings)
+
+    answer = asyncio.run(cli.run(config, object()))
+    assert answer == {
+        "outcome": "REFUSED",
+        "trade_id": None,
+        "detail": cli.EVEDEX_NATIVE_PROTECTION_UNAVAILABLE,
+    }
+
+
 def test_bad_config_is_refused_with_one_json_line_and_exit_code_2(tmp_path, capsys):
     config = tmp_path / "session.json"
     config.write_text(json.dumps({"manifest": "x"}), encoding="utf-8")
