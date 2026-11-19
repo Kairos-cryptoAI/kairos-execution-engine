@@ -49,6 +49,18 @@ class ProtectionEvidenceError(NeedsOperator):
     """A fixed, non-sensitive reason the venue did not establish protection ownership."""
 
 
+class PositionIdentityError(NeedsOperator):
+    """The current exposure cannot be reduced on the original entry's authority."""
+
+
+class _PositionCover(dict[str, Any]):
+    """One read's corroborated position-level cover. It conveys no mutation authority."""
+
+    def __init__(self, trade_id: str, row: dict[str, Any]):
+        super().__init__(row)
+        self.trade_id = trade_id
+
+
 def account_id_for(wallet_address: str) -> str:
     return "evedex-prod-" + hashlib.sha256(wallet_address.lower().encode()).hexdigest()[:20]
 
@@ -124,6 +136,9 @@ class PortfolioBroker:
         self._admission_observed_at = 0.0
         self._settle_seconds = settle_seconds
         self._lock = asyncio.Lock()
+        # Only immutable terminal entry facts are cached. Active children, the live position,
+        # generation fills and closure are checked on every use of position-level cover.
+        self._position_entries: dict[str, tuple[int, Decimal, Decimal, str]] = {}
 
     def pilot_status(self) -> dict[str, Any] | None:
         return self._journal.pilot_status()
@@ -251,11 +266,19 @@ class PortfolioBroker:
             for e in self._journal.effects(item["trade_id"])
         )
 
-    async def _protection_rows(self, item: dict) -> list[dict[str, Any]]:
-        rows = await self._api.active_tpsl(item["symbol"])
+    async def _protection_rows(
+        self, item: dict, rows: list[dict[str, Any]] | None = None, position: Position | None = None
+    ) -> list[dict[str, Any]]:
+        if rows is None:
+            rows = await self._api.active_tpsl(item["symbol"])
         if all(r.get("order") or self._owned_protection(item, r) for r in rows):
             return rows
-        await self._bind_attached(item, rows)
+        if item.get("entry_order_id") in self._position_entries:
+            observed, diagnostic = await self._position_cover(item, rows, position)
+            if not diagnostic:
+                return observed
+        parent = await self._api.order_with_protections(item["symbol"], item["entry_order_id"])
+        empty_parent = self._bind_attached(item, rows, parent)
         if all(self._owned_protection(item, r) for r in rows):
             return rows
 
@@ -279,28 +302,50 @@ class PortfolioBroker:
             )
 
         if active_pair(rows):
+            if empty_parent:
+                observed, diagnostic = await self._position_cover(item, rows, position)
+                if not diagnostic:
+                    return observed
+                if diagnostic not in {
+                    "protection parent is empty and the position lists no protection IDs",
+                    "position and active API protection IDs differ or are ambiguous",
+                }:
+                    raise ProtectionEvidenceError(diagnostic)
             original_ids = {r["id"] for r in rows}
             try:
                 async with asyncio.timeout(1):
                     await asyncio.sleep(min(self._settle_seconds, 0.1))
-                    refreshed = await self._api.active_tpsl(item["symbol"])
+                    refreshed, parent, fresh_position = await asyncio.gather(
+                        self._api.active_tpsl(item["symbol"]),
+                        self._api.order_with_protections(item["symbol"], item["entry_order_id"]),
+                        self.position(item["symbol"]),
+                    )
                     if not active_pair(refreshed) or {r["id"] for r in refreshed} != original_ids:
                         raise ProtectionEvidenceError(
                             "active protection pair changed during ownership verification"
                         )
-                    await self._bind_attached(item, refreshed)
+                    empty_parent = self._bind_attached(item, refreshed, parent)
                     rows = refreshed
+                    if empty_parent and any(not self._owned_protection(item, r) for r in rows):
+                        observed, diagnostic = await self._position_cover(item, rows, fresh_position)
+                        if diagnostic:
+                            raise ProtectionEvidenceError(diagnostic)
+                        return observed
             except TimeoutError as exc:
                 raise ProtectionEvidenceError("parent protection evidence refresh timed out") from exc
+        if empty_parent and any(not self._owned_protection(item, r) for r in rows):
+            observed, diagnostic = await self._position_cover(item, rows)
+            if diagnostic:
+                raise ProtectionEvidenceError(diagnostic)
+            return observed
         if any(not self._owned_protection(item, r) for r in rows):
             raise ProtectionEvidenceError("venue did not link active protection IDs to the owned entry")
         return rows
 
-    async def _bind_attached(self, item: dict, rows: list[dict[str, Any]]) -> None:
+    def _bind_attached(self, item: dict, rows: list[dict[str, Any]], parent: dict | None) -> bool:
         order_id = item["entry_order_id"]
-        parent = await self._api.order_with_protections(item["symbol"], order_id)
         if parent is None:
-            return
+            return False
         if str(parent.get("user", "")) != self._profile.remote_account_id:
             raise ProtectionEvidenceError("protection parent does not belong to the authenticated account")
         entry = next(
@@ -342,10 +387,161 @@ class PortfolioBroker:
                     kind="STOP" if kind == "stop-loss" else "TAKE",
                     price=px,
                 )
+        return not children
+
+    async def _position_cover(
+        self, item: dict, rows: list[dict[str, Any]], position: Position | None = None
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        """Confirm coverage on the authenticated, currently owned position, never authorship."""
+        if all(self._owned_protection(item, row) for row in rows):
+            return rows, None
+        if item["state"] != "OPEN":
+            return rows, "position-level protection requires a reconciled terminal entry fill"
+        position = position or await self.position(item["symbol"])
+        if position is not None and position.venue_id is None and position.user is None:
+            return rows, "protection parent is empty and the position lists no protection IDs"
+        if (
+            position is None
+            or not self._match_position(item, position)
+            or position.user != self._profile.remote_account_id
+            or not isinstance(position.venue_id, str)
+            or not position.venue_id
+        ):
+            raise PositionIdentityError(
+                "protection parent is empty and the authenticated open position does not match"
+            )
+        if not position.protections:
+            return rows, "protection parent is empty and the position lists no protection IDs"
+        children = {c.get("id"): c for c in position.protections if isinstance(c.get("id"), str) and c["id"]}
+        active_ids = {r.get("id") for r in rows}
+        if (
+            len(children) != len(position.protections)
+            or len(active_ids) != len(rows)
+            or set(children) != active_ids
+        ):
+            return rows, "position and active API protection IDs differ or are ambiguous"
+        covered: list[dict[str, Any]] = []
+        initial = {"stop-loss": dec(item["stop"]), "take-profit": dec(item["take"])}
+        for row in rows:
+            child = children[row["id"]]
+            kind = row.get("type")
+            if self._owned_protection(item, row):
+                covered.append(row)
+            elif (
+                kind in initial
+                and sum(r.get("type") == kind and row_price(r) == initial[kind] for r in rows) == 1
+                and all(
+                    r.get("instrument") == item["symbol"]
+                    and r.get("type") == kind
+                    and r.get("side") == _side(item)
+                    and r.get("status") == "active"
+                    and r.get("order") in (None, item["entry_order_id"])
+                    and not r.get("triggerOrder")
+                    and dec(r.get("quantity")) == 0
+                    and row_price(r) == initial[kind]
+                    for r in (row, child)
+                )
+            ):
+                covered.append(_PositionCover(item["trade_id"], row))
+            else:
+                return rows, "position protection does not match the initial full-size active pair"
+        stop = self._tightest_stop(item)
+        if not (
+            any(self._valid_protection(item, r, "stop-loss", stop) for r in covered)
+            and any(self._valid_protection(item, r, "take-profit", initial["take-profit"]) for r in covered)
+        ):
+            return rows, "position lacks the complete active stop and take at the entry levels"
+        await self._require_position_generation(item, position)
+        return covered, None
+
+    async def _require_position_generation(self, item: dict, position: Position) -> None:
+        if (
+            not self._match_position(item, position)
+            or not position.venue_id
+            or position.user != self._profile.remote_account_id
+        ):
+            raise PositionIdentityError("authenticated position identity does not match the owned fill")
+        effects = self._journal.effects(item["trade_id"])
+        entry = next(
+            e
+            for e in effects
+            if e["kind"] == "ENTRY" and e["status"] == "ACCEPTED" and e["venue_id"] == item["entry_order_id"]
+        )
+        key = item["entry_order_id"]
+        cached = self._position_entries.get(key)
+        if cached is None:
+            detail = await self._api.order(key)
+            status, filled = self._entry_record(detail, item, key, dec(entry["request"]["price"]))
+            versions = detail.get("positionVersions") if detail else None
+            if (
+                not detail
+                or str(detail.get("user", "")) != position.user
+                or status not in TERMINAL
+                or not isinstance(versions, list)
+                or len(versions) != 1
+                or type(versions[0]) is not int
+                or versions[0] < 0
+            ):
+                raise PositionIdentityError("entry does not identify a unique matching position generation")
+            cached = (versions[0], filled, dec(detail.get("filledAvgPrice")), position.venue_id)
+        version, filled, average, venue_id = cached
+        if venue_id != position.venue_id or filled < position.quantity or average != position.avg_price:
+            raise PositionIdentityError("entry does not identify a unique matching position generation")
+        closed, orders = await asyncio.gather(
+            self._api.position_version_closed(item["symbol"], version),
+            self._api.position_version_orders(item["symbol"], version),
+        )
+        if closed:
+            raise PositionIdentityError("entry position generation is already closed")
+        # Prove that only our entry and acknowledged reductions compose this generation.
+        # The live position has no version field, and its current economics alone can repeat.
+        reductions = {
+            e["venue_id"]: dec(e["request"]["quantity"])
+            for e in effects
+            if e["status"] == "ACCEPTED" and e["kind"] == "PARTIAL_CLOSE"
+        }
+        expected_fills = {item["entry_order_id"]: filled, **reductions}
+        actual_fills = {}
+        seen_orders: set[str] = set()
+        for order in orders:
+            key = order.get("id")
+            if (
+                not isinstance(key, str)
+                or not key
+                or key in seen_orders
+                or order.get("instrument") != item["symbol"]
+                or str(order.get("user", "")) != position.user
+            ):
+                raise PositionIdentityError("position generation order list is ambiguous")
+            seen_orders.add(key)
+            amount = dec(order.get("quantity")) - dec(order.get("unFilledQuantity"))
+            if key == item["entry_order_id"]:
+                self._entry_record(order, item, key, dec(entry["request"]["price"]))
+                if dec(order.get("filledAvgPrice")) != average:
+                    raise PositionIdentityError(
+                        "generation entry average price conflicts with its exact fill"
+                    )
+            if key in reductions and (
+                order.get("side") != ("SELL" if _side(item) == "BUY" else "BUY")
+                or str(order.get("status", "")).upper() != "FILLED"
+            ):
+                raise PositionIdentityError("generation reduction conflicts with its acknowledged fill")
+            if amount != 0:
+                actual_fills[key] = amount
+        if actual_fills != expected_fills or filled - sum(reductions.values()) != position.quantity:
+            raise PositionIdentityError(
+                "position generation contains fills outside the owned entry and reductions"
+            )
+        self._position_entries[item["entry_order_id"]] = cached
+
+    def _usable_protection(self, item: dict, row: dict) -> bool:
+        return (
+            isinstance(row, _PositionCover) and row.trade_id == item["trade_id"]
+        ) or self._owned_protection(item, row)
 
     def _valid_protection(self, item: dict, row: dict, kind: str, price: Decimal) -> bool:
         return (
-            self._owned_protection(item, row)
+            self._usable_protection(item, row)
             and row["type"] == kind
             and row.get("side") == _side(item)
             and row_price(row) == price
@@ -385,18 +581,34 @@ class PortfolioBroker:
         # Entries fill immediately or their known GTC remainder is cancelled before admitting another.
         if open_orders:
             issues.append("an unclosed entry or foreign order is resting")
-        for row in protections:
-            item = tracked.get(row.get("instrument", ""))
-            if not item or not self._owned_protection(item, row):
+        projected = []
+        for symbol in {r.get("instrument") for r in protections}:
+            scope = [r for r in protections if r.get("instrument") == symbol]
+            item = tracked.get(symbol)
+            if item and symbol in seen and any(not self._owned_protection(item, r) for r in scope):
+                try:
+                    scope = await self._protection_rows(
+                        item, scope, next(p for p in positions if p.instrument == symbol)
+                    )
+                except ProtectionEvidenceError as exc:
+                    issues.append(str(exc))
+            if not item or any(not self._usable_protection(item, r) for r in scope):
                 issues.append("unowned venue protection")
+            projected.extend(scope)
         if check_protected:
             for symbol, item in tracked.items():
                 stop = self._tightest_stop(item)
                 if (
                     symbol not in seen
-                    or not any(self._valid_protection(item, r, "stop-loss", stop) for r in protections)
                     or not any(
-                        self._valid_protection(item, r, "take-profit", dec(item["take"])) for r in protections
+                        self._valid_protection(item, r, "stop-loss", stop)
+                        for r in projected
+                        if r.get("instrument") == symbol
+                    )
+                    or not any(
+                        self._valid_protection(item, r, "take-profit", dec(item["take"]))
+                        for r in projected
+                        if r.get("instrument") == symbol
                     )
                 ):
                     issues.append(f"{symbol} awaits its confirmed stop and take or flatness reconciliation")
@@ -465,7 +677,7 @@ class PortfolioBroker:
         pending = await self._api.open_orders()
         protections = await self._protection_rows(item)
         if any(r.get("instrument") == symbol for r in pending) or any(
-            not self._owned_protection(item, r) for r in protections
+            not self._usable_protection(item, r) for r in protections
         ):
             raise NeedsOperator("orphan shares its instrument with an unowned order")
         position = await self._owned_position(item)
@@ -511,8 +723,8 @@ class PortfolioBroker:
 
     async def _maintain_protection(self, item: dict, trade: dict, position: Position) -> bool:
         stop = self._tightest_stop(item, dec(trade["stop"]))
-        rows = await self._protection_rows(item)
-        if any(not self._owned_protection(item, r) for r in rows):
+        rows = await self._protection_rows(item, position=position)
+        if any(not self._usable_protection(item, r) for r in rows):
             raise NeedsOperator("foreign protection shares a managed instrument")
         try:
             protected = await self._ensure_price(item, "stop-loss", stop, rows) and await self._ensure_price(
@@ -821,7 +1033,12 @@ class PortfolioBroker:
                         if filled:
                             pos = await self.position(symbol)
                             if pos and pos.side == _side(item) and pos.quantity == filled:
-                                await self._ensure_entry_protection(item)
+                                try:
+                                    await self._ensure_entry_protection(item)
+                                except ProtectionEvidenceError:
+                                    # Position-only cover is not accepted for an unsettled GTC.
+                                    # Cancel its remainder now and prove or close the terminal fill below.
+                                    pass
                     finally:
                         # Even on a protection observation failure, stop the exact GTC remainder.
                         try:
@@ -870,11 +1087,13 @@ class PortfolioBroker:
                 protected = (
                     avg * filled <= self._profile.max_notional_usd
                     and within_plan
-                    and await self._ensure_entry_protection(item)
+                    and await self._ensure_entry_protection(item, position=pos)
                 )
             except ProtectionEvidenceError as exc:
                 protected = False
                 failure = str(exc)
+            except PositionIdentityError:
+                raise
             except (EvedexError, ValueError, ArithmeticError, RuntimeError):
                 protected = False
             if not protected:
@@ -891,20 +1110,37 @@ class PortfolioBroker:
             }
         raise NeedsOperator("entry outcome needs order-specific reconciliation")
 
-    async def _ensure_entry_protection(self, item: dict) -> bool:
+    async def _ensure_entry_protection(self, item: dict, *, position: Position | None = None) -> bool:
         # Attached and separately placed protection must refer to the same entry.
-        return await self._ensure_price(item, "stop-loss", dec(item["stop"])) and await self._ensure_price(
-            item, "take-profit", dec(item["take"])
-        )
+        rows = await self._protection_rows(item, position=position)
+        if all(self._usable_protection(item, r) for r in rows) and all(
+            any(self._valid_protection(item, r, kind, price) for r in rows)
+            for kind, price in (("stop-loss", dec(item["stop"])), ("take-profit", dec(item["take"])))
+        ):
+            return True
+        return await self._ensure_price(
+            item, "stop-loss", dec(item["stop"]), rows
+        ) and await self._ensure_price(item, "take-profit", dec(item["take"]))
 
     async def _ensure_price(
         self, item: dict, kind: str, price: Decimal, rows: list[dict[str, Any]] | None = None
     ) -> bool:
         rows = rows if rows is not None else await self._protection_rows(item)
-        if any(not self._owned_protection(item, r) for r in rows):
+        if any(not self._usable_protection(item, r) for r in rows):
             raise NeedsOperator("an unowned protection shares this instrument")
         if any(self._valid_protection(item, r, kind, price) for r in rows):
             return True
+        if item["state"] != "OPEN":
+            return False  # cancel the GTC remainder and reconcile its terminal fill first
+        current = await self._owned_position(item)
+        if current is None:
+            return False
+        if (
+            current.venue_id is not None
+            or current.user is not None
+            or item["entry_order_id"] in self._position_entries
+        ):
+            await self._require_position_generation(item, current)
         body = self._signer.tpsl(
             instrument=item["symbol"], kind=kind, side=_side(item), quantity=Decimal(0), price=price
         )
@@ -975,6 +1211,12 @@ class PortfolioBroker:
     async def _close_quantity(
         self, item: dict, pos: Position, quantity: Decimal, *, origin: str = "system"
     ) -> Decimal:
+        if (
+            pos.venue_id is not None
+            or pos.user is not None
+            or item["entry_order_id"] in self._position_entries
+        ):
+            await self._require_position_generation(item, pos)
         full = quantity == pos.quantity
         if not 0 < quantity <= pos.quantity or dec(plain(quantity)) != quantity:
             raise NeedsOperator("close quantity is outside owned exposure")
@@ -1101,6 +1343,7 @@ class PortfolioBroker:
                 if not settled:
                     raise NeedsOperator("settlement was not retained")
                 item = settled
+            self._position_entries.pop(item["entry_order_id"], None)
             return {
                 "exit_origin": item["exit_origin"],
                 "pnl_basis": item["pnl_basis"],
