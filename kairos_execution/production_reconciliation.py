@@ -637,11 +637,24 @@ class ProductionReservationReconciler:
     async def _verify_facts(facts, binding, trade, evidence) -> None:
         if not facts:
             raise ProductionReconciliationError("durable execution facts are absent")
+        if any(event.contract_version != facts[0].contract_version for event in facts):
+            raise ProductionReconciliationError("durable execution contract changed within the trade")
+        lifecycle_facts: list[Any] = []
+        for event in facts:
+            if event.event_type == "FEE_UPDATED":
+                if (
+                    event.contract_version != "trade-execution-event.v2"
+                    or not lifecycle_facts
+                    or event.lifecycle_state != lifecycle_facts[-1].lifecycle_state
+                ):
+                    raise ProductionReconciliationError("fee update changed durable lifecycle state")
+            else:
+                lifecycle_facts.append(event)
         if (
-            len(facts) != trade.state_version + 1
+            len(lifecycle_facts) != trade.state_version + 1
             or [event.event_seq for event in facts] != list(range(1, len(facts) + 1))
-            or facts[-1].lifecycle_state.value != "FLAT"
-            or facts[-1].position_quantity != 0
+            or lifecycle_facts[-1].lifecycle_state.value != "FLAT"
+            or lifecycle_facts[-1].position_quantity != 0
         ):
             raise ProductionReconciliationError("durable execution fact sequence is not complete and FLAT")
         if any(
@@ -655,7 +668,7 @@ class ProductionReservationReconciler:
             raise ProductionReconciliationError("durable execution facts conflict with trade identity")
         if not any(
             event.event_type.value in {"EXIT_FILLED", "EMERGENCY_CLOSE"} and event.filled_quantity > 0
-            for event in facts
+            for event in lifecycle_facts
         ):
             raise ProductionReconciliationError("durable execution facts lack an actual exit fill")
         if not any(
@@ -663,7 +676,7 @@ class ProductionReservationReconciler:
             and event.order_role is not None
             and event.order_role.value == "ENTRY"
             and event.filled_quantity > 0
-            for event in facts
+            for event in lifecycle_facts
         ):
             raise ProductionReconciliationError("durable execution facts lack an actual entry fill")
         if evidence.closed_quantity != evidence.entry_filled_quantity:

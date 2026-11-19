@@ -25,6 +25,8 @@ from .managed_signer import (
     PRODUCTION_SIGNING_PROFILE,
     production_signing_types,
 )
+from .prod_universe import valid_instrument_set
+from .siwe_auth import evedex_siwe_message
 
 MAX_REQUEST_BYTES = 32 * 1024
 MAX_RESPONSE_BYTES = 4096
@@ -71,7 +73,7 @@ def _regular_protected_file(path: Path) -> Path:
     return resolved
 
 
-def _assert_private_windows_acl(path: Path) -> None:
+def _assert_private_windows_acl(path: Path, *, handle: int | None = None) -> None:
     """Require the current user as owner and only user/SYSTEM DACL entries."""
     if sys.platform != "win32":
         raise LocalCustodyError("Windows ACL verification is unavailable on this platform")
@@ -92,6 +94,8 @@ def _assert_private_windows_acl(path: Path) -> None:
         ctypes.POINTER(ptr),
     ]
     advapi.GetNamedSecurityInfoW.restype = wintypes.DWORD
+    advapi.GetSecurityInfo.argtypes = [wintypes.HANDLE, *advapi.GetNamedSecurityInfoW.argtypes[1:]]
+    advapi.GetSecurityInfo.restype = wintypes.DWORD
     advapi.GetSecurityDescriptorDacl.argtypes = [
         ptr,
         ctypes.POINTER(wintypes.BOOL),
@@ -133,8 +137,9 @@ def _assert_private_windows_acl(path: Path) -> None:
     owner = ctypes.c_void_p()
     dacl = ctypes.c_void_p()
     descriptor = ctypes.c_void_p()
-    result = advapi.GetNamedSecurityInfoW(
-        str(path),
+    security_info = advapi.GetNamedSecurityInfoW if handle is None else advapi.GetSecurityInfo
+    result = security_info(
+        str(path) if handle is None else handle,
         SE_FILE_OBJECT,
         OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
         ctypes.byref(owner),
@@ -217,12 +222,7 @@ def _validate_contract(
         raise LocalCustodyError("custody reference is invalid")
     if _ADDRESS.fullmatch(wallet_address) is None or type(chain_id) is not int or not 0 < chain_id < 2**256:
         raise LocalCustodyError("custody wallet or chain is invalid")
-    if (
-        not isinstance(approved_instruments, tuple)
-        or len(approved_instruments) != 5
-        or len(set(approved_instruments)) != 5
-        or not all(isinstance(item, str) and item for item in approved_instruments)
-    ):
+    if not isinstance(approved_instruments, tuple) or not valid_instrument_set(approved_instruments):
         raise LocalCustodyError("custody instrument universe is invalid")
     if not isinstance(types, dict) or len(types) != 1:
         raise LocalCustodyError("typed schema is not allowlisted")
@@ -348,6 +348,9 @@ class LocalEncryptedKeystoreBackend:
             "keystore_file": str(self.keystore_file),
             "unlock_file": str(self.unlock_file),
         }
+        return self._invoke_request(request)
+
+    def _invoke_request(self, request: dict[str, Any]) -> str:
         encoded = json.dumps(request, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
         if len(encoded) > MAX_REQUEST_BYTES:
             raise LocalCustodyError("typed request exceeds the local custody protocol limit")
@@ -465,6 +468,48 @@ class LocalEncryptedKeystoreBackend:
         ):
             raise LocalCustodyError("local signing subprocess response failed validation")
         return response["signature"]
+
+    def _sign_evedex_siwe_unclaimed(
+        self, *, custody_reference: str, nonce: str, issued_at: str
+    ) -> tuple[str, str]:
+        """Sign only a fixed EVEDEX SIWE message using the same isolated keystore.
+
+        This does not acquire a nonce or submit an authentication request.
+        Internal primitive only. The public path must first commit a durable
+        one-use nonce claim; callers must not invoke this primitive directly.
+        """
+        if custody_reference != self.custody_reference:
+            raise LocalCustodyError("request is outside this custody reference")
+        try:
+            message = evedex_siwe_message(
+                address=self.wallet_address, chain_id=self.chain_id, nonce=nonce, issued_at=issued_at
+            )
+        except ValueError:
+            raise LocalCustodyError("invalid EVEDEX SIWE request") from None
+        request = {
+            "version": "kairos.local-siwe-sign.v1",
+            "custody_reference": custody_reference,
+            "wallet_address": self.wallet_address,
+            "chain_id": self.chain_id,
+            "approved_instruments": list(self.approved_instruments),
+            "nonce": nonce,
+            "issued_at": issued_at,
+            "keystore_file": str(self.keystore_file),
+            "unlock_file": str(self.unlock_file),
+        }
+        signature = self._invoke_request(request)
+        try:
+            from eth_account import Account
+            from eth_account.messages import encode_defunct
+
+            recovered = Account.recover_message(encode_defunct(text=message), signature=signature)
+        except Exception:
+            recovered = None
+        if recovered is None:
+            raise LocalCustodyError("SIWE signature could not be verified") from None
+        if recovered.casefold() != self.wallet_address.casefold():
+            raise LocalCustodyError("SIWE signature does not match the bound wallet")
+        return message, signature
 
 
 class CoincurveTypedDataVerifier:

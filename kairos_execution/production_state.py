@@ -44,6 +44,12 @@ from .production_readiness import (
     StrictRecord,
     canonical_digest,
 )
+from .production_session_loss import (
+    PinnedEvedexSessionVerifier,
+    SessionLossError,
+    append_session_decision,
+    projected_session_loss_usd,
+)
 from .signing_authorization import (
     AcceptedManualNonceV1,
     ExposureSnapshotV1,
@@ -432,6 +438,49 @@ REVOKE ALL ON ALL TABLES IN SCHEMA kairos_production_state_v1 FROM PUBLIC;
 REVOKE ALL ON ALL FUNCTIONS IN SCHEMA kairos_production_state_v1 FROM PUBLIC;
 """
 
+# Keep the historical body solely for an explicit, owner-authenticated upgrade.
+# Runtime readers accept only the reviewed current body and an ALWAYS trigger.
+_operator_function = re.search(
+    r"CREATE FUNCTION kairos_production_state_v1\.enforce_operator_append\(\) RETURNS trigger"
+    r"\n LANGUAGE plpgsql SET search_path=pg_catalog AS \$\$(.*?)\$\$;",
+    DDL,
+    re.DOTALL,
+)
+if _operator_function is None:
+    raise RuntimeError("historical operator guard definition is absent")
+_LEGACY_OPERATOR_APPEND_BODY = _operator_function.group(1)
+_OWNER_RESUME_CHECK = """   IF prior_state='KILLED' AND NEW.payload->>'state' IS DISTINCT FROM 'KILLED' THEN
+    IF NEW.payload->>'state' IS DISTINCT FROM 'DISARMED'
+     OR current_user IS DISTINCT FROM (
+      SELECT owner_role FROM kairos_production_state_v1.identity WHERE singleton=true
+     ) THEN
+     RAISE EXCEPTION 'operator KILLED requires authenticated owner resume';
+    END IF;
+   END IF;
+"""
+_OPERATOR_APPEND_BODY = _LEGACY_OPERATOR_APPEND_BODY.replace(
+    "   prior_state := prior_payload->>'state';\n",
+    "   prior_state := prior_payload->>'state';\n" + _OWNER_RESUME_CHECK,
+    1,
+)
+_OPERATOR_APPEND_BODY = _OPERATOR_APPEND_BODY.replace(
+    " BEGIN\n",
+    " BEGIN\n"
+    "  IF current_setting('transaction_isolation') <> 'read committed' THEN\n"
+    "   RAISE EXCEPTION 'operator append requires READ COMMITTED isolation';\n"
+    "  END IF;\n",
+    1,
+)
+_OPERATOR_CONTROL_GUARD_SQL = (
+    "CREATE OR REPLACE FUNCTION kairos_production_state_v1.enforce_operator_append() RETURNS trigger\n"
+    " LANGUAGE plpgsql SET search_path=pg_catalog AS $$" + _OPERATOR_APPEND_BODY + "$$;"
+)
+DDL = DDL.replace(_operator_function.group(0), _OPERATOR_CONTROL_GUARD_SQL)
+DDL += (
+    "\nALTER TABLE kairos_production_state_v1.operator_observations "
+    "ENABLE ALWAYS TRIGGER operator_append_guard;\n"
+)
+
 
 def _reservation_totals_query(schema_version: int) -> str:
     """No historical row/cap/baseline is removed, including across policy arms."""
@@ -634,6 +683,54 @@ def _validate_snapshot_clock(
         raise ProductionStateError("production signing state snapshot is stale or future-dated")
 
 
+async def _validate_snapshot_clock_after_wait(
+    *,
+    started_at: datetime,
+    resolved_at: datetime,
+    clock_probe: Callable[[], datetime],
+    max_age: timedelta,
+) -> None:
+    """Wait at most 50 ms of monotonic time; then retain the strict check.
+
+    This never changes the immutable DB timestamp, UTC clock, freshness bound
+    or any signing deadline. It grants no clock/source qualification. A small
+    cross-clock lead can become past before use; a large lead, rollback, stall
+    or scheduler timeout refuses. Callers must still recheck their original
+    authorization/evidence expiry after the source I/O, as before.
+    """
+    maximum_wait = 0.050
+    checked_at = clock_probe()
+    # Preserve all original malformed-clock/rollback/staleness failures.
+    if (
+        any(
+            value.tzinfo is None or value.utcoffset() != timedelta(0)
+            for value in (started_at, resolved_at, checked_at)
+        )
+        or checked_at < started_at
+        or resolved_at <= checked_at
+        or (resolved_at - checked_at).total_seconds() > maximum_wait
+    ):
+        _validate_snapshot_clock(
+            started_at=started_at, resolved_at=resolved_at, checked_at=checked_at, max_age=max_age
+        )
+        return
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + maximum_wait
+    while resolved_at > checked_at:
+        if loop.time() >= deadline:
+            raise ProductionStateError("production snapshot UTC availability wait timed out")
+        await asyncio.sleep(0.001)
+        current = clock_probe()
+        if current.tzinfo is None or current.utcoffset() != timedelta(0) or current < checked_at:
+            raise ProductionStateError("production snapshot UTC clock moved backwards or is invalid")
+        checked_at = current
+        if loop.time() >= deadline:
+            raise ProductionStateError("production snapshot UTC availability wait timed out")
+    _validate_snapshot_clock(
+        started_at=started_at, resolved_at=resolved_at, checked_at=checked_at, max_age=max_age
+    )
+
+
 async def _check_role_isolated(
     connection: asyncpg.Connection, role_name: str, protected: Sequence[str]
 ) -> None:
@@ -649,6 +746,237 @@ async def _check_role_isolated(
             "SELECT pg_has_role($1,$2,'MEMBER')", role_name, target
         ):
             raise ProductionStateError("production state roles must not inherit one another")
+
+
+async def _operator_control_guard(connection: asyncpg.Connection) -> asyncpg.Record | None:
+    return await connection.fetchrow(
+        "SELECT p.prosrc AS body,pg_get_userbyid(p.proowner) AS owner,"
+        "p.prosecdef AS security_definer,p.proconfig AS config,l.lanname AS language,"
+        "p.prorettype='pg_catalog.trigger'::regtype AS returns_trigger,"
+        "t.tgenabled::text AS enabled,t.tgtype AS trigger_type,t.tgnargs AS arguments,"
+        "t.tgattr::text AS columns,t.tgqual::text AS condition "
+        "FROM pg_proc p JOIN pg_language l ON l.oid=p.prolang "
+        "JOIN pg_trigger t ON t.tgfoid=p.oid "
+        "WHERE p.oid=to_regprocedure('kairos_production_state_v1.enforce_operator_append()') "
+        "AND t.tgrelid=to_regclass('kairos_production_state_v1.operator_observations') "
+        "AND t.tgname='operator_append_guard' AND NOT t.tgisinternal"
+    )
+
+
+def _validate_operator_control_guard(
+    record: asyncpg.Record | None, *, owner_role: str, allow_upgrade: bool = False
+) -> None:
+    allowed_bodies = (
+        (_LEGACY_OPERATOR_APPEND_BODY, _OPERATOR_APPEND_BODY) if allow_upgrade else (_OPERATOR_APPEND_BODY,)
+    )
+    if (
+        record is None
+        or record["body"] not in allowed_bodies
+        or record["owner"] != owner_role
+        or record["security_definer"] is not False
+        or record["config"] != ["search_path=pg_catalog"]
+        or record["language"] != "plpgsql"
+        or record["returns_trigger"] is not True
+        or (not allow_upgrade and record["enabled"] != "A")
+        or record["trigger_type"] != 7  # BEFORE INSERT, FOR EACH ROW.
+        or record["arguments"] != 0
+        or record["columns"] != ""
+        or record["condition"] is not None
+    ):
+        raise ProductionStateError("reviewed owner-only operator control guard is absent or changed")
+
+
+async def assert_operator_control_guard(connection: asyncpg.Connection, *, owner_role: str) -> None:
+    """Verify the authoritative stop boundary without upgrading or changing it."""
+    _validate_operator_control_guard(await _operator_control_guard(connection), owner_role=_role(owner_role))
+
+
+async def _inspect_operator_owner(
+    connection: asyncpg.Connection,
+    *,
+    expected_database: str,
+    database_uuid: UUID,
+    policy_namespace: str,
+    context: ProductionContextV1,
+    owner_role: str,
+) -> asyncpg.Record:
+    """Owner LOGIN authority is distinct from the ordinary operator writer."""
+    actual = await connection.fetchrow("SELECT current_database() AS db,current_user AS role")
+    if actual is None or actual["db"] != expected_database or actual["role"] != owner_role:
+        raise ProductionStateError("operator owner/database authentication mismatch")
+    identity = await connection.fetchrow(
+        "SELECT * FROM kairos_production_state_v1.identity WHERE singleton=true"
+    )
+    if identity is None or (
+        identity["database_uuid"] != database_uuid
+        or identity["policy_namespace"] != policy_namespace
+        or identity["account_sha256"] != _account_scope_sha256(context)
+        or identity["owner_role"] != owner_role
+        or identity["schema_version"] not in (SCHEMA_VERSION, ACCOUNTING_STATE_SCHEMA_VERSION)
+    ):
+        raise ProductionStateError("operator owner UUID/context/schema mismatch")
+    protected = tuple(identity[key] for key in ("owner_role", "runtime_role", *_WRITER_TABLES))
+    if len(set(protected)) != len(protected):
+        raise ProductionStateError("production state roles are not isolated")
+    for role in protected:
+        await _check_role_isolated(connection, role, protected)
+    if (
+        await connection.fetchval(
+            "SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname=$1", SCHEMA
+        )
+        != owner_role
+        or await connection.fetchval(
+            "SELECT pg_get_userbyid(relowner) FROM pg_class "
+            "WHERE oid=to_regclass('kairos_production_state_v1.operator_observations')"
+        )
+        != owner_role
+    ):
+        raise ProductionStateError("operator control schema/table owner mismatch")
+    return identity
+
+
+async def upgrade_operator_control_guard(
+    connection: asyncpg.Connection,
+    *,
+    expected_database: str,
+    database_uuid: UUID,
+    policy_namespace: str,
+    context: ProductionContextV1,
+    owner_role: str,
+) -> None:
+    """Explicit owner-only upgrade of the known v2/v3 guard; never called at startup."""
+    expected_database, owner_role = _database_name(expected_database), _role(owner_role)
+    policy_namespace = _identity(policy_namespace)
+    context = ProductionContextV1.model_validate(context)
+    if not isinstance(database_uuid, UUID) or database_uuid.int == 0:
+        raise ProductionStateError("an exact nonzero isolated database UUID is required")
+    try:
+        async with asyncio.timeout(10):
+            if connection.is_in_transaction():
+                raise ProductionStateError("operator guard upgrade requires an idle owner connection")
+            async with connection.transaction():
+                await connection.execute("SET LOCAL statement_timeout='5s'")
+                await _inspect_operator_owner(
+                    connection,
+                    expected_database=expected_database,
+                    database_uuid=database_uuid,
+                    policy_namespace=policy_namespace,
+                    context=context,
+                    owner_role=owner_role,
+                )
+                await connection.execute(
+                    "LOCK TABLE kairos_production_state_v1.operator_observations IN ACCESS EXCLUSIVE MODE"
+                )
+                _validate_operator_control_guard(
+                    await _operator_control_guard(connection), owner_role=owner_role, allow_upgrade=True
+                )
+                await connection.execute(_OPERATOR_CONTROL_GUARD_SQL)
+                await connection.execute(
+                    "ALTER TABLE kairos_production_state_v1.operator_observations "
+                    "ENABLE ALWAYS TRIGGER operator_append_guard"
+                )
+                await assert_operator_control_guard(connection, owner_role=owner_role)
+    except ProductionStateError:
+        raise
+    except Exception:
+        raise ProductionStateError(
+            "operator guard upgrade outcome is unavailable; do not retry blindly"
+        ) from None
+
+
+async def resume_operator_after_kill_async(
+    pool: asyncpg.Pool,
+    *,
+    expected_database: str,
+    database_uuid: UUID,
+    policy_namespace: str,
+    context: ProductionContextV1,
+    owner_role: str,
+    expected_version: int,
+    expected_command_sha256: str,
+) -> LiveOperatorStateV1:
+    """Authenticate the separate owner role and atomically consume one exact KILLED state."""
+    expected_database, owner_role = _database_name(expected_database), _role(owner_role)
+    policy_namespace = _identity(policy_namespace)
+    context = ProductionContextV1.model_validate(context)
+    if not isinstance(database_uuid, UUID) or database_uuid.int == 0:
+        raise ProductionStateError("an exact nonzero isolated database UUID is required")
+    if type(expected_version) is not int or expected_version <= 0:
+        raise ProductionStateError("an exact KILLED version is required")
+    expected_command_sha256 = _digest(expected_command_sha256)
+    context_digest = canonical_digest(context)
+    try:
+        async with asyncio.timeout(10), pool.acquire() as connection:
+            if connection.is_in_transaction():
+                raise ProductionStateError("owner resume requires an idle owner connection")
+            async with connection.transaction():
+                await connection.execute("SET LOCAL statement_timeout='5s'")
+                await _inspect_operator_owner(
+                    connection,
+                    expected_database=expected_database,
+                    database_uuid=database_uuid,
+                    policy_namespace=policy_namespace,
+                    context=context,
+                    owner_role=owner_role,
+                )
+                await assert_operator_control_guard(connection, owner_role=owner_role)
+                for lock in (_account_reservation_lock(context), context_digest):
+                    await connection.fetchval("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", lock)
+                row = await connection.fetchrow(
+                    "SELECT payload FROM kairos_production_state_v1.operator_observations "
+                    "WHERE context_sha256=$1 ORDER BY observed_at DESC,inserted_at DESC LIMIT 1",
+                    context_digest,
+                )
+                prior = _parse_json_model(
+                    None if row is None else row["payload"], LiveOperatorStateV1, "operator"
+                )
+                if (
+                    prior.context != context
+                    or prior.state != "KILLED"
+                    or prior.version != expected_version
+                    or prior.command_sha256 != expected_command_sha256
+                ):
+                    raise ProductionStateError("owner resume does not match the exact current KILLED command")
+                stamp = (await connection.fetchval("SELECT clock_timestamp()")).astimezone(UTC)
+                stamp -= timedelta(microseconds=1)
+                if stamp <= prior.observed_at or stamp < prior.changed_at:
+                    raise ProductionStateError("owner resume database clock did not advance")
+                command = {
+                    "state": "DISARMED",
+                    "version": prior.version + 1,
+                    "arm_nonce": None,
+                    "arm_request_sha256": None,
+                    "expires_at": None,
+                }
+                resumed = LiveOperatorStateV1(
+                    context=context,
+                    version=prior.version + 1,
+                    state="DISARMED",
+                    arm_nonce=None,
+                    arm_request_sha256=None,
+                    expires_at=None,
+                    observed_at=stamp,
+                    changed_at=stamp,
+                    command_sha256=_canonical_json_digest(command),
+                    previous_command_sha256=prior.command_sha256,
+                )
+                data, payload_sha = _payload(resumed)
+                await connection.execute(
+                    "INSERT INTO kairos_production_state_v1.operator_observations "
+                    "(context_sha256,observation_id,version,observed_at,payload,payload_sha256) "
+                    "VALUES($1,$2,$3,$4,$5::jsonb,$6)",
+                    context_digest,
+                    uuid4(),
+                    resumed.version,
+                    resumed.observed_at,
+                    json.dumps(data, separators=(",", ":"), allow_nan=False),
+                    payload_sha,
+                )
+            return resumed  # Only after the owner transaction acknowledges COMMIT.
+    except ProductionStateError:
+        raise
+    except Exception:
+        raise ProductionStateError("owner resume outcome is unavailable; do not retry blindly") from None
 
 
 async def provision_production_state_schema(
@@ -753,7 +1081,9 @@ class _StateDB:
             raise ProductionStateError("unsupported explicit production state schema version")
         self.state_schema_version = state_schema_version
 
-    async def inspect(self, connection: asyncpg.Connection) -> asyncpg.Record:
+    async def inspect(
+        self, connection: asyncpg.Connection, *, require_operator_control: bool = True
+    ) -> asyncpg.Record:
         actual = await connection.fetchrow("SELECT current_database() AS db,current_user AS role")
         if actual is None or actual["db"] != self.expected_database or actual["role"] != self.expected_role:
             raise ProductionStateError("production state database/role mismatch")
@@ -780,6 +1110,11 @@ class _StateDB:
         )
         if schema_owner != owner:
             raise ProductionStateError("production state schema ownership mismatch")
+        # Entry authorization and operator writes require the current stop guard.
+        # Protective exits and historical cancellation provenance do not rely on
+        # operator permission and must survive a retained-database upgrade.
+        if require_operator_control:
+            await assert_operator_control_guard(connection, owner_role=owner)
 
         allowed_tables = (
             frozenset({"risk_reservations"})
@@ -819,11 +1154,24 @@ class _StateDB:
             raise ProductionStateError("production state role can modify its schema")
         return identity
 
-    async def _write(self, callback):
+    async def _write(self, callback, *, require_operator_control: bool = True):
         try:
             async with asyncio.timeout(10):
                 async with self.pool.acquire() as connection:
-                    await self.inspect(connection)
+                    # A nested asyncpg transaction is only a SAVEPOINT. Its
+                    # successful exit does not commit the caller's outer
+                    # transaction, so reporting a durable reservation here
+                    # would be incorrect. Never borrow such a connection.
+                    if connection.is_in_transaction() is not False:
+                        raise ProductionStateError("production state write requires an idle connection")
+                    if require_operator_control:
+                        await self.inspect(connection)
+                    else:
+                        await self.inspect(connection, require_operator_control=False)
+                    # Inspection may be overridden or supplied by a future
+                    # adapter. It must not leave an outer transaction open.
+                    if connection.is_in_transaction() is not False:
+                        raise ProductionStateError("production state inspection left an open transaction")
                     async with connection.transaction():
                         await connection.execute("SET LOCAL statement_timeout='5s'")
                         return await callback(connection)
@@ -873,6 +1221,21 @@ class PostgresOperatorStateWriter(_StateDB):
             )
 
         await self._write(append)
+
+    async def latest_operator_state_async(self) -> LiveOperatorStateV1 | None:
+        """The newest operator observation of this scope, or None before the first one."""
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                "SELECT payload FROM kairos_production_state_v1.operator_observations "
+                "WHERE context_sha256=$1 ORDER BY observed_at DESC,inserted_at DESC LIMIT 1",
+                self.context_sha256,
+            )
+        if row is None:
+            return None
+        state = _parse_json_model(row["payload"], LiveOperatorStateV1, "operator observation")
+        if state.context != self.context:
+            raise ProductionStateError("operator observation context differs from source scope")
+        return state
 
     async def append_operator_observation_async(self, state: LiveOperatorStateV1) -> UUID:
         state = LiveOperatorStateV1.model_validate(state)
@@ -984,7 +1347,11 @@ class PostgresRiskStateWriter(_StateDB):
                 payload_sha,
             )
 
-        await self._write(append)
+        await self._write(
+            append,
+            require_operator_control=risk.operation
+            not in {"Position close order", "New take-profit/stop-loss"},
+        )
 
 
 class PostgresExposureStateWriter(_StateDB):
@@ -1030,7 +1397,7 @@ class PostgresExposureStateWriter(_StateDB):
                 payload_sha,
             )
 
-        await self._write(append)
+        await self._write(append, require_operator_control=False)
         return observation_id
 
 
@@ -1055,7 +1422,13 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
         max_snapshot_age: timedelta = timedelta(seconds=5),
         clock_probe: Callable[[], datetime] = lambda: datetime.now(UTC),
         state_schema_version: int = SCHEMA_VERSION,
+        require_session_entry_fence: bool = False,
+        require_session_loss_latch: bool = False,
     ) -> None:
+        if type(require_session_entry_fence) is not bool:
+            raise TypeError("session entry fence requirement must be boolean")
+        if type(require_session_loss_latch) is not bool:
+            raise TypeError("session loss latch requirement must be boolean")
         if not timedelta(0) < max_snapshot_age <= timedelta(seconds=5):
             raise ValueError("production state freshness may not exceed five seconds")
         super().__init__(
@@ -1071,6 +1444,31 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
         self.runtime_role = _role(runtime_role)
         self.max_snapshot_age = max_snapshot_age
         self._clock_probe = clock_probe
+        self._require_session_entry_fence = require_session_entry_fence
+        self._require_session_loss_latch = require_session_loss_latch
+        self._session_loss_verifier = PinnedEvedexSessionVerifier()
+
+    async def observe_session_loss_async(self, raw_observation: object) -> str:
+        """Commit a STOP independent of a candidate; the pinned verifier refuses today."""
+        if not self._require_session_loss_latch:
+            raise ProductionStateError("session loss latch is not enabled")
+        account_digest = _account_scope_sha256(self.context)
+
+        async def observe(connection: asyncpg.Connection) -> str:
+            await connection.fetchval(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                _account_reservation_lock(self.context),
+            )
+            observation = self._session_loss_verifier.verify(raw_observation, account_sha256=account_digest)
+            now = (await connection.fetchval("SELECT clock_timestamp()")).astimezone(UTC)
+            return await append_session_decision(
+                connection, observation, account_sha256=account_digest, now=now
+            )
+
+        try:
+            return await self._write(observe)
+        except SessionLossError as exc:
+            raise ProductionStateError("session loss observation is unavailable") from exc
 
     async def resolve_owner_lineage_async(
         self, manual_request_sha256: str
@@ -1092,7 +1490,7 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
                 async with self.pool.acquire() as connection:
                     async with connection.transaction(isolation="repeatable_read", readonly=True):
                         await connection.execute("SET LOCAL statement_timeout='5s'")
-                        identity = await self.inspect(connection)
+                        identity = await self.inspect(connection, require_operator_control=False)
                         claims = PostgresProductionClaims(
                             self.pool,
                             expected_database=self.expected_database,
@@ -1153,11 +1551,10 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
                         ):
                             raise ProductionStateError("accepted owner nonce does not bind the exact arm")
                         resolved_at = (await connection.fetchval("SELECT clock_timestamp()")).astimezone(UTC)
-            checked_at = self._clock_probe()
-            _validate_snapshot_clock(
+            await _validate_snapshot_clock_after_wait(
                 started_at=started_at,
                 resolved_at=resolved_at,
-                checked_at=checked_at,
+                clock_probe=self._clock_probe,
                 max_age=self.max_snapshot_age,
             )
             return owner_arm, owner_claim
@@ -1193,7 +1590,7 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
                 async with self.pool.acquire() as connection:
                     async with connection.transaction(isolation="repeatable_read", readonly=True):
                         await connection.execute("SET LOCAL statement_timeout='5s'")
-                        identity = await self.inspect(connection)
+                        identity = await self.inspect(connection, require_operator_control=False)
                         claims = PostgresProductionClaims(
                             self.pool,
                             expected_database=self.expected_database,
@@ -1220,13 +1617,18 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
                             request_id,
                         )
                         risk = self._verified_payload(risk_row, RiskGeometryV1, "entry risk decision")
+                        expected_notional = _entry_notional_usd(
+                            {"cashQuantity": risk.cash_quantity}
+                            if risk.operation == "New market order"
+                            else {"quantity": risk.quantity, "limitPrice": risk.price}
+                        )
                         _, evidence_sha256 = _payload(risk)
                         if (
                             risk.context != self.context
                             or risk.signing_request_id != request_id
                             or risk.decision_id != expected_decision
                             or risk.effect_id != effect_digest
-                            or risk.operation != "New limit order"
+                            or risk.operation not in {"New limit order", "New market order"}
                             or risk.client_order_id is None
                             or risk.observed_at != risk_row["observed_at"]
                             or risk.valid_until != risk_row["valid_until"]
@@ -1251,9 +1653,7 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
                             or reservation_row["observed_at"] != risk.observed_at
                             or reservation_row["evidence_sha256"] != evidence_sha256
                             or Decimal(reservation_row["risk_usd"]) != risk.worst_case_loss_usd
-                            or risk.price is None
-                            or Decimal(reservation_row["notional_usd"])
-                            != Decimal(risk.quantity) * Decimal(risk.price) / Decimal(10**16)
+                            or Decimal(reservation_row["notional_usd"]) != expected_notional
                             or Decimal(reservation_row["account_equity_usd"]) != risk.account_equity_usd
                             or Decimal(reservation_row["daily_realized_loss_usd"])
                             != risk.daily_realized_loss_usd
@@ -1290,11 +1690,10 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
                             request_sha256=reservation_row["request_sha256"],
                         )
                         resolved_at = (await connection.fetchval("SELECT clock_timestamp()")).astimezone(UTC)
-            checked_at = self._clock_probe()
-            _validate_snapshot_clock(
+            await _validate_snapshot_clock_after_wait(
                 started_at=started_at,
                 resolved_at=resolved_at,
-                checked_at=checked_at,
+                clock_probe=self._clock_probe,
                 max_age=self.max_snapshot_age,
             )
             return fact
@@ -1320,7 +1719,7 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
                 async with self.pool.acquire() as connection:
                     async with connection.transaction(isolation="repeatable_read", readonly=True):
                         await connection.execute("SET LOCAL statement_timeout='5s'")
-                        identity = await self.inspect(connection)
+                        identity = await self.inspect(connection, require_operator_control=not exit_operation)
                         claims = PostgresProductionClaims(
                             self.pool,
                             expected_database=self.expected_database,
@@ -1347,11 +1746,10 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
                             exit_operation=exit_operation,
                             now=now,
                         )
-            checked_at = self._clock_probe()
-            _validate_snapshot_clock(
+            await _validate_snapshot_clock_after_wait(
                 started_at=now,
                 resolved_at=evidence.resolved_at,
-                checked_at=checked_at,
+                clock_probe=self._clock_probe,
                 max_age=self.max_snapshot_age,
             )
             return evidence
@@ -1380,6 +1778,12 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
             evidence = ProductionSigningEvidenceV1.model_validate(evidence)
             if request.operation in {"Position close order", "New take-profit/stop-loss"}:
                 return
+            # No authenticated account ledger and no shared custody/outbox
+            # fence exists yet. In this mode the real reservation path cannot
+            # authorize an entry or consume capacity. This static rejection is
+            # not the requested $5 session-loss computation.
+            if self._require_session_entry_fence:
+                raise ProductionStateError("atomic session entry fence is unavailable")
             if request.context != self.context or binding.context != self.context:
                 raise ProductionStateError("risk reservation context differs from source scope")
             risk = evidence.risk
@@ -1418,7 +1822,7 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
                 context=self.context,
             )
 
-            async def reserve(connection: asyncpg.Connection) -> None:
+            async def reserve(connection: asyncpg.Connection) -> str | None:
                 await claims.inspect(connection)
                 # The same account key serializes risk-decision insertion,
                 # operator command changes and competing entry reservations.
@@ -1431,193 +1835,263 @@ class AsyncPostgresProductionSigningStateSource(_StateDB):
                     f"operator:{context_digest}",
                 )
                 db_now = (await connection.fetchval("SELECT clock_timestamp()")).astimezone(UTC)
-                if (
-                    risk.observed_at > db_now
-                    or db_now - risk.observed_at > self.max_snapshot_age
-                    or risk.valid_until <= db_now
-                    or risk.valid_until - risk.observed_at > timedelta(seconds=30)
-                    or not arm.created_at <= db_now < arm.expires_at
-                ):
-                    raise ProductionStateError("risk or owner limit evidence expired before reservation")
-
-                risk_row = await connection.fetchrow(
-                    "SELECT decision_id,observed_at,payload_sha256 FROM "
-                    "kairos_production_state_v1.risk_decisions "
-                    "WHERE context_sha256=$1 AND signing_request_id=$2",
-                    context_digest,
-                    request.request_id,
-                )
-                if (
-                    risk_row is None
-                    or risk_row["decision_id"] != risk.decision_id
-                    or risk_row["observed_at"] != risk.observed_at
-                    or risk_row["payload_sha256"] != evidence_digest
-                ):
-                    raise ProductionStateError("risk reservation is not bound to its persisted decision")
-
-                arm_digest = canonical_digest(arm)
-                arm_row = await connection.fetchrow(
-                    "SELECT payload_sha256 FROM kairos_production_state_v1.owner_arms "
-                    "WHERE context_sha256=$1 AND request_sha256=$2 AND owner_identity=$3 AND nonce=$4",
-                    context_digest,
-                    arm_digest,
-                    arm.owner_identity,
-                    arm.nonce,
-                )
-                _, arm_payload_digest = _payload(evidence.owner_arm)
-                nonce_row = await connection.fetchrow(
-                    "SELECT request_sha256,context_sha256 FROM kairos_production_evidence_v1.claims "
-                    "WHERE claim_kind='MANUAL_NONCE' AND namespace=$1 AND identity=$2",
-                    arm.owner_identity,
-                    arm.nonce,
-                )
-                if (
-                    arm_row is None
-                    or arm_row["payload_sha256"] != arm_payload_digest
-                    or nonce_row is None
-                    or nonce_row["request_sha256"] != arm_digest
-                    or nonce_row["context_sha256"] != context_digest
-                ):
-                    raise ProductionStateError("risk reservation lacks the accepted exact owner arm")
-
-                operator_row = await connection.fetchrow(
-                    "SELECT payload,payload_sha256 FROM kairos_production_state_v1.operator_observations "
-                    "WHERE context_sha256=$1 ORDER BY observed_at DESC,inserted_at DESC LIMIT 1",
-                    context_digest,
-                )
-                if operator_row is None:
-                    raise ProductionStateError("risk reservation lacks current operator state")
-                operator = _parse_json_model(
-                    operator_row["payload"], LiveOperatorStateV1, "operator observation"
-                )
-                _, operator_digest = _payload(operator)
-                if (
-                    operator_digest != operator_row["payload_sha256"]
-                    or operator != evidence.operator
-                    or operator.state != "ARMED"
-                    or operator.arm_nonce != arm.nonce
-                    or operator.arm_request_sha256 != arm_digest
-                    or operator.expires_at is None
-                    or operator.expires_at <= db_now
-                ):
-                    raise ProductionStateError("current operator command changed before reservation")
-
-                existing = await connection.fetchrow(
-                    "SELECT * FROM kairos_production_state_v1.risk_reservations "
-                    "WHERE account_sha256=$1 AND effect_id=$2",
-                    account_digest,
-                    risk.effect_id,
-                )
-                if existing is not None:
-                    if (
-                        existing["context_sha256"] != context_digest
-                        or existing["owner_arm_sha256"] != arm_digest
-                        or existing["account_sha256"] != account_digest
-                        or existing["signing_request_id"] != request.request_id
-                        or existing["decision_id"] != risk.decision_id
-                        or existing["risk_usd"] != risk_amount
-                        or existing["notional_usd"] != notional
-                        or existing["account_equity_usd"] != risk.account_equity_usd
-                        or existing["daily_realized_loss_usd"] != risk.daily_realized_loss_usd
-                        or existing["aggregate_open_risk_usd"] != risk.aggregate_open_risk_usd
-                        or existing["aggregate_open_notional_usd"] != risk.aggregate_open_notional_usd
-                        or existing["dollar_cap"] != arm.dollar_cap
-                        or existing["daily_stop_loss_usd"] != arm.daily_stop_loss_usd
-                        or existing["evidence_sha256"] != evidence_digest
-                        or existing["request_sha256"] != request_digest
-                    ):
-                        raise ProductionStateError("risk reservation effect identity was rebound")
-                    return
-                prior_request = await connection.fetchval(
-                    "SELECT 1 FROM kairos_production_state_v1.risk_reservations "
-                    "WHERE account_sha256=$1 AND signing_request_id=$2",
-                    account_digest,
-                    request.request_id,
-                )
-                if prior_request is not None:
-                    raise ProductionStateError("signing request already reserves a different effect")
-
-                if self.state_schema_version == ACCOUNTING_STATE_SCHEMA_VERSION:
-                    from .production_accounting import inspect_accounting_runtime
-
-                    await inspect_accounting_runtime(connection, state_source=self)
-                totals = await connection.fetchrow(
-                    _reservation_totals_query(self.state_schema_version),
-                    account_digest,
-                )
-                reserved_risk = Decimal(totals["risk_usd"])
-                reserved_notional = Decimal(totals["notional_usd"])
-                base_risk = max(
-                    risk.aggregate_open_risk_usd,
-                    Decimal(totals["base_risk"] or 0),
-                )
-                base_notional = max(
-                    risk.aggregate_open_notional_usd,
-                    Decimal(totals["base_notional"] or 0),
-                )
-                daily_realized = max(
-                    risk.daily_realized_loss_usd,
-                    Decimal(totals["daily_realized"] or 0),
-                )
-                if self.state_schema_version == ACCOUNTING_STATE_SCHEMA_VERSION:
-                    # Deliberately no daily/window reset or profit offset. The
-                    # historical snapshot floor can overlap this charge; that
-                    # over-count is conservative until a qualified daily ledger.
-                    daily_realized += Decimal(totals["realized_charge"])
-                account_equity = min(
-                    risk.account_equity_usd,
-                    Decimal(totals["account_equity"] or risk.account_equity_usd),
-                )
-                dollar_limit = min(
-                    arm.dollar_cap,
-                    Decimal(totals["dollar_cap"] or arm.dollar_cap),
-                )
-                daily_limit = min(
-                    arm.daily_stop_loss_usd,
-                    Decimal(totals["daily_stop"] or arm.daily_stop_loss_usd),
-                )
-                next_risk = base_risk + reserved_risk + risk_amount
-                next_notional = base_notional + reserved_notional + notional
-                next_daily_loss = daily_realized + reserved_risk + risk_amount
-                if (
-                    risk.leverage != 1
-                    or risk_amount > dollar_limit
-                    or risk_amount > account_equity * Decimal("0.0025")
-                    or next_risk > account_equity * Decimal("0.01")
-                    or next_daily_loss > daily_limit
-                    or next_notional > dollar_limit
-                ):
-                    raise ProductionStateError(
-                        "account risk reservation exceeds the current exact-decimal cap"
+                session_observation = None
+                if self._require_session_loss_latch:
+                    session_observation = await self._session_loss_verifier.resolve(
+                        connection,
+                        account_sha256=account_digest,
+                        context_sha256=context_digest,
+                        now=db_now,
                     )
-                await connection.execute(
-                    "INSERT INTO kairos_production_state_v1.risk_reservations "
-                    "(context_sha256,account_sha256,effect_id,signing_request_id,decision_id,"
-                    "owner_arm_sha256,observed_at,risk_usd,notional_usd,account_equity_usd,"
-                    "daily_realized_loss_usd,aggregate_open_risk_usd,aggregate_open_notional_usd,"
-                    "dollar_cap,daily_stop_loss_usd,evidence_sha256,request_sha256) "
-                    "VALUES($1,$2,$3,$4,$5,$6,$7,$8::numeric,$9::numeric,$10::numeric,$11::numeric,"
-                    "$12::numeric,$13::numeric,$14::numeric,$15::numeric,$16,$17)",
-                    context_digest,
-                    account_digest,
-                    risk.effect_id,
-                    request.request_id,
-                    risk.decision_id,
-                    arm_digest,
-                    risk.observed_at,
-                    _decimal_text(risk_amount),
-                    _decimal_text(notional),
-                    _decimal_text(risk.account_equity_usd),
-                    _decimal_text(risk.daily_realized_loss_usd),
-                    _decimal_text(risk.aggregate_open_risk_usd),
-                    _decimal_text(risk.aggregate_open_notional_usd),
-                    _decimal_text(arm.dollar_cap),
-                    _decimal_text(arm.daily_stop_loss_usd),
-                    evidence_digest,
-                    request_digest,
-                )
+                    session_state = await append_session_decision(
+                        connection,
+                        session_observation,
+                        account_sha256=account_digest,
+                        now=db_now,
+                    )
+                    if session_state == "STOP":
+                        # Returning (not raising) commits STOP through _write.
+                        return "SESSION_STOP"
 
-            await self._write(reserve)
+                async def validate_and_reserve() -> None:
+                    if self._require_session_loss_latch and await connection.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM kairos_session_entry_io_v1.events "
+                        "WHERE account_sha256=$1)",
+                        account_digest,
+                    ):
+                        raise ProductionStateError("prior account entry I/O awaits reconciliation")
+                    if (
+                        risk.observed_at > db_now
+                        or db_now - risk.observed_at > self.max_snapshot_age
+                        or risk.valid_until <= db_now
+                        or risk.valid_until - risk.observed_at > timedelta(seconds=30)
+                        or not arm.created_at <= db_now < arm.expires_at
+                    ):
+                        raise ProductionStateError("risk or owner limit evidence expired before reservation")
+
+                    risk_row = await connection.fetchrow(
+                        "SELECT decision_id,observed_at,payload_sha256 FROM "
+                        "kairos_production_state_v1.risk_decisions "
+                        "WHERE context_sha256=$1 AND signing_request_id=$2",
+                        context_digest,
+                        request.request_id,
+                    )
+                    if (
+                        risk_row is None
+                        or risk_row["decision_id"] != risk.decision_id
+                        or risk_row["observed_at"] != risk.observed_at
+                        or risk_row["payload_sha256"] != evidence_digest
+                    ):
+                        raise ProductionStateError("risk reservation is not bound to its persisted decision")
+
+                    arm_digest = canonical_digest(arm)
+                    arm_row = await connection.fetchrow(
+                        "SELECT payload_sha256 FROM kairos_production_state_v1.owner_arms "
+                        "WHERE context_sha256=$1 AND request_sha256=$2 AND owner_identity=$3 AND nonce=$4",
+                        context_digest,
+                        arm_digest,
+                        arm.owner_identity,
+                        arm.nonce,
+                    )
+                    _, arm_payload_digest = _payload(evidence.owner_arm)
+                    nonce_row = await connection.fetchrow(
+                        "SELECT request_sha256,context_sha256 FROM kairos_production_evidence_v1.claims "
+                        "WHERE claim_kind='MANUAL_NONCE' AND namespace=$1 AND identity=$2",
+                        arm.owner_identity,
+                        arm.nonce,
+                    )
+                    if (
+                        arm_row is None
+                        or arm_row["payload_sha256"] != arm_payload_digest
+                        or nonce_row is None
+                        or nonce_row["request_sha256"] != arm_digest
+                        or nonce_row["context_sha256"] != context_digest
+                    ):
+                        raise ProductionStateError("risk reservation lacks the accepted exact owner arm")
+
+                    operator_row = await connection.fetchrow(
+                        "SELECT payload,payload_sha256 FROM kairos_production_state_v1.operator_observations "
+                        "WHERE context_sha256=$1 ORDER BY observed_at DESC,inserted_at DESC LIMIT 1",
+                        context_digest,
+                    )
+                    if operator_row is None:
+                        raise ProductionStateError("risk reservation lacks current operator state")
+                    operator = _parse_json_model(
+                        operator_row["payload"], LiveOperatorStateV1, "operator observation"
+                    )
+                    _, operator_digest = _payload(operator)
+                    if (
+                        operator_digest != operator_row["payload_sha256"]
+                        or operator != evidence.operator
+                        or operator.state != "ARMED"
+                        or operator.arm_nonce != arm.nonce
+                        or operator.arm_request_sha256 != arm_digest
+                        or operator.expires_at is None
+                        or operator.expires_at <= db_now
+                    ):
+                        raise ProductionStateError("current operator command changed before reservation")
+
+                    existing = await connection.fetchrow(
+                        "SELECT * FROM kairos_production_state_v1.risk_reservations "
+                        "WHERE account_sha256=$1 AND effect_id=$2",
+                        account_digest,
+                        risk.effect_id,
+                    )
+                    if existing is not None:
+                        if self._require_session_loss_latch:
+                            # An existing reservation may already be reflected in
+                            # the source's remaining exposure. Its exact lineage
+                            # and pending custody/dispatch need a cross-boundary
+                            # fence that is not qualified, so do not double count
+                            # it or authorize replay in this experimental mode.
+                            raise ProductionStateError(
+                                "existing session reservation requires qualified fencing"
+                            )
+                        if (
+                            existing["context_sha256"] != context_digest
+                            or existing["owner_arm_sha256"] != arm_digest
+                            or existing["account_sha256"] != account_digest
+                            or existing["signing_request_id"] != request.request_id
+                            or existing["decision_id"] != risk.decision_id
+                            or existing["risk_usd"] != risk_amount
+                            or existing["notional_usd"] != notional
+                            or existing["account_equity_usd"] != risk.account_equity_usd
+                            or existing["daily_realized_loss_usd"] != risk.daily_realized_loss_usd
+                            or existing["aggregate_open_risk_usd"] != risk.aggregate_open_risk_usd
+                            or existing["aggregate_open_notional_usd"] != risk.aggregate_open_notional_usd
+                            or existing["dollar_cap"] != arm.dollar_cap
+                            or existing["daily_stop_loss_usd"] != arm.daily_stop_loss_usd
+                            or existing["evidence_sha256"] != evidence_digest
+                            or existing["request_sha256"] != request_digest
+                        ):
+                            raise ProductionStateError("risk reservation effect identity was rebound")
+                        return
+                    prior_request = await connection.fetchval(
+                        "SELECT 1 FROM kairos_production_state_v1.risk_reservations "
+                        "WHERE account_sha256=$1 AND signing_request_id=$2",
+                        account_digest,
+                        request.request_id,
+                    )
+                    if prior_request is not None:
+                        raise ProductionStateError("signing request already reserves a different effect")
+
+                    if self.state_schema_version == ACCOUNTING_STATE_SCHEMA_VERSION:
+                        from .production_accounting import inspect_accounting_runtime
+
+                        await inspect_accounting_runtime(connection, state_source=self)
+                    totals = await connection.fetchrow(
+                        _reservation_totals_query(self.state_schema_version),
+                        account_digest,
+                    )
+                    reserved_risk = Decimal(totals["risk_usd"])
+                    reserved_notional = Decimal(totals["notional_usd"])
+                    base_risk = max(
+                        risk.aggregate_open_risk_usd,
+                        Decimal(totals["base_risk"] or 0),
+                    )
+                    base_notional = max(
+                        risk.aggregate_open_notional_usd,
+                        Decimal(totals["base_notional"] or 0),
+                    )
+                    daily_realized = max(
+                        risk.daily_realized_loss_usd,
+                        Decimal(totals["daily_realized"] or 0),
+                    )
+                    if self.state_schema_version == ACCOUNTING_STATE_SCHEMA_VERSION:
+                        # Deliberately no daily/window reset or profit offset. The
+                        # historical snapshot floor can overlap this charge; that
+                        # over-count is conservative until a qualified daily ledger.
+                        daily_realized += Decimal(totals["realized_charge"])
+                    account_equity = min(
+                        risk.account_equity_usd,
+                        Decimal(totals["account_equity"] or risk.account_equity_usd),
+                    )
+                    dollar_limit = min(
+                        arm.dollar_cap,
+                        Decimal(totals["dollar_cap"] or arm.dollar_cap),
+                    )
+                    daily_limit = min(
+                        arm.daily_stop_loss_usd,
+                        Decimal(totals["daily_stop"] or arm.daily_stop_loss_usd),
+                    )
+                    next_risk = base_risk + reserved_risk + risk_amount
+                    next_notional = base_notional + reserved_notional + notional
+                    next_daily_loss = daily_realized + reserved_risk + risk_amount
+                    if session_observation is not None:
+                        # The source must qualify remaining risk from the current
+                        # mark, including existing open positions and outstanding
+                        # reservations, exactly once. RiskGeometry's aggregate is
+                        # deliberately not added again.
+                        projected = projected_session_loss_usd(session_observation, risk_amount)
+                        if projected > Decimal("5"):
+                            raise ProductionStateError("session remaining risk exceeds the $5 cap")
+                    if (
+                        risk.leverage != 1
+                        or risk_amount > dollar_limit
+                        or risk_amount > account_equity * Decimal("0.0025")
+                        or next_risk > account_equity * Decimal("0.01")
+                        or next_daily_loss > daily_limit
+                        or next_notional > dollar_limit
+                    ):
+                        raise ProductionStateError(
+                            "account risk reservation exceeds the current exact-decimal cap"
+                        )
+                    await connection.execute(
+                        "INSERT INTO kairos_production_state_v1.risk_reservations "
+                        "(context_sha256,account_sha256,effect_id,signing_request_id,decision_id,"
+                        "owner_arm_sha256,observed_at,risk_usd,notional_usd,account_equity_usd,"
+                        "daily_realized_loss_usd,aggregate_open_risk_usd,aggregate_open_notional_usd,"
+                        "dollar_cap,daily_stop_loss_usd,evidence_sha256,request_sha256) "
+                        "VALUES($1,$2,$3,$4,$5,$6,$7,$8::numeric,$9::numeric,$10::numeric,$11::numeric,"
+                        "$12::numeric,$13::numeric,$14::numeric,$15::numeric,$16,$17)",
+                        context_digest,
+                        account_digest,
+                        risk.effect_id,
+                        request.request_id,
+                        risk.decision_id,
+                        arm_digest,
+                        risk.observed_at,
+                        _decimal_text(risk_amount),
+                        _decimal_text(notional),
+                        _decimal_text(risk.account_equity_usd),
+                        _decimal_text(risk.daily_realized_loss_usd),
+                        _decimal_text(risk.aggregate_open_risk_usd),
+                        _decimal_text(risk.aggregate_open_notional_usd),
+                        _decimal_text(arm.dollar_cap),
+                        _decimal_text(arm.daily_stop_loss_usd),
+                        evidence_digest,
+                        request_digest,
+                    )
+
+                if self._require_session_loss_latch:
+                    candidate_failure: Exception | None = None
+                    try:
+                        async with connection.transaction():
+                            try:
+                                await validate_and_reserve()
+                            except Exception as exc:
+                                candidate_failure = exc
+                                raise
+                    except Exception as exc:
+                        # Only suppress the original candidate exception after
+                        # the savepoint context has successfully rolled back.
+                        # A different exception may be a failed rollback; it
+                        # must abort the outer transaction and remain unknown.
+                        if candidate_failure is not exc:
+                            raise
+                        if isinstance(exc, ProductionStateError):
+                            return "SESSION_DENIED"
+                        return "SESSION_INFRA_DENIED"
+                else:
+                    await validate_and_reserve()
+
+            result = await self._write(reserve)
+            if result == "SESSION_STOP":
+                raise ProductionStateError("session $5 loss limit reached; new entries stopped")
+            if result == "SESSION_DENIED":
+                raise ProductionStateError("session risk reservation refused")
+            if result == "SESSION_INFRA_DENIED":
+                raise ProductionStateError("session reservation failed; do not retry blindly")
         except ProductionStateError:
             raise
         except Exception:

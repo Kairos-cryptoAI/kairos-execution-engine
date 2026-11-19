@@ -1,0 +1,29 @@
+{
+  "schema": "kairos.fee-v2.offline-research-source-lock.v1",
+  "classification": "RESEARCH_ONLY_NO_TRADING_AUTHORITY",
+  "trusted_signing_fingerprint": "40AF365C6682B73D056A6A274DBFF6B65BE9F827",
+  "python_version": "3.11.15",
+  "uv_version": "0.12.3",
+  "required_node_major": 22,
+  "base_uv_lock_sha256": "f20fa8cc7e2611f76ddc671faa0fa71185586885dd4dc52365f97eb990e4cdd8",
+  "sidecar_package_lock_sha256": "6fa20a6acfc2cbe71bb0da81ca3389a629e586963bb5b8a71dda214d9825964f",
+  "sources": {
+    "execution": {
+      "commit": "53500478e8eab5bf10ce9392ffc2700bee6a50ec",
+      "tree": "3237799952044b482ab424df53cd1b851def97d2",
+      "archive_sha256": "63e83d82a717a4733e3b5efcc80f56244a206a7f0a2344267b6a9e6cdced59f3"
+    },
+    "core": {
+      "commit": "8cb0351df98ebf0f7a5de4d3790044f646e95002",
+      "tree": "5d72628961500ae239faf96fce223d3ada84cd56",
+      "archive_sha256": "af29eecc8ddd05459de78e1e0de4c579654aff8dd025604ef9e0354b85c7e0a8",
+      "package_tree_sha256": "5be4bd40605ad06c4b5e62bdb2b88bc2309b4bc16080c50eda6632269acd0b0b"
+    },
+    "persistence": {
+      "commit": "ef397304558153916dc1e27d5af2aeb878e4d88b",
+      "tree": "d2c9886c28809c6ad57e55e64c39293b9b3f3438",
+      "archive_sha256": "a0fdfdc98443c6d0fefb69ac2be2d465b63e88d0b027bede335c1261daa908ad",
+      "package_tree_sha256": "814ac0feac8c18633be36aaee9e3c0deeaff1857df988fbebc303c3ea7f060bb"
+    }
+  }
+}

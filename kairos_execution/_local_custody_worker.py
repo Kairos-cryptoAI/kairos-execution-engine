@@ -14,6 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from eth_account import Account
 
 from kairos_execution.local_custody import _assert_private_windows_acl  # noqa: E402
+from kairos_execution.prod_universe import valid_instrument_set  # noqa: E402
+from kairos_execution.siwe_auth import evedex_siwe_message  # noqa: E402
 
 MAX_LINE = 32 * 1024
 MAX_SECRET_FILE = 64 * 1024
@@ -150,7 +152,69 @@ def _validate_keystore(document: dict) -> None:
         raise ValueError("unsupported KDF")
 
 
+def _run_siwe(request: dict, expected_binding: dict) -> dict:
+    """Independently validate the fixed SIWE scope before opening secrets."""
+    if set(request) != {
+        "version",
+        "custody_reference",
+        "wallet_address",
+        "chain_id",
+        "approved_instruments",
+        "nonce",
+        "issued_at",
+        "keystore_file",
+        "unlock_file",
+    }:
+        raise ValueError("invalid SIWE request fields")
+    ref, wallet, chain = request["custody_reference"], request["wallet_address"], request["chain_id"]
+    if (
+        type(ref) is not str
+        or not ref
+        or ref != expected_binding.get("custody_reference")
+        or type(wallet) is not str
+        or wallet.casefold() != str(expected_binding.get("wallet_address", "")).casefold()
+        or type(chain) is not int
+        or chain != expected_binding.get("chain_id")
+        or request["approved_instruments"] != expected_binding.get("approved_instruments")
+    ):
+        raise ValueError("invalid SIWE custody binding")
+    message = evedex_siwe_message(
+        address=wallet, chain_id=chain, nonce=request["nonce"], issued_at=request["issued_at"]
+    )
+    key_path, unlock_path = _path(request["keystore_file"]), _path(request["unlock_file"])
+    if key_path == unlock_path:
+        raise ValueError("key and unlock files must be separate")
+    key_document = json.loads(_read_private(key_path, MAX_SECRET_FILE), object_pairs_hook=_reject_duplicates)
+    _validate_keystore(key_document)
+    password = _read_private(unlock_path, 4096).decode("utf-8")
+    if password.endswith("\r\n"):
+        password = password[:-2]
+    elif password.endswith("\n"):
+        password = password[:-1]
+    if not password or "\x00" in password:
+        raise ValueError("invalid unlock material")
+    private_key = bytearray(Account.decrypt(key_document, password))
+    try:
+        account = Account.from_key(bytes(private_key))
+        if account.address.casefold() != wallet.casefold():
+            raise ValueError("decrypted wallet mismatch")
+        from eth_account.messages import encode_defunct
+
+        signature = Account.sign_message(encode_defunct(text=message), bytes(private_key)).signature.hex()
+        if not signature.startswith("0x"):
+            signature = "0x" + signature
+        return {
+            "version": "kairos.local-keystore-sign-result.v1",
+            "wallet_address": account.address,
+            "signature": signature,
+        }
+    finally:
+        private_key[:] = b"\x00" * len(private_key)
+
+
 def _run(request: dict, expected_binding: dict) -> dict:
+    if type(request) is dict and request.get("version") == "kairos.local-siwe-sign.v1":
+        return _run_siwe(request, expected_binding)
     if type(request) is not dict or request.get("version") != "kairos.local-keystore-sign.v1":
         raise ValueError("invalid request")
     operation = request.get("operation")
@@ -184,8 +248,7 @@ def _run(request: dict, expected_binding: dict) -> dict:
         or chain_id <= 0
         or chain_id != expected_binding.get("chain_id")
         or type(instruments) is not list
-        or len(instruments) != 5
-        or len(set(instruments)) != 5
+        or not valid_instrument_set(instruments)
         or instruments != expected_binding.get("approved_instruments")
         or not all(type(item) is str and 0 < len(item) <= 80 for item in instruments)
     ):

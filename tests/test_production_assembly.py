@@ -89,8 +89,57 @@ def test_assembly_rejects_incomplete_runtime_before_provider_io():
 
 
 @pytest.mark.asyncio
-async def test_canary_start_latches_before_await_and_never_retries(monkeypatch):
+async def test_canary_start_refuses_without_the_typed_transport_before_service_start(monkeypatch):
     assembly = _assembly_shell()
+    started = []
+
+    async def must_not_start(**kwargs):
+        started.append(kwargs)
+
+    monkeypatch.setattr("kairos_execution.production_assembly.start_technical_canary_service", must_not_start)
+    with pytest.raises(ProductionAssemblyError, match="typed PROD EVEDEX transport"):
+        await assembly.start_technical_canary(references=(), owner_arm=object())
+    with pytest.raises(ProductionAssemblyError, match="already attempted"):
+        await assembly.start_technical_canary(references=(), owner_arm=object())
+    assert started == []
+
+
+def _assembly_with_transport(monkeypatch, preflights):
+    from types import SimpleNamespace
+
+    from kairos_execution.production_transport import ProductionEvedexTransport
+
+    async def preflight(self):
+        preflights.append(self)
+        return {"exchangeId": "synthetic"}
+
+    monkeypatch.setattr(ProductionEvedexTransport, "preflight", preflight)
+    transport = object.__new__(ProductionEvedexTransport)
+    assembly = _assembly_shell()
+    assembly.runtime = cast(
+        Any, SimpleNamespace(dispatcher=SimpleNamespace(sender=transport.send_signed_post))
+    )
+    return assembly, transport
+
+
+@pytest.mark.asyncio
+async def test_canary_start_runs_the_transport_preflight_before_the_service(monkeypatch):
+    preflights, order = [], []
+
+    async def start(**kwargs):
+        order.append(len(preflights))
+        raise RuntimeError("synthetic refused start")
+
+    monkeypatch.setattr("kairos_execution.production_assembly.start_technical_canary_service", start)
+    assembly, transport = _assembly_with_transport(monkeypatch, preflights)
+    with pytest.raises(RuntimeError, match="synthetic refused start"):
+        await assembly.start_technical_canary(references=(), owner_arm=object())
+    assert preflights == [transport] and order == [1]
+
+
+@pytest.mark.asyncio
+async def test_canary_start_latches_before_await_and_never_retries(monkeypatch):
+    assembly, _ = _assembly_with_transport(monkeypatch, [])
     calls = []
     entered = asyncio.Event()
     release = asyncio.Event()

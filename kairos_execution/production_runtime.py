@@ -101,6 +101,7 @@ class ProductionExecutionRuntime:
         database_uuid: UUID,
         context: ProductionContextV1,
         clock: Callable[[], datetime] | None = None,
+        limit_time_in_force: Literal["IOC", "GTC"] = "IOC",
     ) -> None:
         if not isinstance(database_uuid, UUID) or database_uuid.int == 0:
             raise ValueError("an exact isolated production database UUID is required")
@@ -136,7 +137,11 @@ class ProductionExecutionRuntime:
             raise ValueError("wire dispatcher differs from the exact production authorization scope")
         if authorization._preconditions.context != context:
             raise ValueError("production preconditions differ from the custody/database context")
+        self._check_session_configuration(signer, state_source, dispatcher)
         self._check_concrete_transport_binding(dispatcher, binding)
+        if limit_time_in_force not in {"IOC", "GTC"} or dispatcher.limit_time_in_force != limit_time_in_force:
+            raise ValueError("runtime and dispatcher limit policies differ")
+        self.limit_time_in_force = limit_time_in_force
         self.signer = signer
         self.authorization = authorization
         self.claims = claims
@@ -146,6 +151,38 @@ class ProductionExecutionRuntime:
         self.context = context
         self.binding = binding
         self._clock = clock or (lambda: datetime.now(UTC))
+
+    @staticmethod
+    def _check_session_configuration(signer, state_source, dispatcher) -> None:
+        from .session_entry_io import PostgresEntryIoJournal
+        from .session_stop_boundary import PostgresSessionStopBoundary
+
+        enabled = state_source._require_session_loss_latch
+        signer_boundary = signer._session_stop_boundary
+        dispatch_boundary = dispatcher._session_stop_boundary
+        if not enabled:
+            if (
+                signer_boundary is not None
+                or dispatch_boundary is not None
+                or signer._session_entry_io is not None
+                or dispatcher._session_entry_io is not None
+            ):
+                raise ValueError("session I/O boundary requires the account session-loss latch")
+            return
+        if (
+            type(signer_boundary) is not PostgresSessionStopBoundary
+            or signer_boundary is not dispatch_boundary
+            or signer_boundary.source is not state_source
+            or state_source._require_session_entry_fence is not True
+            or signer._require_session_entry_fence is not True
+            or dispatcher._require_session_entry_fence is not True
+            or type(signer._session_entry_io) is not PostgresEntryIoJournal
+            or signer._session_entry_io is not dispatcher._session_entry_io
+            or signer._session_entry_io.source is not state_source
+            or signer._session_entry_io.claims is not dispatcher.claims
+            or signer._session_entry_io.session_id != signer_boundary.session_id
+        ):
+            raise ValueError("session mode requires one exact boundary and static entry denial")
 
     @staticmethod
     def _check_concrete_transport_binding(
@@ -167,6 +204,7 @@ class ProductionExecutionRuntime:
         without reserving. The signer repeats authorization and commits the
         durable reservation before claiming/signing.
         """
+        self._check_session_configuration(self.signer, self.state_source, self.dispatcher)
         request = ManagedSigningRequestV1.model_validate(request)
         self._check_concrete_transport_binding(self.dispatcher, self.binding)
         if request.context != self.context:
@@ -216,10 +254,12 @@ class ProductionExecutionRuntime:
         This is not a second attempt or a replay facility. Both entry points
         share the same persistent signing/wire claims and unknown-outcome rule.
         """
+        self._check_session_configuration(self.signer, self.state_source, self.dispatcher)
         request = ManagedSigningRequestV1.model_validate(request)
         inspection = await self.inspect_authority(request)
         now = self._clock()
         signed = await self.signer.sign_async(request, now=now, claims=self.claims)
+        self._check_session_configuration(self.signer, self.state_source, self.dispatcher)
         wire = self._wire_request(request, signed, inspection)
         # Dispatcher performs an independent fresh state check after its own
         # durable one-use wire claim and immediately before exactly one POST.
@@ -270,7 +310,10 @@ class ProductionExecutionRuntime:
             effect_type=effect_type,
             method="POST",
             path=path,
-            body=production_wire_body(request.operation, message, signed.signature),
+            body=production_wire_body(
+                request.operation, message, signed.signature, limit_time_in_force=self.limit_time_in_force
+            ),
+            limit_time_in_force=self.limit_time_in_force,
             signing_request=request,
             custody_binding=self.binding,
             signed=signed,

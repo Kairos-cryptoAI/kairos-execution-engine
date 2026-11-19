@@ -15,6 +15,7 @@ const cases = [
   ["/api/v2/order/stop-limit", { id: "stop-1", instrument: "BTCUSD", side: "BUY", leverage: 1, quantity: "0.25", limitPrice: "60000", stopPrice: "59000", chainId: 42161, signature: SIGNATURE }, "createStopLimitOrderV2"],
   ["/api/v2/position/BTCUSD/close", { id: "close-1", instrument: "BTCUSD", leverage: 1, quantity: "0.25", chainId: 42161, signature: SIGNATURE }, "closePositionV2"],
   ["/api/tpsl/BTCUSD", { instrument: "BTCUSD", type: "stop-loss", side: "BUY", quantity: "0.25", price: "59000", order: "entry-1", signature: SIGNATURE }, "createTpSl"],
+  ["/api/v2/order/limit", { id: "gtc-entry-1", instrument: "BTCUSD", side: "BUY", leverage: 1, quantity: "0.25", limitPrice: "60000", chainId: 42161, signature: SIGNATURE }, "createLimitOrderV2"],
 ];
 
 function fixture({ exchangeId = "acct-prod-1", orderRecord = null, tpslPage = null } = {}) {
@@ -80,7 +81,7 @@ test("uses the pinned PROD SDK profile and only the API-key account constructor"
   const { gateway, optionsSeen } = fixture();
   await gateway.preflight();
   assert.deepEqual(await gateway.preflight(), { exchangeId: "acct-prod-1" });
-  await gateway.sendSignedPost({ method: "POST", path: cases[0][0], body: cases[0][1] });
+  await gateway.sendSignedPost({ method: "POST", path: cases[0][0], body: cases[0][1], deadline_ms: Date.now() + 2_000 });
   assert.deepEqual({
     authURI: optionsSeen[0].authURI,
     exchangeURI: optionsSeen[0].exchangeURI,
@@ -113,7 +114,7 @@ test("real pinned SDK Gateway uses isolated bounded HTTPS transport and x-api-ke
   });
   assert.equal(gateway.gatewayFactory instanceof Function, true);
   await gateway.preflight();
-  await gateway.sendSignedPost({ method: "POST", path: cases[0][0], body: cases[0][1] });
+  await gateway.sendSignedPost({ method: "POST", path: cases[0][0], body: cases[0][1], deadline_ms: Date.now() + 2_000 });
 
   assert.equal(requests.length, 2);
   assert.equal(requests[0].url, "https://trading-api.evedex.com/api/user/me");
@@ -169,7 +170,7 @@ test("passes exact pre-signed bodies through the corresponding SDK API method", 
   const { gateway, calls } = fixture();
   await gateway.preflight();
   for (const [path, body, method] of cases) {
-    const result = await gateway.sendSignedPost({ method: "POST", path, body });
+    const result = await gateway.sendSignedPost({ method: "POST", path, body, ...(path === cases[0][0] ? { deadline_ms: Date.now() + 2_000 } : {}) });
     assert.deepEqual(result, { accepted: true });
     assert.equal(calls.at(-1)[0], method);
     assert.equal(calls.at(-1)[1], body);

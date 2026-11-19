@@ -14,7 +14,7 @@ import json
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Annotated, Literal, Protocol, Self
+from typing import Annotated, Any, Literal, Protocol, Self
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -391,13 +391,85 @@ SINGLE_HOST_REQUIRED_ALERT_NAMES = (
 )
 
 
-class SingleHostAlertFactsV1(StrictRecord):
+def validate_telegram_callback(
+    query: object, *, owner_user_id: int, chat_id: int, message_id: int, callback_data: str
+) -> None:
+    """Bind an authenticated Bot API callback to one owner and delivered message."""
+    if not isinstance(query, dict):
+        raise ValueError("Telegram acknowledgment has no callback query")
+    sender, message = query.get("from"), query.get("message")
+    if not isinstance(sender, dict) or not isinstance(message, dict):
+        raise ValueError("Telegram acknowledgment lacks sender/message binding")
+    chat = message.get("chat")
+    if (
+        type(sender.get("id")) is not int
+        or sender["id"] != owner_user_id
+        or not isinstance(chat, dict)
+        or type(chat.get("id")) is not int
+        or chat["id"] != chat_id
+        or type(message.get("message_id")) is not int
+        or message["message_id"] != message_id
+        or query.get("data") != callback_data
+        or not isinstance(query.get("id"), str)
+        or not query["id"]
+    ):
+        raise ValueError("Telegram acknowledgment owner/chat/message/token mismatch")
+
+
+class TelegramAcknowledgementV2(StrictRecord):
+    version: Literal["kairos.telegram-owner-ack.v2"] = "kairos.telegram-owner-ack.v2"
+    type: Literal["ACK"] = "ACK"
+    event_sha256: Digest
+    at: datetime
+    owner_telegram_user_id: int = Field(gt=0, strict=True)
+    chat_id: int = Field(strict=True)
+    message_id: int = Field(gt=0, strict=True)
+    callback_data: str = Field(pattern=r"^ack:[a-f0-9]{56}$")
+    query: dict[str, Any]
+
+    _utc = field_validator("at")(_aware)
+
+    @model_validator(mode="after")
+    def bound_callback(self) -> Self:
+        if self.chat_id == 0 or self.callback_data != f"ack:{self.event_sha256[:56]}":
+            raise ValueError("Telegram acknowledgment event/token mismatch")
+        validate_telegram_callback(
+            self.query,
+            owner_user_id=self.owner_telegram_user_id,
+            chat_id=self.chat_id,
+            message_id=self.message_id,
+            callback_data=self.callback_data,
+        )
+        return self
+
+
+class SingleHostAlertDeliveryV2(AlertDeliveryV1):
+    owner_telegram_user_id: int = Field(gt=0, strict=True)
+    telegram_chat_id: int = Field(strict=True)
+    resolved_message_id: int = Field(gt=0, strict=True)
+    callback_data: str = Field(pattern=r"^ack:[a-f0-9]{56}$")
+    acknowledgement_sha256: Digest
+    delivery_receipt_sha256: Digest
+
+    @model_validator(mode="after")
+    def telegram_binding(self) -> Self:
+        if (
+            self.telegram_chat_id == 0
+            or self.callback_data != f"ack:{self.resolved_event_sha256[:56]}"
+            or self.receiver_identity != f"telegram-chat-{self.telegram_chat_id}"
+        ):
+            raise ValueError("single-host Telegram delivery/token binding mismatch")
+        return self
+
+
+class SingleHostAlertFactsV2(StrictRecord):
     """Local alert/supervision evidence, with no claim of full-host resilience."""
 
-    schema_version: Literal["kairos.single-host-alert-facts.v1"] = "kairos.single-host-alert-facts.v1"
+    schema_version: Literal["kairos.single-host-alert-facts.v2"] = "kairos.single-host-alert-facts.v2"
     artifact_sha256s: tuple[Digest, ...] = Field(min_length=1, max_length=10000)
     required_alert_names: tuple[Identity, ...] = Field(min_length=2, max_length=2)
-    deliveries: tuple[AlertDeliveryV1, ...] = Field(min_length=2, max_length=2)
+    owner_telegram_user_id: int = Field(gt=0, strict=True)
+    deliveries: tuple[SingleHostAlertDeliveryV2, ...] = Field(min_length=2, max_length=2)
     notifier_restart_receipt_sha256: Digest
     local_supervisor_identity: Identity
     local_supervisor_restart_receipt_sha256: Digest
@@ -419,7 +491,13 @@ class SingleHostAlertFactsV1(StrictRecord):
             raise ValueError("single-host local alert delivery coverage is incomplete")
         if set(self.required_alert_names) != set(SINGLE_HOST_REQUIRED_ALERT_NAMES):
             raise ValueError("single-host alert names differ from the fixed local profile")
+        if any(d.owner_telegram_user_id != self.owner_telegram_user_id for d in self.deliveries):
+            raise ValueError("single-host alert owner identity mismatch")
         return self
+
+
+# Import compatibility only: the alias validates V2 and cannot adopt unsafe V1 facts.
+SingleHostAlertFactsV1 = SingleHostAlertFactsV2
 
 
 class OperatorFactsV1(EvidenceArtifactsV1):
@@ -567,6 +645,7 @@ class FrozenGatePolicyV1(StrictRecord):
     maximum_drawdown_fraction: Positive
     crash_scenario_sha256s: tuple[Digest, ...] = Field(min_length=1)
     required_alert_names: tuple[Identity, ...] = Field(min_length=1)
+    owner_telegram_user_id: int | None = Field(default=None, gt=0, strict=True)
     minimum_forward_days: int = Field(ge=365)
     minimum_natural_closes: int = Field(ge=500)
     frozen_at: datetime
@@ -823,5 +902,81 @@ class SingleHostAlertReceiptInterpreter(SignedReceiptInterpreter):
             raise ValueError("single-host alert names differ from the fresh local profile policy")
         if facts.host_loss_resilience != "NOT_ESTABLISHED":
             raise ValueError("single-host evidence cannot claim full-host-loss resilience")
+        if frozen.owner_telegram_user_id is None or (
+            facts.owner_telegram_user_id != frozen.owner_telegram_user_id
+        ):
+            raise ValueError("single-host Telegram owner differs from the frozen owner pin")
         if any(delivery.owner_acknowledged_at > body.issued_at for delivery in facts.deliveries):
             raise ValueError("single-host alert receipt includes a future owner acknowledgment")
+        self.validate_artifacts(facts, owner_user_id=frozen.owner_telegram_user_id)
+
+    def validate_artifacts(self, facts: SingleHostAlertFactsV2, *, owner_user_id: int) -> None:
+        """Recheck raw delivery and callback bindings, also used before facts signing."""
+        if facts.owner_telegram_user_id != owner_user_id:
+            raise ValueError("single-host Telegram owner differs from the pinned owner")
+
+        def artifact(digest: str) -> dict:
+            raw = self._resolver.artifact_bytes(digest)
+            if len(raw) > _MAX_BYTES or hashlib.sha256(raw).hexdigest() != digest:
+                raise ValueError("single-host raw alert artifact integrity mismatch")
+            value = json.loads(raw, object_pairs_hook=_unique_json)
+            if not isinstance(value, dict):
+                raise ValueError("single-host raw alert artifact is not an object")
+            return value
+
+        for delivery in facts.deliveries:
+            expected_receipt = (
+                facts.local_supervisor_restart_receipt_sha256
+                if delivery.alert_name == "local-supervisor-restart"
+                else facts.local_health_check_receipt_sha256
+            )
+            if delivery.delivery_receipt_sha256 != expected_receipt:
+                raise ValueError("single-host alert delivery receipt binding mismatch")
+            receipt = artifact(expected_receipt)
+            if receipt.get("alert") != delivery.alert_name:
+                raise ValueError("single-host alert receipt name mismatch")
+            for state, digest, received in (
+                ("firing", delivery.firing_event_sha256, delivery.firing_received_at),
+                ("resolved", delivery.resolved_event_sha256, delivery.resolved_received_at),
+            ):
+                event = artifact(digest)
+                if event.get("alert_name") != delivery.alert_name or event.get("state") != state.upper():
+                    raise ValueError("single-host raw event name/state mismatch")
+                record = receipt.get(state)
+                if not isinstance(record, dict):
+                    raise ValueError("single-host alert delivery record missing")
+                answer = record.get("answer")
+                if not isinstance(answer, dict) or not isinstance(answer.get("chat"), dict):
+                    raise ValueError("single-host alert delivery has no Telegram response")
+                answer_digest = hashlib.sha256(canonical_bytes(answer)).hexdigest()
+                if (
+                    record.get("sha256") != digest
+                    or record.get("owner_telegram_user_id") != facts.owner_telegram_user_id
+                    or type(record.get("chat_id")) is not int
+                    or record["chat_id"] != delivery.telegram_chat_id
+                    or type(answer["chat"].get("id")) is not int
+                    or answer["chat"]["id"] != delivery.telegram_chat_id
+                    or type(answer.get("message_id")) is not int
+                    or answer["message_id"] <= 0
+                    or record.get("message_id") != answer["message_id"]
+                    or record.get("answer_sha256") != answer_digest
+                    or answer_digest not in facts.artifact_sha256s
+                    or datetime.fromisoformat(record["received_at"]) != received
+                    or datetime.fromtimestamp(answer["date"], tz=UTC) != received
+                    or (state == "resolved" and answer["message_id"] != delivery.resolved_message_id)
+                ):
+                    raise ValueError("single-host raw Telegram delivery binding mismatch")
+                if artifact(answer_digest) != answer:
+                    raise ValueError("single-host raw Telegram answer mismatch")
+            ack = TelegramAcknowledgementV2.model_validate_json(
+                canonical_bytes(artifact(delivery.acknowledgement_sha256))
+            )
+            if (
+                ack.owner_telegram_user_id != owner_user_id
+                or ack.event_sha256 != delivery.resolved_event_sha256
+                or ack.chat_id != delivery.telegram_chat_id
+                or ack.message_id != delivery.resolved_message_id
+                or ack.callback_data != delivery.callback_data
+                or ack.at != delivery.owner_acknowledged_at
+            ):
+                raise ValueError("single-host raw owner acknowledgment binding mismatch")

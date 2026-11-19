@@ -14,13 +14,14 @@ import json
 import math
 import os
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from .managed_signer import CustodyBindingV1, reviewed_schema_sha256
+from .production_dispatch import _canonical_bytes, _sha256, _WireToken
 from .production_readiness import ProductionContextV1
 
 _SIGNED_PATHS = {
@@ -200,6 +201,14 @@ def _raw_capture_request(
         return history_payload, history_query
     if any(value is not None for value in (order_id, after, before, transfer_type)):
         raise ProductionTransportError("history parameters are not valid for this fixed source")
+    if source == "best_depth":
+        if (
+            not isinstance(instrument, str)
+            or re.fullmatch(r"[A-Z0-9]{1,32}", instrument) is None
+            or any(value is not None for value in (version, limit, offset, next_cursor, max_level))
+        ):
+            raise ProductionTransportError("raw best-depth query is outside the fixed read contract")
+        return {"source": source, "instrument": instrument}, {"marketLevel": 1}
     if source == "depth":
         if (
             not isinstance(instrument, str)
@@ -319,6 +328,13 @@ def parse_raw_response_capture(
             "/api/user/funding-transfer" if source == "funding_transfers" else "/api/fill",
             authorized_query,
         )
+    elif source == "best_depth":
+        if expected_query != {"marketLevel": 1}:
+            raise ProductionTransportError("raw best-depth query differs from the documented contract")
+        _, authorized_query = _raw_capture_request(
+            source, version=None, limit=None, offset=None, next_cursor=None, instrument=instrument
+        )
+        expected_path = (f"/api/market/{instrument}/deep", authorized_query)
     elif source == "depth":
         if set(expected_query) != {"maxLevel"}:
             raise ProductionTransportError("raw depth query is outside the fixed read contract")
@@ -457,7 +473,10 @@ def _validate_signed_post(method: str, path: str, body: dict[str, Any]) -> tuple
                 break
     if operation is None:
         raise ProductionTransportError("signed operation is outside the fixed EVEDEX PROD allowlist")
-    if set(body) != _FIELDS[operation]:
+    expected_fields = _FIELDS[operation]
+    if path == "/api/v2/order/limit" and "timeInForce" not in body:
+        expected_fields = expected_fields - {"timeInForce"}
+    if set(body) != expected_fields:
         raise ProductionTransportError("signed body fields differ from the pinned EVEDEX schema")
     if not isinstance(body.get("signature"), str) or _SIGNATURE.fullmatch(body["signature"]) is None:
         raise ProductionTransportError("signed body signature is malformed")
@@ -477,8 +496,8 @@ def _validate_signed_post(method: str, path: str, body: dict[str, Any]) -> tuple
         raise ProductionTransportError("signed instrument differs from the exact SDK route")
     if body.get("side", "BUY") not in {"BUY", "SELL"}:
         raise ProductionTransportError("signed side is malformed")
-    if "timeInForce" in body and body["timeInForce"] != "IOC":
-        raise ProductionTransportError("signed operation differs from the reviewed IOC dispatch policy")
+    if "timeInForce" in body and body["timeInForce"] != ("GTC" if path == "/api/v2/order/limit" else "IOC"):
+        raise ProductionTransportError("signed operation differs from the reviewed order dispatch policy")
     if "postOnly" in body:
         raise ProductionTransportError("unsigned postOnly metadata is not part of the reviewed wire body")
     if "type" in body and body["type"] not in {"stop-loss", "take-profit"}:
@@ -487,6 +506,24 @@ def _validate_signed_post(method: str, path: str, body: dict[str, Any]) -> tuple
         if name in body and (not isinstance(body[name], str) or _DECIMAL.fullmatch(body[name]) is None):
             raise ProductionTransportError(f"{name} must remain a canonical REST decimal string")
     return operation, instrument
+
+
+def _market_deadline_ms(path: str, expires_at: datetime | None) -> int | None:
+    """Keep market entry's original signing lease outside its signed REST body."""
+    if path != "/api/v2/order/market":
+        if expires_at is not None:
+            raise ProductionTransportError("market deadline is only valid for market entry")
+        return None
+    if not isinstance(expires_at, datetime) or expires_at.utcoffset() != timedelta(0):
+        raise ProductionTransportError("market entry requires an explicit UTC signing deadline")
+    now = datetime.now(UTC)
+    if not now < expires_at <= now + timedelta(seconds=30):
+        raise ProductionTransportError("market entry signing deadline is expired or too far ahead")
+    # Floor rather than round up: IPC never extends the original signing lease.
+    deadline = (expires_at - datetime(1970, 1, 1, tzinfo=UTC)) // timedelta(milliseconds=1)
+    if deadline <= 0 or deadline > 2**53 - 1:
+        raise ProductionTransportError("market entry signing deadline is outside safe IPC bounds")
+    return deadline
 
 
 class ProductionEvedexTransport:
@@ -560,7 +597,15 @@ class ProductionEvedexTransport:
                 "explicit EVEDEX PROD preflight must finish before authority checks and transport"
             )
 
-    async def send_signed_post(self, *, method: str, path: str, body: dict[str, Any]) -> dict[str, Any]:
+    async def send_signed_post(
+        self,
+        *,
+        method: str,
+        path: str,
+        body: dict[str, Any],
+        expires_at: datetime | None = None,
+        wire_token: _WireToken | None = None,
+    ) -> dict[str, Any]:
         self._require_preflight()
         _validate_signed_post(method, path, body)
         try:
@@ -569,7 +614,25 @@ class ProductionEvedexTransport:
             )
         except (TypeError, ValueError) as exc:
             raise ProductionTransportError("signed EVEDEX body is not canonical JSON") from exc
-        result = await self.client.send_signed_post(method=method, path=path, body=immutable_body)
+        deadline_ms = _market_deadline_ms(path, expires_at)
+        if deadline_ms is None:
+            if wire_token is not None:
+                raise ProductionTransportError("market wire token cannot authorize a different operation")
+            result = await self.client.send_signed_post(method=method, path=path, body=immutable_body)
+        else:
+            if type(wire_token) is not _WireToken:
+                raise ProductionTransportError("market sender requires exact one-use wire authorization")
+            admitted_expiry = wire_token.consume(
+                method=method,
+                path=path,
+                body_sha256=_sha256(_canonical_bytes(immutable_body)),
+                now=datetime.now(UTC),
+            )
+            if expires_at != admitted_expiry:
+                raise ProductionTransportError("market sender cannot change the original signing deadline")
+            result = await self.client.send_signed_post(
+                method=method, path=path, body=immutable_body, expires_at=expires_at, wire_token=wire_token
+            )
         if not isinstance(result, dict):
             raise ProductionTransportError("EVEDEX SDK returned a malformed signed-operation response")
         return result
@@ -749,7 +812,9 @@ class ProductionEvedexSdkClient:
             limit=MAX_IPC_RESPONSE_BYTES + 1,
         )
 
-    async def _call(self, operation: str, payload: dict[str, Any], *, mutation: bool) -> Any:
+    async def _call(
+        self, operation: str, payload: dict[str, Any], *, mutation: bool, wire_token: _WireToken | None = None
+    ) -> Any:
         async with self._lock:
             if self._failed or self._closed:
                 raise ProductionTransportError(
@@ -769,6 +834,20 @@ class ProductionEvedexSdkClient:
             ):
                 raise ProductionTransportError(
                     "EVEDEX PROD SDK process is unavailable; reconcile before another attempt"
+                )
+            if operation == "send_signed_post" and payload.get("path") == "/api/v2/order/market":
+                if type(wire_token) is not _WireToken:
+                    raise ProductionTransportError("market IPC requires one-use wire authorization")
+                market_method = payload.get("method")
+                market_deadline = payload.get("deadline_ms")
+                if type(market_method) is not str or type(market_deadline) is not int:
+                    raise ProductionTransportError("market IPC binding is malformed")
+                wire_token.consume_ipc(
+                    method=market_method,
+                    path="/api/v2/order/market",
+                    body_sha256=_sha256(_canonical_bytes(payload.get("body"))),
+                    deadline_ms=market_deadline,
+                    now=datetime.now(UTC),
                 )
             request_id = uuid4().hex
             try:
@@ -900,11 +979,25 @@ class ProductionEvedexSdkClient:
             raise ProductionTransportError("PROD health lacks successful exact native authentication capture")
         return health
 
-    async def send_signed_post(self, *, method: str, path: str, body: dict[str, Any]) -> dict[str, Any]:
+    async def send_signed_post(
+        self,
+        *,
+        method: str,
+        path: str,
+        body: dict[str, Any],
+        expires_at: datetime | None = None,
+        wire_token: _WireToken | None = None,
+    ) -> dict[str, Any]:
         _validate_signed_post(method, path, body)
-        return await self._call(
-            "send_signed_post", {"method": method, "path": path, "body": body}, mutation=True
-        )
+        deadline_ms = _market_deadline_ms(path, expires_at)
+        payload: dict[str, Any] = {"method": method, "path": path, "body": body}
+        if deadline_ms is not None:
+            if type(wire_token) is not _WireToken:
+                raise ProductionTransportError("market IPC requires one-use wire authorization")
+            payload["deadline_ms"] = deadline_ms
+        elif wire_token is not None:
+            raise ProductionTransportError("market wire token cannot authorize a different operation")
+        return await self._call("send_signed_post", payload, mutation=True, wire_token=wire_token)
 
     async def cancel_order(self, *, effect_id: str, instrument: str, order_id: str) -> dict[str, Any]:
         ProductionEvedexTransport._validate_cancel(
@@ -982,6 +1075,9 @@ class ProductionEvedexSdkClient:
         elif source == "depth":
             if set(payload) != {"source", "instrument", "max_level"}:
                 raise ProductionTransportError("raw depth capture fields differ from the fixed read contract")
+        elif source == "best_depth":
+            if set(payload) != {"source", "instrument"}:
+                raise ProductionTransportError("raw best-depth fields differ from the fixed read contract")
         elif source == "order_fills":
             if set(payload) != {"source", "order_id"}:
                 raise ProductionTransportError("raw order fills fields differ from the fixed read contract")

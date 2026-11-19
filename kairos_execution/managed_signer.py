@@ -12,12 +12,14 @@ import asyncio
 import hashlib
 import json
 import re
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 from typing import Annotated, Literal, Protocol, runtime_checkable
 
 from pydantic import Field, field_validator
 
 from .crypto import EIP712_SCHEMAS, build_domain
+from .prod_universe import valid_instrument_set
 from .production_readiness import Digest, Identity, ProductionContextV1, StrictRecord, _aware
 from .state_machine import is_evedex_client_order_id
 
@@ -87,8 +89,8 @@ class CustodyBindingV1(StrictRecord):
     @field_validator("approved_instruments")
     @classmethod
     def explicit_universe(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if len(value) != 5 or len(set(value)) != 5:
-            raise ValueError("five distinct owner-reviewed production instruments are required")
+        if not valid_instrument_set(value):
+            raise ValueError("distinct owner-reviewed PROD instruments (prod_universe) are required")
         return value
 
 
@@ -246,18 +248,41 @@ class ManagedSignerBoundary:
         verifier: SignatureVerifier,
         claims: SigningClaimStore,
         authorization: SigningAuthorizationVerifier | AsyncSigningAuthorizationVerifier,
+        require_session_entry_fence: bool = False,
+        session_stop_boundary=None,
+        session_entry_io=None,
     ) -> None:
+        if type(require_session_entry_fence) is not bool:
+            raise TypeError("session entry fence requirement must be boolean")
         self.binding = binding
         self._backend = backend
         self._verifier = verifier
         self._claims = claims
         self._authorization = authorization
+        # Until the session source, schema integrity and I/O fence are
+        # qualified, attaching the supplemental boundary cannot enable entry.
+        self._require_session_entry_fence = (
+            require_session_entry_fence or session_stop_boundary is not None or session_entry_io is not None
+        )
+        self._session_stop_boundary = session_stop_boundary
+        self._session_entry_io = session_entry_io
 
     def _prepare_fields(
         self, request: ManagedSigningRequestV1, now: datetime
     ) -> tuple[ManagedSigningRequestV1, CustodyBindingV1, dict, dict, str]:
         _aware(now)
         request = ManagedSigningRequestV1.model_validate(request)
+        # No current custody backend implements an atomic session-loss fence.
+        # When this optional requirement is selected, do not call custody or
+        # consume a claim for any entry. A future implementation must fence at
+        # custody AND at submission; a Python preflight callback is not one.
+        # The two allowlisted operations still need normal authorization.
+        # Stop-limit is denied even if used for protection elsewhere.
+        if self._require_session_entry_fence and request.operation not in {
+            "Position close order",
+            "New take-profit/stop-loss",
+        }:
+            raise ManagedSigningError("atomic session entry fence is unavailable")
         binding = CustodyBindingV1.model_validate(self.binding)
         if (
             request.context != binding.context
@@ -291,6 +316,11 @@ class ManagedSignerBoundary:
 
     def sign(self, request: ManagedSigningRequestV1, *, now: datetime) -> SignedTypedDataV1:
         request, binding, types, message, digest = self._prepare(request, now)
+        if self._session_stop_boundary is not None and request.operation not in {
+            "Position close order",
+            "New take-profit/stop-loss",
+        }:
+            raise ManagedSigningError("session-bound entries require asynchronous signing")
         try:
             claimed = self._claims.claim_once(
                 custody_reference=binding.custody_reference,
@@ -388,7 +418,29 @@ class ManagedSignerBoundary:
                 try:
                     # Offloading does not make an unwired native backend
                     # killable. Timeout leaves the committed claim UNKNOWN.
-                    signed = await asyncio.to_thread(self._sign_claimed, binding, types, message, digest)
+                    if self._session_entry_io is not None and request.operation not in {
+                        "Position close order",
+                        "New take-profit/stop-loss",
+                    }:
+                        await self._session_entry_io.begin_sign(
+                            custody_reference=binding.custody_reference,
+                            request_id=request.request_id,
+                            request_sha=digest,
+                        )
+                    boundary = (
+                        self._session_stop_boundary.entry(context=request.context)
+                        if self._session_stop_boundary is not None
+                        and request.operation not in {"Position close order", "New take-profit/stop-loss"}
+                        else nullcontext()
+                    )
+                    async with boundary as lease:
+                        if loop.time() >= deadline:
+                            raise TimeoutError
+                        if lease is not None:
+                            lease.assert_live()
+                        signed = await asyncio.to_thread(self._sign_claimed, binding, types, message, digest)
+                        if lease is not None:
+                            lease.assert_live()
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -421,6 +473,21 @@ class ManagedSignerBoundary:
                     raise ManagedSigningError(
                         "signing terminal outcome is unresolved; do not retry"
                     ) from None
+                if self._session_entry_io is not None and request.operation not in {
+                    "Position close order",
+                    "New take-profit/stop-loss",
+                }:
+                    try:
+                        await self._session_entry_io.complete_sign(
+                            custody_reference=binding.custody_reference,
+                            request_id=request.request_id,
+                            request_sha=digest,
+                            signature_sha=signed.signature_sha256,
+                        )
+                    except Exception:
+                        raise ManagedSigningError(
+                            "session signing journal unresolved; do not retry"
+                        ) from None
                 if loop.time() >= deadline:
                     raise TimeoutError
                 return signed

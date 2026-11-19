@@ -209,7 +209,7 @@ class SyntheticExitVerifier:
         return VerifiedLiveExitEvidenceV1(**fields)
 
 
-def _setup(role="TIMEOUT_EXIT", *, state=None, quantity=0.05, filled_quantity=0.1):
+def _setup(role="TIMEOUT_EXIT", *, state=None, quantity=0.05, filled_quantity=0.1, gtc=False):
     decision = _live_decision()
     context = ProductionContextV1(
         remote_account_id=decision.account_id,
@@ -348,6 +348,13 @@ def _setup(role="TIMEOUT_EXIT", *, state=None, quantity=0.05, filled_quantity=0.
         min(decision.intent.entry_expires_ts_ms, decision.venue_quality.expires_at_ms) / 1_000,
         tz=UTC,
     )
+    gtc_entry = None
+    gtc_expiry = entry_expiry
+    if gtc:
+        from kairos_execution.limit_gtc_contract import LimitGtcEntryV1
+
+        gtc_expiry = min(entry_expiry, entry_plan_now + timedelta(seconds=3))
+        gtc_entry = LimitGtcEntryV1(cancel_after_ms=int(gtc_expiry.timestamp() * 1000))
     bindings.rows[entry_effect_id] = build_production_lifecycle_binding(
         decision=decision,
         context=context,
@@ -356,8 +363,9 @@ def _setup(role="TIMEOUT_EXIT", *, state=None, quantity=0.05, filled_quantity=0.
         lifecycle_effect_id=entry_effect_id,
         client_order_id=entry_id,
         manual_request_sha256="5" * 64,
-        expires_at=entry_expiry,
+        expires_at=gtc_expiry if gtc else entry_expiry,
         now=entry_plan_now,
+        limit_gtc_entry=gtc_entry,
     )
     verifier = SyntheticExitVerifier()
     publisher = ProductionLiveExitRiskPublisher(
@@ -644,3 +652,43 @@ def test_pinned_source_refuses_before_any_writer_can_be_called():
             now=NOW,
         )
     assert GAPS and not risks.rows and not exposures.rows and len(bindings.rows) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["STOP_LOSS", "TAKE_PROFIT", "TIMEOUT_EXIT"])
+async def test_exit_after_a_bounded_gtc_entry_resolves_its_owner_binding(role):
+    """The owner lineage of a LIMIT_GTC entry is rebuilt with its cancellation contract."""
+    publisher, _verifier, *_rest, _decision, _trade, effect = _setup(role, gtc=True)
+    receipt = await _stage(publisher, effect)
+    assert receipt.lifecycle_binding.role == role
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["STOP_LOSS", "TAKE_PROFIT"])
+async def test_cancellation_accepts_the_exit_risk_record_of_a_staged_protection(role):
+    """A protection binding carries its own exit-risk record, not the entry decision."""
+    from kairos_execution.production_cancellation import (
+        ProductionCancellationError,
+        ProductionCancellationVerifier,
+    )
+
+    publisher, _verifier, *_rest, decision, trade, effect = _setup(role, gtc=True)
+    binding = (await _stage(publisher, effect)).lifecycle_binding
+    assert binding.risk_decision_id != trade.risk_decision_id
+    cancellations = object.__new__(ProductionCancellationVerifier)
+    cancellations.context = publisher.context
+    cancellations.custody_binding = publisher.custody_binding
+    digest = cancellations._verify_origin_binding(
+        binding, trade=trade, origin=effect, origin_key=effect.effect_key, role=role, signing_claimed_at=NOW
+    )
+    assert digest == binding.request.manual_request_sha256
+    foreign = binding.model_copy(update={"decision_id": "another-decision"})
+    with pytest.raises(ProductionCancellationError):
+        cancellations._verify_origin_binding(
+            foreign,
+            trade=trade,
+            origin=effect,
+            origin_key=effect.effect_key,
+            role=role,
+            signing_claimed_at=NOW,
+        )

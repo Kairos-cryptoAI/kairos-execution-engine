@@ -223,7 +223,7 @@ def test_bad_http_response_is_not_persisted(tmp_path, monkeypatch, response):
     assert normalized == []
 
 
-@pytest.mark.parametrize("symbol", ["BTCUSD", "btcUSDT", "DOGEUSDT", ""])
+@pytest.mark.parametrize("symbol", ["BTCUSD", "btcUSDT", "ATOMUSDT", ""])
 def test_unapproved_symbol_refuses_before_http(tmp_path, monkeypatch, symbol):
     normalized = []
     install_fake_quant_normalizer(monkeypatch, normalized)

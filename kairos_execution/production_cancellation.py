@@ -23,7 +23,9 @@ from kairos_core.enums import TradeLifecycleState, TradingMode
 from kairos_persistence import EffectStatus, EffectType
 from pydantic import Field, field_validator, model_validator
 
+from .limit_gtc_contract import LIMIT_GTC_ENTRY_CONTRACT
 from .managed_signer import CustodyBindingV1, _typed_message
+from .market_ioc_admission import MARKET_IOC_ENTRY_CONTRACT
 from .production_claims import PostgresProductionClaims
 from .production_lifecycle_binding import ProductionLifecycleBindingV1, build_production_lifecycle_binding
 from .production_readiness import (
@@ -462,15 +464,16 @@ class ProductionCancellationVerifier:
         origin = await self.effects.get(origin_key)
         if origin is None or await verify_effect(origin_key) is not True:
             raise ProductionCancellationError("durable origin execution journal chain is invalid")
+        binding = await self.bindings.get(origin_key)
         self._validate_origin(
             origin,
             trade=trade,
             origin_key=origin_key,
             role=role,
             target_id=target_id,
+            binding=binding,
         )
-        binding = await self.bindings.get(origin_key)
-        signing_claimed_at = await self._verify_completed_origin_claims(binding)
+        signing_claimed_at = await self._verify_completed_origin_claims(binding, origin=origin)
         owner_hash = self._verify_origin_binding(
             binding,
             trade=trade,
@@ -488,7 +491,7 @@ class ProductionCancellationVerifier:
             if entry_origin is None or await verify_effect(entry_key) is not True:
                 raise ProductionCancellationError("durable entry origin journal chain is invalid")
             entry_binding = await self.bindings.get(entry_key)
-            entry_claimed_at = await self._verify_completed_origin_claims(entry_binding)
+            entry_claimed_at = await self._verify_completed_origin_claims(entry_binding, origin=entry_origin)
             entry_hash = self._verify_origin_binding(
                 entry_binding,
                 trade=trade,
@@ -577,10 +580,11 @@ class ProductionCancellationVerifier:
             or risk.signing_request_id != binding.request.request_id
             or risk.effect_id != binding.signing_effect_id
             or risk.client_order_id != trade.entry_client_order_id
-            or risk.operation != "New limit order"
+            or risk.operation != binding.request.operation
             or risk.instrument != decision.venue_symbol
             or risk.side != expected_side
-            or risk.quantity != message.get("quantity")
+            or risk.quantity != message.get("quantity", 0)
+            or risk.cash_quantity != message.get("cashQuantity")
             or risk.price != message.get("limitPrice")
             or risk.leverage != 1
             or risk.worst_case_loss_usd != Decimal(str(decision.worst_case_loss_usd))
@@ -673,6 +677,7 @@ class ProductionCancellationVerifier:
         origin_key: str,
         role: str,
         target_id: str,
+        binding: ProductionLifecycleBindingV1 | None = None,
     ) -> None:
         if origin is None:
             raise ProductionCancellationError("owned origin effect is absent")
@@ -740,6 +745,26 @@ class ProductionCancellationVerifier:
                 "price_hex": float(trade.stop_price if role == "STOP_LOSS" else trade.target_price).hex(),
             }
         )
+        if role == "ENTRY" and binding is not None and binding.market_ioc_entry is not None:
+            if binding.market_ioc_envelope is None:
+                raise ProductionCancellationError("original market envelope is absent")
+            expected_payload = {
+                "trade_id": trade.trade_id,
+                "intent_id": trade.strategy_intent_id,
+                "client_order_id": owned_client_id,
+                "venue_symbol": trade.venue_symbol,
+                "side": trade.side,
+                "entry_contract": MARKET_IOC_ENTRY_CONTRACT,
+                "cash_quantity_e8": binding.market_ioc_entry.cash_quantity_e8,
+                "market_envelope_sha256": canonical_digest(binding.market_ioc_envelope),
+                "quantity_cap_hex": float(trade.quantity).hex(),
+                "leverage_hex": float(trade.leverage).hex(),
+            }
+        if role == "ENTRY" and binding is not None and binding.limit_gtc_entry is not None:
+            expected_payload.update(
+                entry_contract=LIMIT_GTC_ENTRY_CONTRACT,
+                cancel_after_ms=binding.limit_gtc_entry.cancel_after_ms,
+            )
         if origin.request_payload != expected_payload:
             raise ProductionCancellationError("origin journal payload differs from exact trade geometry")
 
@@ -783,7 +808,12 @@ class ProductionCancellationVerifier:
                 # historical admission time; never renew an expired plan.
                 now=signing_claimed_at,
                 parent_order_id=None if role == "ENTRY" else trade.entry_client_order_id,
-                risk_decision_id=trade.risk_decision_id,
+                # A protection is staged by the exit-risk publisher with its own
+                # independent exit-risk record; the entry keeps the original decision.
+                risk_decision_id=trade.risk_decision_id if role == "ENTRY" else candidate.risk_decision_id,
+                market_ioc_entry=candidate.market_ioc_entry,
+                market_ioc_envelope=candidate.market_ioc_envelope,
+                limit_gtc_entry=candidate.limit_gtc_entry,
             )
         except Exception:
             raise ProductionCancellationError("stored lifecycle binding fails canonical rebuild") from None
@@ -792,7 +822,8 @@ class ProductionCancellationVerifier:
             or candidate.context != self.context
             or candidate.trade_id != trade.trade_id
             or candidate.decision_id != trade.risk_decision_id
-            or candidate.risk_decision_id != trade.risk_decision_id
+            or (role == "ENTRY" and candidate.risk_decision_id != trade.risk_decision_id)
+            or (role != "ENTRY" and re.fullmatch(r"[a-f0-9]{64}", candidate.risk_decision_id or "") is None)
             or candidate.role != role
             or candidate.lifecycle_effect_id != origin_key
             or origin.effect_key != origin_key
@@ -801,8 +832,113 @@ class ProductionCancellationVerifier:
             raise ProductionCancellationError("stored lifecycle binding differs from exact journal origin")
         return candidate.request.manual_request_sha256
 
-    async def _verify_completed_origin_claims(self, binding: ProductionLifecycleBindingV1) -> datetime:
+    @staticmethod
+    def canonical_recovered_gtc_record(record):
+        """Lossless JSON projection for native Decimal reads and PG roundtrip."""
+
+        def normalize(value):
+            if isinstance(value, Decimal):
+                if not value.is_finite():
+                    raise ProductionCancellationError("native GTC record has a nonfinite number")
+                return format(value, "f")
+            if isinstance(value, dict):
+                return {key: normalize(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [normalize(item) for item in value]
+            return value
+
+        return normalize(record)
+
+    @staticmethod
+    def _validate_recovered_gtc_record(binding, record) -> None:
+        """Positive exact-order proof, never absence or a legacy/market fallback."""
+        try:
+            message = json.loads(binding.request.message_json)
+            total = Decimal(str(record["quantity"]))
+            remaining = Decimal(str(record["unFilledQuantity"]))
+            price = Decimal(str(record["limitPrice"]))
+            average = Decimal(str(record["filledAvgPrice"]))
+            status = str(record["status"]).upper().replace("CANCELLED", "CANCELED")
+            valid = (
+                binding.role == "ENTRY"
+                and binding.limit_gtc_entry is not None
+                and binding.market_ioc_entry is None
+                and binding.request.operation == "New limit order"
+                and record["id"] == message["id"]
+                and record["instrument"] == message["instrument"]
+                and record["side"] == message["side"]
+                and record["type"] == "LIMIT"
+                and Decimal(str(record["leverage"])) == Decimal(message["leverage"])
+                and (
+                    "chainId" not in record or Decimal(str(record["chainId"])) == Decimal(message["chainId"])
+                )
+                and record.get("timeInForce", "GTC") == "GTC"
+                and status in {"PARTIALLY_FILLED", "FILLED", "CANCELED", "EXPIRED"}
+                and (status != "FILLED" or remaining == 0)
+                and (status != "PARTIALLY_FILLED" or remaining > 0)
+                and all(value.is_finite() for value in (total, remaining, price, average))
+                and total * 100_000_000 == message["quantity"]
+                and price * 100_000_000 == message["limitPrice"]
+                and 0 <= remaining < total
+                and average > 0
+                and (average <= price if message["side"] == "BUY" else average >= price)
+            )
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            valid = False
+        if not valid:
+            raise ProductionCancellationError(
+                "recovered GTC origin lacks exact positive signed order geometry"
+            )
+
+    async def recovered_gtc_entry_proof(self, *, binding, record) -> dict[str, str]:
+        """Return non-authorizing lineage for an authenticated positive recovery.
+
+        The engine must separately journal the exact native record. Cancellation
+        still repeats its independent qualified current-account source checks.
+        Neither signing nor original wire claims are changed here.
+        """
+        record = self.canonical_recovered_gtc_record(record)
+        await self._verify_completed_origin_claims(binding, recovered_gtc_record=record)
+        wire = await self.claims.load_claim(
+            kind="WIRE_DISPATCH",
+            namespace=f"wire:{canonical_digest(self.context)}",
+            identity=binding.signing_effect_id,
+        )
+        if wire is None or not _is_digest(wire.get("request_sha256")):
+            raise ProductionCancellationError("original GTC wire claim is absent")
+        return {
+            "version": "kairos.recovered-gtc-origin.v1",
+            "wire_request_sha256": wire["request_sha256"],
+            "record_sha256": _sha256(record),
+        }
+
+    async def _verify_completed_origin_claims(
+        self,
+        binding: ProductionLifecycleBindingV1,
+        *,
+        origin=None,
+        recovered_gtc_record=None,
+    ) -> datetime:
         request = binding.request
+        expected_wire_sha = None
+        if origin is not None and origin.status is EffectStatus.RECONCILED:
+            payload = origin.response_payload
+            if isinstance(payload, dict) and "recovered_gtc_origin" in payload:
+                proof = payload["recovered_gtc_origin"]
+                record = {key: value for key, value in payload.items() if key != "recovered_gtc_origin"}
+                if (
+                    not isinstance(proof, dict)
+                    or set(proof) != {"version", "wire_request_sha256", "record_sha256"}
+                    or proof["version"] != "kairos.recovered-gtc-origin.v1"
+                    or proof["record_sha256"] != _sha256(record)
+                    or not _is_digest(proof["wire_request_sha256"])
+                ):
+                    raise ProductionCancellationError(
+                        "recovered GTC origin proof differs from journal record"
+                    )
+                recovered_gtc_record, expected_wire_sha = record, proof["wire_request_sha256"]
+        if recovered_gtc_record is not None:
+            self._validate_recovered_gtc_record(binding, recovered_gtc_record)
         try:
             _types, message = _typed_message(request, self.custody_binding)
             canonical = json.dumps(
@@ -829,6 +965,18 @@ class ProductionCancellationVerifier:
         claimed_at = signing_claim.get("claimed_at") if signing_claim is not None else None
         if not isinstance(claimed_at, datetime):
             raise ProductionCancellationError("origin lacks exact completed signing and wire lineage")
+        completed_wire = (
+            wire_claim is not None
+            and wire_claim.get("terminal_status") == "COMPLETED"
+            and _is_digest(wire_claim.get("result_sha256"))
+        )
+        recovered_unknown_wire = (
+            recovered_gtc_record is not None
+            and wire_claim is not None
+            and wire_claim.get("terminal_status") in {None, "UNRESOLVED"}
+            and _is_digest(wire_claim.get("request_sha256"))
+            and (expected_wire_sha is None or expected_wire_sha == wire_claim.get("request_sha256"))
+        )
         if (
             signing_claim is None
             or signing_claim.get("claim_kind") != "TYPED_SIGNING"
@@ -843,8 +991,8 @@ class ProductionCancellationVerifier:
             or wire_claim.get("namespace") != f"wire:{canonical_digest(self.context)}"
             or wire_claim.get("identity") != binding.signing_effect_id
             or wire_claim.get("context_sha256") != canonical_digest(self.context)
-            or wire_claim.get("terminal_status") != "COMPLETED"
-            or not _is_digest(wire_claim.get("result_sha256"))
+            or (expected_wire_sha is not None and expected_wire_sha != wire_claim.get("request_sha256"))
+            or not (completed_wire or recovered_unknown_wire)
             or claimed_at.tzinfo is None
             or claimed_at.utcoffset() != timedelta(0)
             or claimed_at >= request.expires_at
@@ -979,7 +1127,26 @@ class ProductionCancellationVerifier:
                     and item.parent_order_id == trade.entry_client_order_id
                     and item.covered_quantity >= venue.position_quantity
                 }
-                if not expected.issubset(live):
+                # The first protection can fail while the trade is still
+                # PROTECTING. Cancelling its own proven entry remainder only
+                # removes possible new exposure; requiring both protections
+                # here would deadlock the subsequent independently authorized
+                # emergency close. This does not authorize cancelling a stop
+                # or closing a position. Exact owner/origin/claim checks above
+                # remain mandatory, and the source must identify this position
+                # as belonging to the same entry, not merely the same symbol.
+                try:
+                    recorded_fill = Decimal(str(getattr(trade, "filled_quantity", 0)))
+                    protection_setup_remainder = (
+                        getattr(getattr(trade, "state", None), "value", getattr(trade, "state", None))
+                        == TradeLifecycleState.PROTECTING.value
+                        and recorded_fill.is_finite()
+                        and 0 < recorded_fill <= venue.position_quantity <= Decimal(str(trade.quantity))
+                        and venue.entry_parent_order_id == target_id == trade.entry_client_order_id
+                    )
+                except (ValueError, ArithmeticError):
+                    protection_setup_remainder = False
+                if not expected.issubset(live) and not protection_setup_remainder:
                     raise ProductionCancellationError("partial entry exposure lacks both active protections")
             return
 

@@ -65,6 +65,42 @@ evidence verification. No key is imported or migrated automatically. In
 particular, a general-purpose `keys.txt` is not an approved encrypted keystore,
 and a DEV API key is not evidence of a PROD account/signing association.
 
+## Private role files
+
+Provisioning creates role DSN files with a protected current-user/SYSTEM DACL on
+Windows, applied when the file is created. POSIX uses private directories and
+0600 files. Reads validate the opened object and its permissions before using
+bounded contents; links and unsafe inherited/shared file permissions are refused.
+Existing directory permissions are never widened or rewritten automatically.
+
+Old DSN files do not become safe merely by updating the package. Replace unsafe
+files through the reviewed credential provisioning process before loading their
+manifest. If a password was exposed by shared permissions, rotate that database
+role's password as well. The code update does not rotate deployment credentials.
+
+## Telegram owner acknowledgments
+
+Local alert evidence uses `kairos.single-host-alert-facts.v2`. The frozen gate
+policy must explicitly pin a positive integer `owner_telegram_user_id`; the
+monitor and facts commands require the same `--owner-user-id`. A group chat ID
+is a delivery destination, not an owner identity. Private and group chats both
+work when the callback sender is the pinned owner.
+
+The monitor accepts only the exact `ack:` token with the resolved event's 56
+hexadecimal characters, on the chat and message recorded in the Telegram
+delivery response. Facts retain the raw callback and delivery artifacts. The
+receipt verifier independently checks the sender against the frozen owner pin,
+the exact event/token, chat, message, raw responses and acknowledgment time.
+A different group member, copied button, short or empty prefix cannot qualify.
+
+Historical prefix-only ACK logs and V1 single-host alert receipts are refused.
+Migration requires an explicitly pinned owner in a freshly frozen policy and a
+fresh alert drill/log, followed by new facts and receipts bound to that policy;
+no owner ID is inferred or filled in from old observations. The legacy generic
+fourteen-gate `AlertFactsV1` contract remains separate. The old Python import
+`SingleHostAlertFactsV1` is only an alias for the strict V2 schema, not a V1
+evidence converter.
+
 ## Finite engineering acceptance
 
 `tests/test_nontrading_executor_acceptance.py` composes the real PostgreSQL

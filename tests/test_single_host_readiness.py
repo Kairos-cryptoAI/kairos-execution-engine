@@ -25,19 +25,22 @@ from kairos_execution.single_host_readiness import (
     issuer_registry_sha256,
     single_host_profile_sha256,
 )
-from tests.production_evidence_fixtures import NOW, H, signed_gate_fixture
+from tests.alert_evidence_fixtures import synthetic_alert_facts
+from tests.production_evidence_fixtures import NOW, signed_gate_fixture
 from tests.test_signed_evidence import reissue
 
 
-def single_host_gate_fixture():
+def single_host_gate_fixture(*, owner_user_id=5):
     """Build test-only signatures bound to a fresh local-alert frozen policy."""
 
     _, all_refs, resolver, old_context, private, old_policy = signed_gate_fixture()
     original_policy = FrozenGatePolicyV1.model_validate_json(
         canonical_bytes(json.loads(resolver.artifacts[old_context.frozen_policy_sha256]))
     )
-    local_policy = original_policy.model_copy(
-        update={"required_alert_names": SINGLE_HOST_REQUIRED_ALERT_NAMES}
+    local_policy = original_policy.model_dump(mode="json")
+    local_policy.update(
+        required_alert_names=SINGLE_HOST_REQUIRED_ALERT_NAMES,
+        owner_telegram_user_id=owner_user_id,
     )
     policy_bytes = canonical_bytes(local_policy)
     policy_hash = hashlib.sha256(policy_bytes).hexdigest()
@@ -45,46 +48,13 @@ def single_host_gate_fixture():
     context = old_context.model_copy(update={"frozen_policy_sha256": policy_hash})
     policy = old_policy.model_copy(update={"context": context})
 
-    restart_artifact = b"SYNTHETIC_TEST_ONLY_LOCAL_SUPERVISOR_RESTART"
-    health_artifact = b"SYNTHETIC_TEST_ONLY_LOCAL_PROCESS_HEALTH"
-    restart_hash = hashlib.sha256(restart_artifact).hexdigest()
-    health_hash = hashlib.sha256(health_artifact).hexdigest()
-    resolver.artifacts[restart_hash] = restart_artifact
-    resolver.artifacts[health_hash] = health_artifact
+    def store(data):
+        digest = hashlib.sha256(data).hexdigest()
+        resolver.artifacts[digest] = data
+        return digest
 
     new_refs = []
-    alert_facts_json = canonical_bytes(
-        SingleHostAlertFactsV1(
-            artifact_sha256s=(H, restart_hash, health_hash),
-            required_alert_names=SINGLE_HOST_REQUIRED_ALERT_NAMES,
-            deliveries=(
-                dict(
-                    alert_name=SINGLE_HOST_REQUIRED_ALERT_NAMES[0],
-                    firing_event_sha256=H,
-                    resolved_event_sha256=H,
-                    receiver_identity="owner-alarm",
-                    firing_received_at=NOW - timedelta(minutes=4),
-                    resolved_received_at=NOW - timedelta(minutes=3),
-                    owner_acknowledged_at=NOW - timedelta(minutes=2),
-                ),
-                dict(
-                    alert_name=SINGLE_HOST_REQUIRED_ALERT_NAMES[1],
-                    firing_event_sha256=H,
-                    resolved_event_sha256=H,
-                    receiver_identity="owner-alarm",
-                    firing_received_at=NOW - timedelta(minutes=2),
-                    resolved_received_at=NOW - timedelta(minutes=1),
-                    owner_acknowledged_at=NOW,
-                ),
-            ),
-            notifier_restart_receipt_sha256=H,
-            local_supervisor_identity="local-process-supervisor",
-            local_supervisor_restart_receipt_sha256=restart_hash,
-            local_health_check_receipt_sha256=health_hash,
-            host_loss_resilience="NOT_ESTABLISHED",
-            unknown_sends=0,
-        )
-    ).decode()
+    alert_facts_json = canonical_bytes(synthetic_alert_facts(NOW, store)).decode()
     facts_schema_sha256 = hashlib.sha256(
         canonical_bytes(SingleHostAlertFactsV1.model_json_schema())
     ).hexdigest()
@@ -275,3 +245,78 @@ def test_single_host_interpreter_does_not_reinterpret_v1_host_loss_receipt():
     alert_ref = next(ref for ref in refs if ref.kind is EvidenceKind.ALERT_DELIVERY)
     with pytest.raises(ValueError, match="unreviewed substantive gate schema"):
         interpreter.verify(alert_ref, context)
+
+
+@pytest.mark.parametrize("mutation", ["sender", "chat", "message", "token", "legacy", "delivery"])
+def test_resigned_receipt_cannot_cover_misbound_raw_telegram_artifacts(mutation):
+    bundle = single_host_gate_fixture()
+    _, refs, resolver, context, _, policy = bundle
+    reference = next(r for r in refs if r.kind is EvidenceKind.ALERT_DELIVERY)
+    receipt = json.loads(resolver.receipts[reference.content_sha256])
+    facts = json.loads(receipt["body"]["facts_json"])
+    delivery = facts["deliveries"][0]
+    field = "delivery_receipt_sha256" if mutation == "delivery" else "acknowledgement_sha256"
+    old_digest = delivery[field]
+    raw = json.loads(resolver.artifacts[old_digest])
+    if mutation == "sender":
+        raw["query"]["from"]["id"] = 999
+    elif mutation == "chat":
+        raw["query"]["message"]["chat"]["id"] = -999
+    elif mutation == "message":
+        raw["query"]["message"]["message_id"] = 999
+    elif mutation == "token":
+        raw["query"]["data"] = "ack:"
+    elif mutation == "legacy":
+        raw = {"type": "ACK", "prefix": "", "user_id": 5, "at": raw["at"]}
+    else:
+        raw["resolved"]["chat_id"] = -999
+    new_bytes = canonical_bytes(raw)
+    new_digest = hashlib.sha256(new_bytes).hexdigest()
+    resolver.artifacts[new_digest] = new_bytes
+    facts["artifact_sha256s"] = [new_digest if h == old_digest else h for h in facts["artifact_sha256s"]]
+    delivery[field] = new_digest
+    if mutation == "delivery":
+        facts["local_supervisor_restart_receipt_sha256"] = new_digest
+    changed_refs = reissue(bundle, EvidenceKind.ALERT_DELIVERY, facts_change=lambda f: f.update(facts))
+    changed = next(r for r in changed_refs if r.kind is EvidenceKind.ALERT_DELIVERY)
+    with pytest.raises(ValueError):
+        SingleHostAlertReceiptInterpreter((policy,), resolver).verify(changed, context)
+
+
+def test_alert_receipt_owner_is_pinned_by_frozen_policy_not_resigned_facts():
+    bundle = single_host_gate_fixture()
+    _, _, resolver, context, _, policy = bundle
+
+    def rebind(facts):
+        facts["owner_telegram_user_id"] = 999
+        for delivery in facts["deliveries"]:
+            delivery["owner_telegram_user_id"] = 999
+
+    changed = reissue(bundle, EvidenceKind.ALERT_DELIVERY, facts_change=rebind)
+    with pytest.raises(ValueError, match="frozen owner pin"):
+        SingleHostAlertReceiptInterpreter((policy,), resolver).verify(
+            next(r for r in changed if r.kind is EvidenceKind.ALERT_DELIVERY), context
+        )
+
+
+def test_historical_single_host_schema_is_not_adopted_as_v2():
+    bundle = single_host_gate_fixture()
+    _, _, resolver, context, _, policy = bundle
+    changed = reissue(
+        bundle,
+        EvidenceKind.ALERT_DELIVERY,
+        facts_change=lambda f: f.update(schema_version="kairos.single-host-alert-facts.v1"),
+    )
+    with pytest.raises(ValueError):
+        SingleHostAlertReceiptInterpreter((policy,), resolver).verify(
+            next(r for r in changed if r.kind is EvidenceKind.ALERT_DELIVERY), context
+        )
+
+
+@pytest.mark.parametrize("owner_user_id", [None, 0, -5, True, "5"])
+def test_single_host_receipt_requires_explicit_positive_frozen_owner_pin(owner_user_id):
+    _, refs, resolver, context, _, policy = single_host_gate_fixture(owner_user_id=owner_user_id)
+    with pytest.raises(ValueError):
+        SingleHostAlertReceiptInterpreter((policy,), resolver).verify(
+            next(r for r in refs if r.kind is EvidenceKind.ALERT_DELIVERY), context
+        )

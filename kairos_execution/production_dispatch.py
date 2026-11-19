@@ -13,11 +13,12 @@ import hashlib
 import json
 import re
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from contextlib import nullcontext
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol
 from uuid import UUID
 
-from pydantic import Field
+from pydantic import Field, model_serializer
 
 from .crypto import build_domain
 from .managed_signer import (
@@ -92,12 +93,20 @@ class ProductionWireRequestV1(StrictRecord):
     signing_request: ManagedSigningRequestV1
     custody_binding: CustodyBindingV1
     signed: SignedTypedDataV1
+    limit_time_in_force: Literal["IOC", "GTC"] = "IOC"
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_shape(self, handler):
+        payload = handler(self)
+        if self.limit_time_in_force == "IOC":
+            payload.pop("limit_time_in_force", None)
+        return payload
 
 
 class _WireToken:
     """Private one-call capability; binds one HTTP operation and expires once."""
 
-    __slots__ = ("_seal", "_method", "_path", "_body_sha256", "_expires_at", "_used")
+    __slots__ = ("_seal", "_method", "_path", "_body_sha256", "_expires_at", "_used", "_ipc_used")
 
     def __init__(self, *, seal: object, method: str, path: str, body_sha256: str, expires_at: datetime):
         if seal is not _WIRE_SEAL:
@@ -108,8 +117,9 @@ class _WireToken:
         self._body_sha256 = body_sha256
         self._expires_at = expires_at
         self._used = False
+        self._ipc_used = False
 
-    def consume(self, *, method: str, path: str, body_sha256: str, now: datetime) -> None:
+    def consume(self, *, method: str, path: str, body_sha256: str, now: datetime) -> datetime:
         _aware(now)
         if (
             self._seal is not _WIRE_SEAL
@@ -123,6 +133,26 @@ class _WireToken:
                 "exact one-use wire authorization is absent, expired, or already consumed"
             )
         self._used = True
+        return self._expires_at
+
+    def consume_ipc(
+        self, *, method: str, path: str, body_sha256: str, deadline_ms: int, now: datetime
+    ) -> None:
+        _aware(now)
+        expiry_ms = (self._expires_at - datetime(1970, 1, 1, tzinfo=UTC)) // timedelta(milliseconds=1)
+        if (
+            self._seal is not _WIRE_SEAL
+            or not self._used
+            or self._ipc_used
+            or method != self._method
+            or path != self._path
+            or body_sha256 != self._body_sha256
+            or type(deadline_ms) is not int
+            or deadline_ms != expiry_ms
+            or now >= self._expires_at
+        ):
+            raise ProductionDispatchError("exact one-use market IPC authorization is absent or expired")
+        self._ipc_used = True
 
 
 _WIRE_SEAL = object()
@@ -135,14 +165,23 @@ _OPERATION_BINDINGS: dict[str, tuple[str, WireEffectType, str]] = {
 }
 
 
-def production_wire_body(operation: str, message: dict[str, Any], signature: str) -> dict[str, Any]:
+def production_wire_body(
+    operation: str,
+    message: dict[str, Any],
+    signature: str,
+    *,
+    limit_time_in_force: Literal["IOC", "GTC"] = "IOC",
+) -> dict[str, Any]:
     """Derive the pinned SDK REST representation from reviewed EIP-712 units.
 
     EIP quantities/prices are integers at 1e8, while exchange-crypto 1.1.0
     (SDK 1.2.11) emits canonical decimal strings on REST. Never send the scaled
-    signing integers as human units. Limit IOC is fixed dispatch policy, not
-    an extra signed EIP field; its exact value is covered by the wire claim.
+    signing integers as human units. Explicit GTC uses the native limit body
+    without a timeInForce override. Legacy IOC remains separately selectable
+    and is rejected by the real transport. Exact bodies are wire-claim bound.
     """
+    if limit_time_in_force not in {"IOC", "GTC"}:
+        raise ProductionDispatchError("unsupported limit entry wire policy")
     if operation not in _OPERATION_BINDINGS:
         raise ProductionDispatchError("wire operation has no reviewed REST normalization")
     result = dict(message)
@@ -154,7 +193,7 @@ def production_wire_body(operation: str, message: dict[str, Any], signature: str
             raise ProductionDispatchError("wire numeric geometry must use exact unsigned EIP integers")
         whole, fraction = divmod(value, 100_000_000)
         result[field] = str(whole) + ("." + f"{fraction:08d}".rstrip("0") if fraction else "")
-    if operation == "New limit order":
+    if operation == "New limit order" and limit_time_in_force == "IOC":
         result["timeInForce"] = "IOC"
     result["signature"] = signature
     return result
@@ -224,7 +263,12 @@ def _validate_effect(request: ProductionWireRequestV1) -> dict[str, Any]:
     if hashlib.sha256(canonical).hexdigest() != request.signed.request_sha256:
         raise ProductionDispatchError("managed signature belongs to a different signing request")
     if _canonical_bytes(request.body) != _canonical_bytes(
-        production_wire_body(request.signing_request.operation, message, signature)
+        production_wire_body(
+            request.signing_request.operation,
+            message,
+            signature,
+            limit_time_in_force=request.limit_time_in_force,
+        )
     ):
         raise ProductionDispatchError("wire body differs from the exact independently signed message")
     return message
@@ -247,7 +291,13 @@ class ProductionEffectDispatcher:
         context: ProductionContextV1,
         clock: Callable[[], datetime] | None = None,
         sender: Callable[..., Awaitable[dict[str, Any]]],
+        require_session_entry_fence: bool = False,
+        session_stop_boundary=None,
+        session_entry_io=None,
+        limit_time_in_force: Literal["IOC", "GTC"] = "IOC",
     ) -> None:
+        if type(require_session_entry_fence) is not bool:
+            raise TypeError("session entry fence requirement must be boolean")
         if not isinstance(database_uuid, UUID) or database_uuid.int == 0:
             raise ValueError("an explicit isolated production database UUID is required")
         self.authorization = authorization
@@ -261,9 +311,28 @@ class ProductionEffectDispatcher:
             raise ValueError("wire-claim store differs from the exact production database/context")
         self.clock = clock or (lambda: datetime.now(UTC))
         self.sender = sender
+        # An ACTIVE row does not prove a qualified ledger or a safe sender.
+        # Attaching the experimental boundary must not enable entry.
+        self._require_session_entry_fence = (
+            require_session_entry_fence or session_stop_boundary is not None or session_entry_io is not None
+        )
+        self._session_stop_boundary = session_stop_boundary
+        self._session_entry_io = session_entry_io
+        if limit_time_in_force not in {"IOC", "GTC"}:
+            raise ValueError("unsupported limit entry wire policy")
+        self.limit_time_in_force = limit_time_in_force
 
     async def dispatch_one(self, request: ProductionWireRequestV1) -> dict[str, Any]:
         request = ProductionWireRequestV1.model_validate(request)
+        # No qualified atomic session fence exists at the sender. A signature
+        # produced before the fence was selected is not authority to submit an
+        # entry. This is a static deny, not an implementation of a $5 latch:
+        # it cannot cancel in-flight calls or fence older workers.
+        if self._require_session_entry_fence and request.signing_request.operation not in {
+            "Position close order",
+            "New take-profit/stop-loss",
+        }:
+            raise ProductionDispatchError("atomic session entry fence is unavailable")
         loop = asyncio.get_running_loop()
         started = loop.time()
         initial_now = self.clock()
@@ -291,6 +360,8 @@ class ProductionEffectDispatcher:
     ) -> dict[str, Any]:
         if request.context != self.context or request.database_uuid != self.database_uuid:
             raise ProductionDispatchError("wire request differs from the pinned production scope")
+        if request.limit_time_in_force != self.limit_time_in_force:
+            raise ProductionDispatchError("wire limit policy differs from the configured runtime")
         message = _validate_effect(request)
 
         wall_high_water = initial_now
@@ -313,7 +384,12 @@ class ProductionEffectDispatcher:
         # not the caller-owned mutable body mapping after its validation.
         body = json.loads(
             _canonical_bytes(
-                production_wire_body(request.signing_request.operation, message, request.signed.signature)
+                production_wire_body(
+                    request.signing_request.operation,
+                    message,
+                    request.signed.signature,
+                    limit_time_in_force=request.limit_time_in_force,
+                )
             )
         )
         body_digest = _sha256(_canonical_bytes(body))
@@ -405,12 +481,13 @@ class ProductionEffectDispatcher:
                 body_sha256=body_digest,
                 expires_at=request.signing_request.expires_at,
             )
-            token.consume(
-                method=request.method,
-                path=request.path,
-                body_sha256=body_digest,
-                now=fresh_time(),
-            )
+            if request.signing_request.operation != "New market order":
+                token.consume(
+                    method=request.method,
+                    path=request.path,
+                    body_sha256=body_digest,
+                    now=fresh_time(),
+                )
         except asyncio.CancelledError:
             await self._finish_shielded(namespace, request, request_sha256, "UNRESOLVED", None, deadline)
             raise
@@ -421,7 +498,43 @@ class ProductionEffectDispatcher:
             ) from None
 
         try:
-            response = await self.sender(method=request.method, path=request.path, body=body)
+            if self._session_entry_io is not None and request.signing_request.operation not in {
+                "Position close order",
+                "New take-profit/stop-loss",
+            }:
+                await self._session_entry_io.begin_wire(
+                    custody_reference=request.custody_binding.custody_reference,
+                    request_id=request.signing_request.request_id,
+                    request_sha=request.signed.request_sha256,
+                    signature_sha=request.signed.signature_sha256,
+                    effect_id=request.effect_id,
+                    wire_sha=request_sha256,
+                )
+            boundary = (
+                self._session_stop_boundary.entry(context=request.context)
+                if self._session_stop_boundary is not None
+                and request.signing_request.operation
+                not in {"Position close order", "New take-profit/stop-loss"}
+                else nullcontext()
+            )
+            async with boundary as lease:
+                # Lock acquisition may have waited for a STOP writer; never
+                # start network I/O using a deadline that expired meanwhile.
+                fresh_time()
+                if lease is not None:
+                    lease.assert_live()
+                if request.signing_request.operation == "New market order":
+                    response = await self.sender(
+                        method=request.method,
+                        path=request.path,
+                        body=body,
+                        expires_at=request.signing_request.expires_at,
+                        wire_token=token,
+                    )
+                else:
+                    response = await self.sender(method=request.method, path=request.path, body=body)
+                if lease is not None:
+                    lease.assert_live()
             fresh_time()
             if not isinstance(response, dict):
                 raise ValueError("transport returned a malformed response")

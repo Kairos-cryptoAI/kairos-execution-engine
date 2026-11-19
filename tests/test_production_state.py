@@ -5,15 +5,20 @@ opt-in isolated PostgreSQL integration test.
 """
 
 import json
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import pytest
 
-from kairos_execution.production_readiness import ProductionContextV1
+import kairos_execution.production_state as state_module
+from kairos_execution.production_claims import SCHEMA_VERSION as CLAIMS_SCHEMA_VERSION
+from kairos_execution.production_readiness import ProductionContextV1, canonical_digest
 from kairos_execution.production_state import (
     SCHEMA_VERSION,
     AsyncPostgresProductionSigningStateSource,
+    PostgresExposureStateWriter,
+    PostgresOperatorStateWriter,
     PostgresRiskStateWriter,
     ProductionStateError,
     _account_scope_sha256,
@@ -72,7 +77,7 @@ def _risk_payload_record(risk):
 
 
 async def _use_risk_append_connection(monkeypatch, writer, connection):
-    async def write(callback):
+    async def write(callback, **kwargs):
         return await callback(connection)
 
     monkeypatch.setattr(writer, "_write", write)
@@ -333,3 +338,362 @@ async def test_risk_append_rejects_different_context_before_database_callback(mo
     assert connection.fetchval_calls == []
     assert connection.fetchrow_calls == []
     assert connection.execute_calls == []
+
+
+class _LegacyProtectiveConnection:
+    """Retained legacy guard with real source inspection and exact synthetic rows.
+
+    This double returns catalog facts, not authorization outcomes. State/claims
+    inspection, payload validation and the signing verifier run unmodified.
+    """
+
+    def __init__(self, request, evidence, now):
+        self.now, self.request, self.evidence = now, request, evidence
+        self.active = False
+        self.actual_role = "state_reader"
+        self.owner = "state_owner"
+        self.schema_owner = self.owner
+        self.mutating_privilege = False
+        self.guard_reads = 0
+        self.inserts = []
+        self.identity = {
+            "database_uuid": evidence.owner_nonce_claim.database_uuid,
+            "policy_namespace": "fixture:production-state",
+            "account_sha256": _account_scope_sha256(request.context),
+            "schema_version": SCHEMA_VERSION,
+            "owner_role": self.owner,
+            "runtime_role": "state_reader",
+            "operator_writer_role": "operator_writer",
+            "risk_writer_role": "risk_writer",
+            "exposure_writer_role": "exposure_writer",
+        }
+
+    def is_in_transaction(self):
+        return self.active
+
+    @asynccontextmanager
+    async def transaction(self, **kwargs):
+        assert not self.active
+        if kwargs:
+            assert kwargs == {"isolation": "repeatable_read", "readonly": True}
+        self.active = True
+        try:
+            yield self
+        finally:
+            self.active = False
+
+    async def execute(self, query, *args):
+        assert self.active
+        if query.startswith("INSERT INTO kairos_production_state_v1."):
+            self.inserts.append((query, args))
+            return "INSERT 0 1"
+        assert query == "SET LOCAL statement_timeout='5s'"
+        return "SET"
+
+    @staticmethod
+    def row(model, **columns):
+        data, digest = _payload(model)
+        return {"payload": data, "payload_sha256": digest, **columns}
+
+    async def fetchrow(self, query, *args):
+        evidence = self.evidence
+        if "current_database()" in query:
+            return {"db": "kairos_production_evidence_123456789abc", "role": self.actual_role}
+        if "FROM pg_roles" in query:
+            return {
+                "rolsuper": False,
+                "rolcreaterole": False,
+                "rolcreatedb": False,
+                "rolreplication": False,
+                "rolbypassrls": False,
+                "rolinherit": False,
+            }
+        if "p.prosrc AS body" in query:
+            self.guard_reads += 1
+            return {
+                "body": state_module._LEGACY_OPERATOR_APPEND_BODY,
+                "owner": self.owner,
+                "security_definer": False,
+                "config": ["search_path=pg_catalog"],
+                "language": "plpgsql",
+                "returns_trigger": True,
+                "enabled": "O",
+                "trigger_type": 7,
+                "arguments": 0,
+                "columns": "",
+                "condition": None,
+            }
+        if "FROM kairos_production_state_v1.identity" in query:
+            return self.identity
+        if "FROM kairos_production_evidence_v1.identity" in query:
+            return {**self.identity, "schema_version": CLAIMS_SCHEMA_VERSION}
+        if "FROM kairos_production_state_v1.owner_arms" in query:
+            arm = evidence.owner_arm.request
+            assert args == (canonical_digest(self.request.context), canonical_digest(arm))
+            return self.row(
+                evidence.owner_arm,
+                owner_identity=arm.owner_identity,
+                nonce=arm.nonce,
+                observed_at=arm.created_at,
+            )
+        if "FROM kairos_production_evidence_v1.claims" in query:
+            nonce = evidence.owner_nonce_claim
+            assert args == (nonce.owner_identity, nonce.nonce)
+            return {
+                "namespace": nonce.owner_identity,
+                "identity": nonce.nonce,
+                "request_sha256": nonce.request_sha256,
+                "context_sha256": nonce.context_sha256,
+                "claimed_at": nonce.claimed_at,
+            }
+        if "FROM kairos_production_state_v1.operator_observations" in query:
+            operator = evidence.operator
+            return self.row(operator, version=operator.version, observed_at=operator.observed_at)
+        if "FROM kairos_production_state_v1.risk_decisions" in query:
+            risk = evidence.risk
+            assert args == (canonical_digest(self.request.context), self.request.request_id)
+            return self.row(
+                risk, observed_at=risk.observed_at, valid_until=risk.valid_until, decision_id=risk.decision_id
+            )
+        if "FROM kairos_production_state_v1.risk_reservations" in query:
+            risk, arm = evidence.risk, evidence.owner_arm.request
+            return {
+                "context_sha256": canonical_digest(self.request.context),
+                "account_sha256": _account_scope_sha256(self.request.context),
+                "effect_id": risk.effect_id,
+                "signing_request_id": risk.signing_request_id,
+                "decision_id": risk.decision_id,
+                "owner_arm_sha256": canonical_digest(arm),
+                "observed_at": risk.observed_at,
+                "reserved_at": self.now,
+                "risk_usd": risk.worst_case_loss_usd,
+                "notional_usd": _entry_notional_usd({"quantity": risk.quantity, "limitPrice": risk.price}),
+                "account_equity_usd": risk.account_equity_usd,
+                "daily_realized_loss_usd": risk.daily_realized_loss_usd,
+                "aggregate_open_risk_usd": risk.aggregate_open_risk_usd,
+                "aggregate_open_notional_usd": risk.aggregate_open_notional_usd,
+                "dollar_cap": arm.dollar_cap,
+                "daily_stop_loss_usd": arm.daily_stop_loss_usd,
+                "evidence_sha256": _payload(risk)[1],
+                "request_sha256": canonical_digest(self.request),
+            }
+        if "FROM kairos_production_state_v1.exposure_observations" in query:
+            if query.startswith("SELECT observed_at"):
+                return None  # writer publishes the first current position snapshot
+            exposure = evidence.exposure
+            return self.row(exposure, observed_at=exposure.observed_at, valid_until=exposure.valid_until)
+        raise AssertionError(f"unexpected synthetic read: {query}")
+
+    async def fetchval(self, query, *args):
+        if "pg_get_userbyid" in query:
+            return self.schema_owner
+        if "pg_has_role" in query or "has_schema_privilege" in query:
+            return False
+        if "has_table_privilege" in query:
+            table = args[0] if "current_user" in query else args[1]
+            if "'SELECT'" in query:
+                if "kairos_production_evidence_v1." in table or self.actual_role == "state_reader":
+                    return True
+                role_field = next(
+                    k for k in state_module._WRITER_TABLES if self.identity[k] == self.actual_role
+                )
+                return table.rsplit(".", 1)[-1] in _writer_select_tables(role_field, SCHEMA_VERSION)
+            if "'INSERT'" in query:
+                if "kairos_production_evidence_v1." in table:
+                    return not table.endswith(".identity")
+                if self.actual_role == "state_reader":
+                    return table.endswith(".risk_reservations")
+                role_field = next(
+                    k for k in state_module._WRITER_TABLES if self.identity[k] == self.actual_role
+                )
+                return table.rsplit(".", 1)[-1] in state_module._WRITER_TABLES[role_field]
+            return self.mutating_privilege
+        if "clock_timestamp()" in query:
+            return self.now
+        if "count(*)" in query:
+            return 1
+        if "pg_advisory_xact_lock" in query:
+            return None
+        raise AssertionError(f"unexpected synthetic scalar read: {query}")
+
+    async def fetch(self, query, *args):
+        assert "WITH role_table AS" in query
+        return [
+            {
+                "role_field": role_field,
+                "role_name": self.identity[role_field],
+                "table_name": table,
+                "has_insert": table in allowed,
+                "has_select": table in _writer_select_tables(role_field, SCHEMA_VERSION),
+                "has_mutating": False,
+                "can_create_schema": False,
+            }
+            for role_field, allowed in state_module._WRITER_TABLES.items()
+            for table in state_module._TABLES
+        ]
+
+
+class _LegacyProtectivePool:
+    def __init__(self, connection):
+        self.connection = connection
+
+    @asynccontextmanager
+    async def acquire(self):
+        yield self.connection
+
+
+def _legacy_protective_source(operation="New limit order"):
+    verifier, request, binding, evidence, now = fixture(operation=operation)
+    connection = _LegacyProtectiveConnection(request, evidence, now)
+    source = AsyncPostgresProductionSigningStateSource(
+        _LegacyProtectivePool(connection),
+        expected_database="kairos_production_evidence_123456789abc",
+        database_uuid=evidence.owner_nonce_claim.database_uuid,
+        policy_namespace="fixture:production-state",
+        runtime_role="state_reader",
+        context=binding.context,
+        clock_probe=lambda: now,
+    )
+    verifier._source, verifier._clock = source, lambda: now
+    return source, connection, verifier, request, binding, evidence, now
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["Position close order", "New take-profit/stop-loss"])
+async def test_legacy_operator_guard_does_not_disable_protective_signing_authorization(operation):
+    source, connection, verifier, request, binding, expected, now = _legacy_protective_source(operation)
+    resolved = await source.resolve_signing_evidence_async(request=request, binding=binding, now=now)
+    assert resolved.owner_arm == expected.owner_arm and resolved.risk == expected.risk
+    assert resolved.exposure == expected.exposure
+    await verifier.verify_request_async(request, binding)
+    assert connection.inserts == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_operator_guard_retains_exact_accepted_cancellation_provenance():
+    source, _, _, request, _, expected, _ = _legacy_protective_source()
+    arm, nonce = await source.resolve_owner_lineage_async(request.manual_request_sha256)
+    reservation = await source.resolve_entry_reservation_async(
+        expected.risk.effect_id,
+        request.manual_request_sha256,
+        request.request_id,
+        expected.risk.decision_id,
+    )
+    assert arm == expected.owner_arm and nonce == expected.owner_nonce_claim
+    assert reservation.risk_evidence == expected.risk
+    assert reservation.owner_arm_sha256 == request.manual_request_sha256
+
+
+@pytest.mark.asyncio
+async def test_legacy_operator_guard_still_refuses_new_entries_and_startup_inspection():
+    source, connection, _, request, binding, _, now = _legacy_protective_source()
+    with pytest.raises(ProductionStateError, match="operator control guard"):
+        await source.resolve_signing_evidence_async(request=request, binding=binding, now=now)
+    with pytest.raises(ProductionStateError, match="operator control guard"):
+        await source.inspect(connection)
+    assert not connection.inserts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["close", "protection", "owner-lineage", "entry-reservation"])
+@pytest.mark.parametrize("drift", ["role", "context", "ownership", "privilege"])
+async def test_legacy_protective_reads_keep_role_context_and_least_privilege_checks(path, drift):
+    operation = {"close": "Position close order", "protection": "New take-profit/stop-loss"}.get(path)
+    source, connection, _, request, binding, expected, now = _legacy_protective_source(
+        operation or "New limit order"
+    )
+    if drift == "role":
+        connection.actual_role = "unrelated_reader"
+    elif drift == "context":
+        connection.identity["account_sha256"] = "0" * 64
+    elif drift == "ownership":
+        connection.schema_owner = "unrelated_owner"
+    else:
+        connection.mutating_privilege = True
+    with pytest.raises(ProductionStateError):
+        if path == "owner-lineage":
+            await source.resolve_owner_lineage_async(request.manual_request_sha256)
+        elif path == "entry-reservation":
+            await source.resolve_entry_reservation_async(
+                expected.risk.effect_id,
+                request.manual_request_sha256,
+                request.request_id,
+                expected.risk.decision_id,
+            )
+        else:
+            await source.resolve_signing_evidence_async(request=request, binding=binding, now=now)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("publication", ["close-risk", "protection-risk", "exposure"])
+async def test_legacy_operator_guard_keeps_protective_evidence_publication_available(publication):
+    operation = "New take-profit/stop-loss" if publication == "protection-risk" else "Position close order"
+    source, connection, _, _, _, expected, _ = _legacy_protective_source(operation)
+    risk = publication.endswith("risk")
+    connection.actual_role = "risk_writer" if risk else "exposure_writer"
+    writer_type = PostgresRiskStateWriter if risk else PostgresExposureStateWriter
+    writer = writer_type(
+        source.pool,
+        expected_database=source.expected_database,
+        database_uuid=source.database_uuid,
+        policy_namespace=source.policy_namespace,
+        context=source.context,
+        expected_role=connection.actual_role,
+    )
+    if risk:
+        await writer.append_risk_decision_async(expected.risk)
+    else:
+        await writer.append_exposure_async(expected.exposure)
+    assert len(connection.inserts) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("writer_kind", ["entry-risk", "owner-arm"])
+async def test_legacy_operator_guard_keeps_entry_and_operator_publication_strict(writer_kind):
+    source, connection, _, _, _, expected, _ = _legacy_protective_source()
+    risk = writer_kind == "entry-risk"
+    connection.actual_role = "risk_writer" if risk else "operator_writer"
+    writer_type = PostgresRiskStateWriter if risk else PostgresOperatorStateWriter
+    writer = writer_type(
+        source.pool,
+        expected_database=source.expected_database,
+        database_uuid=source.database_uuid,
+        policy_namespace=source.policy_namespace,
+        context=source.context,
+        expected_role=connection.actual_role,
+    )
+    with pytest.raises(ProductionStateError, match="operator control guard"):
+        if risk:
+            await writer.append_risk_decision_async(expected.risk)
+        else:
+            await writer.append_owner_arm_async(expected.owner_arm)
+    assert not connection.inserts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("publication", ["risk", "exposure"])
+@pytest.mark.parametrize("drift", ["role", "context", "privilege"])
+async def test_protective_evidence_writers_keep_scope_and_immutable_privileges(publication, drift):
+    source, connection, _, _, _, expected, _ = _legacy_protective_source("Position close order")
+    connection.actual_role = "risk_writer" if publication == "risk" else "exposure_writer"
+    writer_type = PostgresRiskStateWriter if publication == "risk" else PostgresExposureStateWriter
+    writer = writer_type(
+        source.pool,
+        expected_database=source.expected_database,
+        database_uuid=source.database_uuid,
+        policy_namespace=source.policy_namespace,
+        context=source.context,
+        expected_role=connection.actual_role,
+    )
+    if drift == "role":
+        connection.actual_role = "unrelated_writer"
+    elif drift == "context":
+        connection.identity["account_sha256"] = "0" * 64
+    else:
+        connection.mutating_privilege = True
+    with pytest.raises(ProductionStateError):
+        if publication == "risk":
+            await writer.append_risk_decision_async(expected.risk)
+        else:
+            await writer.append_exposure_async(expected.exposure)
+    assert not connection.inserts

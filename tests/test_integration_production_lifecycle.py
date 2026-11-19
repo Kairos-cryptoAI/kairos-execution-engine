@@ -94,6 +94,14 @@ async def production_pg_runtime(paper_runtime):
         yield database, clock
     finally:
         pool = database.pool
+        # Public facts enqueue immutable outbox rows. Scope cleanup must remove
+        # those same rows before deterministic test decisions can be reused.
+        await pool.execute(
+            "DELETE FROM message_outbox WHERE message_id IN "
+            "(SELECT payload->>'message_id' FROM public_execution_events WHERE trade_id IN "
+            "(SELECT trade_id FROM execution_trades WHERE environment=$1))",
+            environment,
+        )
         await pool.execute(
             "DELETE FROM public_execution_events WHERE trade_id IN "
             "(SELECT trade_id FROM execution_trades WHERE environment=$1)",
@@ -469,6 +477,10 @@ def _synthetic_authority(
         "resolved_at": now,
     }
     source = object.__new__(SyntheticPostgresStateSource)
+    # This fixture bypasses the production constructor and must supply its
+    # explicit default session configuration.
+    source._require_session_loss_latch = False
+    source._require_session_entry_fence = False
     source.pool = pool
     source.expected_database = "kairos_production_evidence_synthetic_runtime"
     source.database_uuid = database_uuid
@@ -627,7 +639,19 @@ def _synthetic_authority(
     return source, claims, authorization, signer, database_uuid, backend
 
 
-def _runtime(*, clock, context, binding, source, claims, authorization, signer, database_uuid, venue):
+def _runtime(
+    *,
+    clock,
+    context,
+    binding,
+    source,
+    claims,
+    authorization,
+    signer,
+    database_uuid,
+    venue,
+    limit_time_in_force="IOC",
+):
     async def synthetic_sender(*, method: str, path: str, body: dict[str, Any]):
         assert method == "POST"
         if path == "/api/v2/order/limit":
@@ -644,6 +668,7 @@ def _runtime(*, clock, context, binding, source, claims, authorization, signer, 
         context=context,
         clock=clock,
         sender=synthetic_sender,
+        limit_time_in_force=limit_time_in_force,
     )
     return ProductionExecutionRuntime(
         signer=signer,
@@ -654,6 +679,7 @@ def _runtime(*, clock, context, binding, source, claims, authorization, signer, 
         database_uuid=database_uuid,
         context=context,
         clock=clock,
+        limit_time_in_force=limit_time_in_force,
     )
 
 

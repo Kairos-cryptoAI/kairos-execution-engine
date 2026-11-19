@@ -6,6 +6,7 @@ import asyncio
 import base64
 import hashlib
 import json
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from kairos_execution.managed_signer import CustodyBindingV1, reviewed_schema_sha256
+from kairos_execution.production_dispatch import _WIRE_SEAL, _canonical_bytes, _sha256, _WireToken
 from kairos_execution.production_readiness import ProductionContextV1
 from kairos_execution.production_transport import (
     MAX_IPC_RESPONSE_BYTES,
@@ -307,7 +309,54 @@ async def test_transport_rejects_unsupported_limit_ioc_but_keeps_market_ioc():
         "chainId": 42161,
         "signature": "0x" + "12" * 65,
     }
-    await transport.send_signed_post(method="POST", path="/api/v2/order/market", body=market)
+    path = "/api/v2/order/market"
+    deadline = datetime.now(UTC) + timedelta(seconds=2)
+    with pytest.raises(ProductionTransportError):
+        await transport.send_signed_post(method="POST", path=path, body=market, expires_at=deadline)
+    changed_body_token = _WireToken(
+        seal=_WIRE_SEAL,
+        method="POST",
+        path=path,
+        body_sha256=_sha256(_canonical_bytes(market)),
+        expires_at=deadline,
+    )
+    with pytest.raises(PermissionError):
+        await transport.send_signed_post(
+            method="POST",
+            path=path,
+            body={**market, "cashQuantity": "6"},
+            expires_at=deadline,
+            wire_token=changed_body_token,
+        )
+    changed_expiry_token = _WireToken(
+        seal=_WIRE_SEAL,
+        method="POST",
+        path=path,
+        body_sha256=_sha256(_canonical_bytes(market)),
+        expires_at=deadline,
+    )
+    with pytest.raises(ProductionTransportError, match="cannot change"):
+        await transport.send_signed_post(
+            method="POST",
+            path=path,
+            body=market,
+            expires_at=deadline + timedelta(milliseconds=1),
+            wire_token=changed_expiry_token,
+        )
+    token = _WireToken(
+        seal=_WIRE_SEAL,
+        method="POST",
+        path=path,
+        body_sha256=_sha256(_canonical_bytes(market)),
+        expires_at=deadline,
+    )
+    await transport.send_signed_post(
+        method="POST", path=path, body=market, expires_at=deadline, wire_token=token
+    )
+    with pytest.raises(PermissionError):
+        await transport.send_signed_post(
+            method="POST", path=path, body=market, expires_at=deadline, wire_token=token
+        )
     assert client.calls[-1][0] == "signed"
     calls_before_limit = len(client.calls)
     limit = {

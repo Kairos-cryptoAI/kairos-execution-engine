@@ -459,6 +459,34 @@ async def test_full_protected_round_trip_times_out_once(paper_runtime) -> None:
 
 
 @pytest.mark.asyncio
+async def test_early_exit_request_closes_active_trade_before_its_holding_time(paper_runtime) -> None:
+    database, settings, clock = paper_runtime
+    adapter = FakePaperAdapter(clock)
+    engine = _engine(database, settings, clock, adapter)
+    assert await engine.initialize_recovery() == ()
+    decision = approved_decision()
+    await engine.handle(decision)
+    trade = await engine.trades.get(decision.trade_id)
+    assert trade is not None and trade.state is TradeState.ACTIVE
+    assert trade.timeout_at is not None and clock.value < trade.timeout_at
+
+    with pytest.raises(ValueError):
+        engine.request_early_exit(decision.trade_id, " ")
+    assert list(await engine.reconcile_once()) == []
+    engine.request_early_exit(decision.trade_id, "regime BEAR opposes LONG")
+    engine.request_early_exit(decision.trade_id, "a second reason is ignored")
+    exit_events = await engine.reconcile_once()
+
+    assert [event.exit_reason for event in exit_events] == [TradeExitReason.TIMEOUT, TradeExitReason.TIMEOUT]
+    assert dict(exit_events[0].details)["early_exit"] == "regime BEAR opposes LONG"
+    assert adapter.calls.count("CLOSE") == 1
+    trade = await engine.trades.get(decision.trade_id)
+    assert trade is not None and trade.state is TradeState.FLAT
+    assert list(await engine.reconcile_once()) == []
+    assert adapter.calls.count("CLOSE") == 1
+
+
+@pytest.mark.asyncio
 async def test_profile_or_telemetry_mismatch_keeps_recovery_blocked(paper_runtime) -> None:
     database, settings, clock = paper_runtime
 

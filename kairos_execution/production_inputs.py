@@ -105,6 +105,65 @@ def _review_evidence_matches_context(review: CandidateReviewV1, context: Decisio
     return review.evidence in (context_refs, native_refs)
 
 
+def instrument_timestamp_ms(value: object) -> int:
+    """Exact UTC milliseconds of one original EVEDEX ISO timestamp."""
+    if not isinstance(value, str):
+        raise ValueError("instrument source timestamp must be original ISO UTC text")
+    stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if stamp.utcoffset() != UTC.utcoffset(stamp) or stamp.microsecond % 1_000:
+        raise ValueError("instrument source timestamp must be exact UTC milliseconds")
+    delta = stamp - datetime(1970, 1, 1, tzinfo=UTC)
+    return (delta.days * 86_400 + delta.seconds) * 1_000 + delta.microseconds // 1_000
+
+
+def instrument_rules_from_payload(
+    payload: object,
+    *,
+    venue_symbol: str,
+    source_id: str,
+    scope_sha256: str,
+    evidence_sha256: str,
+    received_ms: int,
+) -> VerifiedLiveInstrumentRulesV1:
+    """Rule facts for one PROD instrument from a parsed original ``instruments`` response."""
+    instruments = payload.get("list") if isinstance(payload, dict) else payload
+    if not isinstance(instruments, list) or any(not isinstance(item, dict) for item in instruments):
+        raise ValueError("instrument source must preserve the native list response")
+    matches = [item for item in instruments if item.get("name") == venue_symbol]
+    if len(matches) != 1:
+        raise ValueError("instrument metadata is missing or duplicated for the exact PROD symbol")
+    instrument = matches[0]
+    if (
+        instrument.get("trading") != "all"
+        or instrument.get("visibility") != "all"
+        or instrument.get("marketState") != "OPEN"
+    ):
+        raise ValueError("instrument is not open, visible, and tradeable")
+    updated_ms = instrument_timestamp_ms(instrument.get("updatedAt"))
+    if updated_ms > received_ms:
+        raise ValueError("instrument rule-change timestamp postdates original capture")
+    return VerifiedLiveInstrumentRulesV1(
+        source_id=source_id,
+        scope_sha256=scope_sha256,
+        evidence_sha256=evidence_sha256,
+        venue_symbol=venue_symbol,
+        profile=EvedexProfile.PROD,
+        observed_at_ms=received_ms,
+        rules_updated_at_ms=updated_ms,
+        price_increment=instrument.get("priceIncrement"),
+        quantity_increment=instrument.get("quantityIncrement"),
+        min_price=instrument.get("minPrice"),
+        max_price=instrument.get("maxPrice"),
+        min_quantity=instrument.get("minQuantity"),
+        max_quantity=instrument.get("maxQuantity"),
+        min_notional_usd=instrument.get("minVolume"),
+        # No maximum-notional meaning is inferred from an undocumented field.
+        max_notional_usd=None,
+        lot_size=instrument.get("lotSize"),
+        multiplier=instrument.get("multiplier"),
+    )
+
+
 class LiveInputProducerTrustV1(StrictRecord):
     """Externally pinned producer identity; there is intentionally no default."""
 
@@ -1226,14 +1285,7 @@ class LiveInputsSourceVerifier:
         if receipt.source_name != "instruments" or not 200 <= capture["status"] < 300:
             raise ValueError("instrument HTTP capture identity/status is invalid")
 
-        def timestamp_ms(value):
-            if not isinstance(value, str):
-                raise ValueError("instrument source timestamp must be original ISO UTC text")
-            stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            if stamp.utcoffset() != UTC.utcoffset(stamp) or stamp.microsecond % 1_000:
-                raise ValueError("instrument source timestamp must be exact UTC milliseconds")
-            delta = stamp - datetime(1970, 1, 1, tzinfo=UTC)
-            return (delta.days * 86_400 + delta.seconds) * 1_000 + delta.microseconds // 1_000
+        timestamp_ms = instrument_timestamp_ms
 
         requested_ms = timestamp_ms(capture["requested_at"])
         received_ms = timestamp_ms(capture["received_at"])
@@ -1245,41 +1297,13 @@ class LiveInputsSourceVerifier:
             or received_ms > envelope.observed_at_ms
         ):
             raise ValueError("instrument original HTTP clocks differ, are future-dated, or stale")
-        instruments = payload.get("list") if isinstance(payload, dict) else payload
-        if not isinstance(instruments, list) or any(not isinstance(item, dict) for item in instruments):
-            raise ValueError("instrument source must preserve the native list response")
-        matches = [item for item in instruments if item.get("name") == envelope.venue.symbol]
-        if len(matches) != 1:
-            raise ValueError("instrument metadata is missing or duplicated for the exact PROD symbol")
-        instrument = matches[0]
-        if (
-            instrument.get("trading") != "all"
-            or instrument.get("visibility") != "all"
-            or instrument.get("marketState") != "OPEN"
-        ):
-            raise ValueError("instrument is not open, visible, and tradeable")
-        updated_ms = timestamp_ms(instrument.get("updatedAt"))
-        if updated_ms > received_ms:
-            raise ValueError("instrument rule-change timestamp postdates original capture")
-        return VerifiedLiveInstrumentRulesV1(
+        return instrument_rules_from_payload(
+            payload,
+            venue_symbol=envelope.venue.symbol,
             source_id=envelope.source_id,
             scope_sha256=expected_scope.scope_sha256,
             evidence_sha256=evidence_sha256,
-            venue_symbol=envelope.venue.symbol,
-            profile=EvedexProfile.PROD,
-            observed_at_ms=received_ms,
-            rules_updated_at_ms=updated_ms,
-            price_increment=instrument.get("priceIncrement"),
-            quantity_increment=instrument.get("quantityIncrement"),
-            min_price=instrument.get("minPrice"),
-            max_price=instrument.get("maxPrice"),
-            min_quantity=instrument.get("minQuantity"),
-            max_quantity=instrument.get("maxQuantity"),
-            min_notional_usd=instrument.get("minVolume"),
-            # No maximum-notional meaning is inferred from an undocumented field.
-            max_notional_usd=None,
-            lot_size=instrument.get("lotSize"),
-            multiplier=instrument.get("multiplier"),
+            received_ms=received_ms,
         )
 
     @staticmethod

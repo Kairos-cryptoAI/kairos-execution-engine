@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import json
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from kairos_core.enums import EvedexProfile
-from kairos_persistence import TradeState
+from kairos_core.enums import EvedexProfile, OrderRole
+from kairos_persistence import EffectStatus, EffectType, TradeState
 from pydantic import ValidationError
 
+from kairos_execution.managed_signer import reviewed_schema_sha256
+from kairos_execution.market_ioc_admission import MARKET_IOC_ENTRY_CONTRACT, MarketIocEntryRequestV1
 from kairos_execution.paper_engine import PaperExecutionSafetyError
 from kairos_execution.production_lifecycle import (
     ProductionLifecycleConfigV1,
@@ -18,8 +21,12 @@ from kairos_execution.production_lifecycle import (
     ProductionVenueHealthV1,
     _production_policy,
 )
+from kairos_execution.production_lifecycle_binding import build_production_lifecycle_binding
 from kairos_execution.production_observation import PROD_EXCHANGE_ORIGIN
+from kairos_execution.production_readiness import canonical_digest
 from kairos_execution.profiles import profile_params
+from kairos_execution.state_machine import client_order_id
+from tests.test_market_ioc_admission import DynamicSyntheticEnvelopeVerifier, _signed_request
 from tests.test_production_lifecycle_binding import _decision, _scope
 
 
@@ -81,6 +88,265 @@ def _redelivery_engine(state=TradeState.ACTIVE):
     engine._reconcile_redelivery_locked = AsyncMock(return_value=[])
     engine.clock = lambda: datetime.fromtimestamp((decision.venue_quality.expires_at_ms + 1) / 1000, tz=UTC)
     return engine, decision, trade
+
+
+def _market_reduction_engine():
+    engine, decision, trade = _redelivery_engine(TradeState.ENTRY_PENDING)
+    trade.venue_symbol = decision.venue_symbol
+    trade.entry_client_order_id = "exact-original-entry-id"
+    trade.side, trade.leverage = "BUY", 1
+    trade.entry_eligible_at = datetime.now(UTC)
+    market_request = MarketIocEntryRequestV1(
+        source_id=DynamicSyntheticEnvelopeVerifier.source_id,
+        proof_sha256="a" * 64,
+        cash_quantity_e8=1_000_000_000,
+    )
+    envelope = DynamicSyntheticEnvelopeVerifier(decision.decided_at_ms).verify(
+        market_request,
+        context=engine.production_settings.context,
+        decision=decision,
+        now_ms=decision.decided_at_ms,
+    )
+    binding = SimpleNamespace(
+        market_ioc_entry=market_request,
+        market_ioc_envelope=envelope,
+        request=_signed_request(decision, trade.entry_client_order_id, market_request),
+    )
+    request = {
+        "trade_id": trade.trade_id,
+        "intent_id": trade.strategy_intent_id,
+        "client_order_id": trade.entry_client_order_id,
+        "venue_symbol": trade.venue_symbol,
+        "side": trade.side,
+        "entry_contract": MARKET_IOC_ENTRY_CONTRACT,
+        "cash_quantity_e8": binding.market_ioc_entry.cash_quantity_e8,
+        "market_envelope_sha256": canonical_digest(envelope),
+        "quantity_cap_hex": float(decision.quantity).hex(),
+        "leverage_hex": float(1).hex(),
+    }
+    effect = SimpleNamespace(
+        effect_type=EffectType.PLACE_ORDER,
+        status=EffectStatus.PREPARED,
+        trade_id=trade.trade_id,
+        client_order_id=trade.entry_client_order_id,
+        environment=trade.environment,
+        account_id=trade.account_id,
+        request_payload=request,
+        exchange=trade.exchange,
+        symbol=trade.symbol,
+        order_role="ENTRY",
+    )
+    engine.effects = SimpleNamespace(
+        get=AsyncMock(return_value=effect), verify_chain=AsyncMock(return_value=True)
+    )
+    engine.trades.recovery_required = AsyncMock(return_value=[trade])
+    engine._market_entry_history = AsyncMock(return_value=binding)
+    engine._validate_entry_response = lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("missing fee"))
+    engine._block_entries_unlocked = AsyncMock()
+    engine._transition_with_event = AsyncMock(return_value=(trade, "failed"))
+    engine._emergency_close = AsyncMock(return_value=["close"])
+    history = {
+        "id": trade.entry_client_order_id,
+        "instrument": trade.venue_symbol,
+        "side": trade.side,
+        "type": "MARKET",
+        "timeInForce": "IOC",
+        "status": "CANCELED",
+        "quantity": 0.1,
+        "unFilledQuantity": 0.05,
+    }
+    venue = {
+        "account": {"id": engine._lifecycle_scope.remote_account_id},
+        "orders": [],
+        "positions": [{"instrument": trade.venue_symbol, "side": "BUY", "leverage": 1, "quantity": 0.05}],
+        "order_history": [history],
+    }
+    return engine, trade, effect, binding, venue
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field",
+    [
+        "cash_quantity_e8",
+        "market_envelope_sha256",
+        "quantity_cap_hex",
+        "leverage_hex",
+        "entry_contract",
+        "venue_symbol",
+        "side",
+    ],
+)
+async def test_unverifiable_market_fill_cannot_reduce_from_a_different_prepared_request(field):
+    engine, trade, effect, _binding, venue = _market_reduction_engine()
+    effect.request_payload[field] = "different-original-request"
+    with pytest.raises(PaperExecutionSafetyError, match="lineage"):
+        await engine._reduce_unverifiable_market_fill(trade, venue)
+    engine._emergency_close.assert_not_awaited()
+    engine._transition_with_event.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "no_history",
+        "other_id",
+        "partial",
+        "rejected",
+        "filled_with_remainder",
+        "mismatched_fill",
+        "position_above_envelope",
+        "other_account",
+        "open_entry",
+        "chain",
+    ],
+)
+async def test_unverifiable_market_fill_requires_exact_terminal_owned_quantity(fault):
+    engine, trade, _effect, binding, venue = _market_reduction_engine()
+    history = venue["order_history"][0]
+    if fault == "no_history":
+        venue["order_history"] = []
+    elif fault == "other_id":
+        history["id"] = "not-our-entry"
+    elif fault == "partial":
+        history["status"] = "PARTIALLY_FILLED"
+    elif fault == "rejected":
+        history["status"] = "REJECTED"
+    elif fault == "filled_with_remainder":
+        history["status"] = "FILLED"
+    elif fault == "mismatched_fill":
+        history["unFilledQuantity"] = 0.01
+    elif fault == "position_above_envelope":
+        binding.market_ioc_envelope = binding.market_ioc_envelope.model_copy(
+            update={"maximum_base_quantity_e8": 1}
+        )
+    elif fault == "other_account":
+        venue["account"]["id"] = "not-our-account"
+    elif fault == "open_entry":
+        venue["orders"] = [history]
+    else:
+        engine.effects.verify_chain.return_value = False
+    with pytest.raises(PaperExecutionSafetyError):
+        await engine._reduce_unverifiable_market_fill(trade, venue)
+    engine._emergency_close.assert_not_awaited()
+    engine._transition_with_event.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_terminal_recovery_accepts_absent_tif_only_with_matching_original_ioc_request():
+    engine, trade, _effect, binding, venue = _market_reduction_engine()
+    venue["order_history"][0].pop("timeInForce")
+    assert await engine._reduce_unverifiable_market_fill(trade, venue) == ["failed", "close"]
+    engine._emergency_close.assert_awaited_once()
+
+    engine, trade, _effect, binding, venue = _market_reduction_engine()
+    venue["order_history"][0].pop("timeInForce")
+    message = json.loads(binding.request.message_json)
+    message["timeInForce"] = "FOK"
+    binding.request = binding.request.model_copy(update={"message_json": json.dumps(message)})
+    with pytest.raises(ValueError, match="original signed"):
+        await engine._reduce_unverifiable_market_fill(trade, venue)
+    engine._emergency_close.assert_not_awaited()
+
+    engine, trade, _effect, _binding, venue = _market_reduction_engine()
+    venue["order_history"][0]["timeInForce"] = "GTC"
+    with pytest.raises(PaperExecutionSafetyError):
+        await engine._reduce_unverifiable_market_fill(trade, venue)
+    engine._emergency_close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_market_history_proof_observed_after_risk_decision_survives_expiry_without_renewal():
+    decision = _decision()
+    config = _config()
+    custody = config.custody_binding.model_copy(
+        update={"chain_id": 42161, "schema_sha256": reviewed_schema_sha256(42161)}
+    )
+    config = config.model_copy(update={"custody_binding": custody})
+    engine = _bare_engine(config)
+    observed_ms = max(decision.decided_at_ms, decision.intent.entry_eligible_ts_ms) + 100
+    request = MarketIocEntryRequestV1(
+        source_id=DynamicSyntheticEnvelopeVerifier.source_id,
+        proof_sha256="a" * 64,
+        cash_quantity_e8=1_000_000_000,
+    )
+    envelope = DynamicSyntheticEnvelopeVerifier(observed_ms).verify(
+        request,
+        context=config.context,
+        decision=decision,
+        now_ms=observed_ms,
+    )
+    original_now = datetime.fromtimestamp(observed_ms / 1000, UTC)
+    binding = build_production_lifecycle_binding(
+        decision=decision,
+        context=config.context,
+        custody_binding=custody,
+        role="ENTRY",
+        lifecycle_effect_id=engine._effect_id(
+            decision.trade_id,
+            OrderRole.ENTRY,
+            "place",
+        ),
+        client_order_id=client_order_id(
+            f"{decision.trade_id}:ENTRY",
+            "evedex",
+            occurred_at=datetime.fromtimestamp(decision.decided_at_ms / 1000, UTC),
+        ),
+        manual_request_sha256="a" * 64,
+        expires_at=original_now + timedelta(seconds=1),
+        now=original_now,
+        market_ioc_entry=request,
+        market_ioc_envelope=envelope,
+    )
+    engine.adapter = SimpleNamespace(bindings=SimpleNamespace(get=AsyncMock(return_value=binding)))
+    engine.clock = lambda: binding.request.expires_at + timedelta(days=1)
+    assert observed_ms > decision.decided_at_ms
+    assert engine.clock() > binding.request.expires_at
+    assert await engine._market_entry_history(decision) == binding
+    assert engine._market_entry_bindings[decision.trade_id].market_ioc_envelope == envelope
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing_binding",
+        "missing_metadata",
+        "market_operation_without_metadata",
+        "legacy_effect_market_binding",
+    ],
+)
+async def test_persisted_market_contract_cannot_fall_back_to_a_limit_response(fault):
+    engine, decision, trade = _redelivery_engine(TradeState.ENTRY_PENDING)
+    effect = SimpleNamespace(request_payload={"entry_contract": MARKET_IOC_ENTRY_CONTRACT})
+    legacy = SimpleNamespace(
+        market_ioc_entry=None, market_ioc_envelope=None, request=SimpleNamespace(operation="New limit order")
+    )
+    binding = legacy
+    if fault == "missing_binding":
+        binding = None
+    elif fault == "market_operation_without_metadata":
+        effect.request_payload = {}
+        legacy.request.operation = "New market order"
+    elif fault == "legacy_effect_market_binding":
+        effect.request_payload = {}
+        legacy.market_ioc_entry = SimpleNamespace()
+        legacy.market_ioc_envelope = SimpleNamespace()
+        legacy.context = engine.production_settings.context
+        legacy.role = "ENTRY"
+        legacy.decision_sha256 = canonical_digest(decision)
+        legacy.decision_id = decision.decision_id
+        legacy.trade_id = decision.trade_id
+        legacy.lifecycle_effect_id = engine._effect_id(decision.trade_id, OrderRole.ENTRY, "place")
+        legacy.request.operation = "New market order"
+    engine.effects = SimpleNamespace(get=AsyncMock(return_value=effect))
+    engine.adapter = SimpleNamespace(bindings=SimpleNamespace(get=AsyncMock(return_value=binding)))
+    with pytest.raises(PaperExecutionSafetyError, match="market"):
+        await engine._market_entry_history(decision)
+    engine.trades.recovery_required = AsyncMock(return_value=[trade])
+    with pytest.raises(PaperExecutionSafetyError, match="market"):
+        await engine._account_snapshot_unlocked()
 
 
 @pytest.mark.asyncio

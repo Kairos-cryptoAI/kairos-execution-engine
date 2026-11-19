@@ -20,6 +20,7 @@ from kairos_persistence import ExecutionJournalRepository, TradeLifecycleReposit
 from kairos_risk.live import LiveRiskEvaluator  # type: ignore[import-untyped]
 
 from .managed_signer import ManagedSignerBoundary
+from .market_ioc_admission import MarketIocAdmission
 from .production_accounting import PostgresProductionAccounting
 from .production_cancellation import (
     ProductionCancellationVenueSource,
@@ -96,6 +97,7 @@ class ProductionAssemblyResources:
     canary_verifier: TechnicalCanaryPreconditionsVerifier
     clock: Callable[[], datetime]
     sleeper: Callable[[float], Awaitable[None]] | None = None
+    market_ioc_admission: MarketIocAdmission | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,6 +154,14 @@ class ProductionAssembly:
         if self._start_attempted:
             raise ProductionAssemblyError("canary start already attempted; no new arm or driver is allowed")
         self._start_attempted = True
+        # Signed sends and cancels refuse until the transport itself has matched
+        # the API-key account to the bound PROD context; the read preflight does
+        # not set the transport's flag.
+        dispatcher = getattr(self.runtime, "dispatcher", None)
+        transport = getattr(getattr(dispatcher, "sender", None), "__self__", None)
+        if type(transport) is not ProductionEvedexTransport:
+            raise ProductionAssemblyError("canary start requires the exact typed PROD EVEDEX transport")
+        await transport.preflight()
         driver = await start_technical_canary_service(
             coordinator=self.coordinator,
             verifier=self.canary_verifier,
@@ -250,6 +260,12 @@ def _validate_resources(resources: ProductionAssemblyResources) -> tuple[Product
     ):
         raise TypeError("the PostgreSQL claims and state-source adapters are required")
     dispatcher = runtime.dispatcher
+    expected_limit_policy = "GTC" if resources.lifecycle_settings.entry_order_type == "LIMIT_GTC" else "IOC"
+    if (
+        runtime.limit_time_in_force != expected_limit_policy
+        or dispatcher.limit_time_in_force != expected_limit_policy
+    ):
+        raise ProductionAssemblyError("configured entry contract differs from runtime wire policy")
     sender = dispatcher.sender
     transport = getattr(sender, "__self__", None)
     if (
@@ -423,6 +439,8 @@ def build_production_assembly(resources: ProductionAssemblyResources) -> Product
         custody_binding=runtime.binding,
         database_uuid=runtime.database_uuid,
         policy_namespace=namespace,
+        market_ioc_admission=resources.market_ioc_admission,
+        clock=resources.clock,
     )
     trades = resources.trades
     effects = resources.effects
@@ -470,6 +488,8 @@ def build_production_assembly(resources: ProductionAssemblyResources) -> Product
         effects=effects,
         cancellations=cancellations,
         clock=resources.clock,
+        entry_order_type=resources.lifecycle_settings.entry_order_type,
+        market_ioc_admission=resources.market_ioc_admission,
     )
     engine = ProductionLifecycleEngine(
         lifecycle_adapter,

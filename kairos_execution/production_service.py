@@ -20,6 +20,8 @@ from typing import Any, Literal
 from kairos_core.contracts import CandidateReviewV1, StrategicAllocation, VenueQualityV1
 from kairos_core.enums import SystemMode
 
+from .limit_gtc_contract import LimitGtcEntryV1
+from .market_ioc_admission import MarketIocEntryRequestV1
 from .production_path import (
     ProductionLiveEntryRefusal,
     ProductionLiveEntryResult,
@@ -44,8 +46,16 @@ class ProductionEntryEnvelope:
     owner_arm: SignedManualArmRequestV1
     expires_at: datetime
     system_mode: SystemMode
+    limit_gtc_entry: LimitGtcEntryV1 | None = None
+    market_ioc_entry: MarketIocEntryRequestV1 | None = None
 
     def __post_init__(self) -> None:
+        if self.limit_gtc_entry is not None:
+            LimitGtcEntryV1.model_validate(self.limit_gtc_entry.model_dump(mode="python"))
+            if self.market_ioc_entry is not None:
+                raise ValueError("GTC and market IOC contracts cannot be combined")
+        if self.market_ioc_entry is not None:
+            MarketIocEntryRequestV1.model_validate(self.market_ioc_entry.model_dump(mode="python"))
         for value in (self.envelope_id, self.source_id):
             if not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", value) is None:
                 raise ValueError("entry envelope identities must be bounded normalized identifiers")
@@ -303,6 +313,16 @@ class ProductionServiceDriver:
                             expires_at=item.envelope.expires_at,
                             system_mode=item.envelope.system_mode,
                             entry_interlock=entry_interlock,
+                            **(
+                                {"limit_gtc_entry": item.envelope.limit_gtc_entry}
+                                if item.envelope.limit_gtc_entry is not None
+                                else {}
+                            ),
+                            **(
+                                {"market_ioc_entry": item.envelope.market_ioc_entry}
+                                if item.envelope.market_ioc_entry is not None
+                                else {}
+                            ),
                         )
                         if (
                             isinstance(result, ProductionLiveEntryRefusal)

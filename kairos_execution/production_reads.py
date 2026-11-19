@@ -229,6 +229,24 @@ class ProductionEvedexReads:
     async def fetch_depth(self, *, symbol: str, max_level: int = 100) -> dict[str, Any]:
         instrument = self._venue_symbol(symbol)
         depth = self._object(await self._read("depth", instrument=instrument, max_level=max_level))
+        return self._validate_depth(depth, source="depth")
+
+    async def fetch_best_depth(self, *, symbol: str) -> dict[str, Any]:
+        """Read documented marketLevel=1; this is a quote observation, not execution authority."""
+        instrument = self._venue_symbol(symbol)
+        depth = self._object(await self._read("best_depth", instrument=instrument))
+        depth = self._validate_depth(depth, source="best_depth")
+        bids, asks = depth["bids"], depth["asks"]
+        if (
+            len(bids) != 1
+            or len(asks) != 1
+            or self._decimal(bids[0]["price"], "native best bid")
+            >= self._decimal(asks[0]["price"], "native best ask")
+        ):
+            raise ProductionReadUnavailable("documented best book requires one uncrossed bid and ask")
+        return depth
+
+    def _validate_depth(self, depth: dict[str, Any], *, source: str) -> dict[str, Any]:
         # Only lossless integral timestamp conversion; never replace the venue clock.
         timestamp = self._integer(depth.get("t"), "native depth timestamp", maximum=2**53 - 1)
         for field in ("asks", "bids"):
@@ -238,12 +256,24 @@ class ProductionEvedexReads:
                     or self._decimal(row.get("quantity"), "native depth quantity") <= 0
                 ):
                     raise ProductionReadUnavailable("native depth contains nonpositive levels")
-        return {**depth, "t": timestamp, "native_read_capture": dict(self.last_captures["depth"])}
+        return {**depth, "t": timestamp, "native_read_capture": dict(self.last_captures[source])}
 
     async def drain_events(self, *, limit: int = 1000) -> list[dict[str, Any]]:
-        raise ProductionReadUnavailable(
-            "pinned PROD API-key REST binding has no ordered recoverable fill/fee/funding event source"
-        )
+        """The REST binding has no event stream; reconciliation polls full state instead.
+
+        The pinned PROD API-key binding has no ordered recoverable fill/fee/funding
+        events. The engine uses events only as a supplement to the authoritative
+        TP/SL list of ``fetch_paper_state`` (``_proven_venue_trigger``), so this
+        returns no events rather than inventing them. A protection that is absent
+        from the polled list stays unexplained and fails closed in the engine.
+        Account totals and terminal facts come from the REST sources in
+        ``production_rest_sources``, never from events.
+        """
+        if not self._preflight_complete:
+            raise ProductionReadUnavailable("explicit read preflight is required")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise ProductionReadUnavailable("event drain limit must be 1..1000")
+        return []
 
     async def fetch_order_fills(self, *, order_id: str) -> list[dict[str, Any]]:
         """Read one known V2 order's native fills, not a final-settlement marker.

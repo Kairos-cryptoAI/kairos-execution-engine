@@ -95,6 +95,10 @@ def runtime_fixture(*, sender=None):
     authorization._clock = lambda: now
     database_uuid = evidence.owner_nonce_claim.database_uuid
     source = object.__new__(SyntheticPostgresStateSource)
+    # This synthetic source bypasses the production constructor; mirror its
+    # explicit default session configuration without weakening runtime checks.
+    source._require_session_loss_latch = False
+    source._require_session_entry_fence = False
     source.evidence = evidence
     source.reservations = []
     source.pool = object()

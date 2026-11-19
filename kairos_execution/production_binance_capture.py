@@ -30,13 +30,64 @@ from .production_native_capture_store import (
 )
 from .production_readiness import StrictRecord
 
-BinanceReferenceSymbol = Literal["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+BinanceReferenceSymbol = Literal[
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "BNBUSDT",
+    "XRPUSDT",
+    "AAVEUSDT",
+    "DOGEUSDT",
+    "HYPEUSDT",
+    "LINKUSDT",
+    "SUIUSDT",
+    "ZECUSDT",
+    "ENAUSDT",
+    "1000PEPEUSDT",
+    "LTCUSDT",
+    "TRXUSDT",
+    "ARBUSDT",
+    "TAOUSDT",
+    "APTUSDT",
+    "1000BONKUSDT",
+    "VIRTUALUSDT",
+    "BCHUSDT",
+    "OPUSDT",
+    "DOTUSDT",
+    "AVAXUSDT",
+]
 BinanceSourceTimestampField = Literal["T", "E"]
 BINANCE_DEPTH_URL: Final[Literal["https://fapi.binance.com/fapi/v1/depth"]] = (
     "https://fapi.binance.com/fapi/v1/depth"
 )
+# Exactly the signal symbols of the reviewed PROD universe (prod_universe.PROD_SYMBOL_MAP).
 BINANCE_REFERENCE_SYMBOLS: Final[frozenset[BinanceReferenceSymbol]] = frozenset(
-    {"BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"}
+    {
+        "BTCUSDT",
+        "ETHUSDT",
+        "SOLUSDT",
+        "BNBUSDT",
+        "XRPUSDT",
+        "AAVEUSDT",
+        "DOGEUSDT",
+        "HYPEUSDT",
+        "LINKUSDT",
+        "SUIUSDT",
+        "ZECUSDT",
+        "ENAUSDT",
+        "1000PEPEUSDT",
+        "LTCUSDT",
+        "TRXUSDT",
+        "ARBUSDT",
+        "TAOUSDT",
+        "APTUSDT",
+        "1000BONKUSDT",
+        "VIRTUALUSDT",
+        "BCHUSDT",
+        "OPUSDT",
+        "DOTUSDT",
+        "AVAXUSDT",
+    }
 )
 BINANCE_DEPTH_LIMIT: Final[Literal[100]] = 100
 MAX_BINANCE_DEPTH_BODY_BYTES: Final = 1_000_000

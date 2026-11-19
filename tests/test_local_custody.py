@@ -45,6 +45,12 @@ def _make_private(path: Path, data: bytes) -> None:
             ["whoami"], check=True, capture_output=True, text=True, timeout=5
         ).stdout.strip()
         subprocess.run(
+            ["icacls", str(path), "/setowner", identity],
+            check=True,
+            capture_output=True,
+            timeout=5,
+        )
+        subprocess.run(
             [
                 "icacls",
                 str(path),
@@ -57,6 +63,15 @@ def _make_private(path: Path, data: bytes) -> None:
             capture_output=True,
             timeout=5,
         )
+        # Elevated Windows processes can create files with an explicit
+        # Administrators grant. The custody boundary permits only the user
+        # and SYSTEM; remove that well-known group grant on this test file.
+        subprocess.run(
+            ["icacls", str(path), "/remove:g", "*S-1-5-32-544"],
+            check=True,
+            capture_output=True,
+            timeout=5,
+        )
     else:
         path.chmod(0o600)
 
@@ -64,6 +79,10 @@ def _make_private(path: Path, data: bytes) -> None:
 def _backend(tmp_path: Path, *, timeout_s: float = 8.0):
     account = Account.from_key(KEY)
     encrypted = Account.encrypt(KEY, PASSWORD, kdf="pbkdf2")
+    # Keep the same numeric AES counter while restoring the worker's fixed
+    # 16-byte IV representation when eth-keyfile drops leading zero bytes.
+    params = encrypted["crypto"]["cipherparams"]
+    params["iv"] = params["iv"].zfill(32)
     key_path, unlock_path = tmp_path / "wallet.json", tmp_path / "unlock.txt"
     _make_private(key_path, json.dumps(encrypted).encode())
     _make_private(unlock_path, (PASSWORD + "\n").encode())
@@ -108,6 +127,31 @@ def test_local_child_signs_one_fixed_typed_message_and_verifier_recovers_address
             signature=signature,
         )
         is False
+    )
+
+
+def test_fixture_preserves_leading_zero_iv_and_worker_can_sign(tmp_path, monkeypatch):
+    # eth-keyfile serializes its random IV through an integer, which can drop
+    # leading zero bytes. Force that case without relying on a 1/256 event.
+    monkeypatch.setattr(
+        "eth_keyfile.keyfile.Random.get_random_bytes", lambda length: b"\x00" + b"\x42" * (length - 1)
+    )
+    backend, wallet = _backend(tmp_path)
+    encrypted = json.loads(backend.keystore_file.read_text())
+    assert encrypted["crypto"]["cipherparams"]["iv"] == "00" + "42" * 15
+    assert bytes(Account.decrypt(encrypted, PASSWORD)) == KEY
+    signature = backend.sign_typed_data(
+        custody_reference=REFERENCE,
+        domain=build_domain(CHAIN),
+        types=EIP712_SCHEMAS["New limit order"],
+        message=MESSAGE,
+    )
+    assert CoincurveTypedDataVerifier().verify(
+        wallet_address=wallet,
+        domain=build_domain(CHAIN),
+        types=EIP712_SCHEMAS["New limit order"],
+        message=MESSAGE,
+        signature=signature,
     )
 
 
