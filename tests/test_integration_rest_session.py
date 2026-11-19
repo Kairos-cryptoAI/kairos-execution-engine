@@ -39,7 +39,6 @@ from kairos_execution.signed_evidence import DirectoryEvidenceResolver
 from kairos_execution.technical_canary_readiness import TechnicalCanaryPreconditionsVerifier
 from kairos_execution.utc_clock import precise_utc_now
 from tests import paper_fixtures
-from tests import test_production_risk as risk_fixtures
 from tests.rest_stand import FakeEvedex, StandCustody, issue_stand_evidence, stand_admin_dsn
 
 pytestmark = pytest.mark.integration
@@ -62,12 +61,8 @@ async def test_one_armed_trade_enters_protects_exits_and_is_accounted(monkeypatc
     stand_custody = StandCustody()
     root = Path(tempfile.mkdtemp(prefix="rest-stand-"))
     now = precise_utc_now()
-    base_ms = (int(now.timestamp() * 1000) // 60_000) * 60_000 - 60_000
-    monkeypatch.setattr(paper_fixtures, "T0", base_ms)
-    monkeypatch.setattr(risk_fixtures, "T0", base_ms)
-    paper = paper_fixtures.approved_decision()
-    review = paper.review
-    strategy_id = review.intent.strategy_id
+    template_intent = paper_fixtures.approved_decision().review.intent
+    strategy_id = template_intent.strategy_id
     context, references, registry, pin, owner_key = issue_stand_evidence(
         root,
         remote_account_id="synthetic-stand-account",
@@ -93,7 +88,7 @@ async def test_one_armed_trade_enters_protects_exits_and_is_accounted(monkeypatc
     settings = ProductionLifecycleConfigV1(
         context=context,
         custody_binding=custody,
-        strategy_revision=review.intent.strategy_revision,
+        strategy_revision=template_intent.strategy_revision,
         expected_health=ProductionVenueHealthV1(
             chain_id=42161,
             exchange_url=PROD_EXCHANGE_ORIGIN,
@@ -101,7 +96,7 @@ async def test_one_armed_trade_enters_protects_exits_and_is_accounted(monkeypatc
             sdk_version="1.2.11",
         ),
         service_name="kairos-production-execution",
-        symbol_map={review.intent.symbol: "BTCUSD"},
+        symbol_map={template_intent.symbol: "BTCUSD"},
         entry_order_type="LIMIT_GTC",
     )
     manifest = await provision_production_database(
@@ -157,6 +152,18 @@ async def test_one_armed_trade_enters_protects_exits_and_is_accounted(monkeypatc
             adverse_slippage_rate=Decimal("0.001"),
             clock=precise_utc_now,
         )
+        # Build a fresh candidate after provisioning. Wait for the next closed
+        # bar when the current entry window would expire during host startup.
+        elapsed_ms = int(precise_utc_now().timestamp() * 1_000) % 60_000
+        if elapsed_ms >= 45_000:
+            await asyncio.sleep((60_500 - elapsed_ms) / 1_000)
+        elif elapsed_ms < 500:
+            await asyncio.sleep((500 - elapsed_ms) / 1_000)
+        current_minute_ms = int(precise_utc_now().timestamp() * 1_000) // 60_000 * 60_000
+        base_ms = current_minute_ms - 60_000
+        monkeypatch.setattr(paper_fixtures, "T0", base_ms)
+        paper = paper_fixtures.approved_decision()
+        review = paper.review
         allocation = StrategicAllocation(
             source="synthetic-stand-macro",
             regime=MarketRegime.BULL,
