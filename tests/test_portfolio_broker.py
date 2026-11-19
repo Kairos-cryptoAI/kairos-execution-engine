@@ -390,7 +390,8 @@ async def test_full_emergency_exit_settles_before_runner_records_entry(system, m
     s = system
     post_close = s.v.post_close
 
-    async def unverified(item):
+    async def unverified(item, *, position=None):
+        assert position is not None and position.instrument == item["symbol"]
         return False
 
     async def close(body):
