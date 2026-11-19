@@ -564,6 +564,8 @@ class PortfolioJournal:
         conservative_equity: Decimal,
         external_flow: Decimal,
         positions: int,
+        open_orders: int,
+        active_protections: int,
         entry_deadline_utc: datetime,
         read_digests: Sequence[str],
         baseline_at: str | None,
@@ -571,8 +573,7 @@ class PortfolioJournal:
         if (
             observed_at.tzinfo is None
             or entry_deadline_utc.tzinfo is None
-            or type(positions) is not int
-            or positions < 0
+            or any(type(n) is not int or n < 0 for n in (positions, open_orders, active_protections))
             or not read_digests
             or any(not re.fullmatch(r"[a-f0-9]{64}", s) for s in read_digests)
         ):
@@ -590,6 +591,8 @@ class PortfolioJournal:
                 if (
                     baseline_at is not None
                     or positions
+                    or open_orders
+                    or active_protections
                     or external_flow
                     or conservative_equity != funding
                     or funding < 100
@@ -637,6 +640,10 @@ class PortfolioJournal:
                     "equity_lower_bound": equity_text,
                     "net_transfers": flow,
                     "positions": positions,
+                    "open_orders": open_orders,
+                    "active_protections": active_protections,
+                    "owned_trades": len(self.active_trades()),
+                    "unresolved": len(self.unresolved_effects()),
                     "stopped": stopped,
                     "source_read_count": len(read_digests),
                     "source_sha256": hashlib.sha256("".join(read_digests).encode("ascii")).hexdigest(),

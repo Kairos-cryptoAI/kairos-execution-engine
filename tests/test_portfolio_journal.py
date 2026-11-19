@@ -27,6 +27,8 @@ def observation(j, funding="109", equity=None, flow="0", deadline=FUTURE, when=N
         conservative_equity=D(equity or funding),
         external_flow=D(flow),
         positions=0,
+        open_orders=0,
+        active_protections=0,
         entry_deadline_utc=deadline,
         read_digests=["a" * 64],
         baseline_at=prev["started_at"] if prev else None,
@@ -190,3 +192,17 @@ def test_attached_order_children_require_proven_parent_and_keep_identity(tmp_pat
         open_trade(j, 1)
         with pytest.raises(PortfolioJournalError):
             j.record_attached("t1", **(args | dict(entry_order_id="q1")))
+
+
+def test_week_end_result_remains_at_first_observation_after_signed_cutoff(tmp_path):
+    now = datetime.now(UTC)
+    deadline = now - timedelta(minutes=1)
+    with owner(tmp_path / "pilot.db") as j:
+        observation(j, when=now - timedelta(hours=1), deadline=deadline)
+        observation(j, when=now - timedelta(seconds=45), funding="109.20", deadline=deadline)
+        observation(j, when=now, funding="108", deadline=deadline)
+        status = read_pilot_status(j.path)
+        assert D(status["account_result"]) == -1
+        assert D(status["cutoff_observation"]["account_result"]) == D(".20")
+        assert status["cutoff_observation"]["lag_seconds"] == 15
+        assert status["cutoff_observation"] == status["final_flat_observation"]

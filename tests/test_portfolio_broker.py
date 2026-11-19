@@ -173,6 +173,8 @@ def system(tmp_path, monkeypatch):
             conservative_equity=D(100),
             external_flow=D(0),
             positions=len(venue.held),
+            open_orders=len(await venue.open_orders()),
+            active_protections=len(await venue.active_tpsl()),
             entry_deadline_utc=entry_deadline_utc,
             read_digests=["a" * 64],
             baseline_at=prior["started_at"] if prior else None,

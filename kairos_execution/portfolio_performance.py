@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -53,6 +54,8 @@ async def observe_pilot(
         conservative_equity=current.equity_lower_bound_usdt,
         external_flow=flows.net_deposits_usdt if flows else Decimal(0),
         positions=current.nonzero_positions,
+        open_orders=current.open_orders,
+        active_protections=current.nonterminal_tpsl,
         entry_deadline_utc=entry_deadline_utc,
         read_digests=evidence,
         baseline_at=prior["started_at"] if prior else None,
@@ -80,6 +83,33 @@ def read_pilot_status(path: Path) -> dict[str, Any] | None:
         result["unresolved_effects"] = db.execute(
             "SELECT count(*) FROM effects WHERE status IN ('UNKNOWN','PREPARED')"
         ).fetchone()[0]
+        cutoff = datetime.fromisoformat(row["entry_deadline_utc"])
+        result["cutoff_observation"] = None
+        result["final_flat_observation"] = None
+        # Read by observation time. A late first poll stays visibly late after a restart.
+        if datetime.fromisoformat(row["observed_at"]) >= cutoff:
+            events = db.execute(
+                """SELECT payload FROM events WHERE event='ACCOUNT_OBSERVED' AND created_at>=?
+                   AND json_extract(payload,'$.at')>=? ORDER BY sequence""",
+                (row["entry_deadline_utc"], row["entry_deadline_utc"]),
+            )
+            for record in events:
+                sample = json.loads(record["payload"])
+                net = Decimal(sample["funding"]) - Decimal(sample["net_transfers"]) - Decimal(row["baseline"])
+                snapshot = {
+                    "observed_at": sample["at"],
+                    "account_result": str(net),
+                    "open_positions": sample["positions"],
+                    "lag_seconds": (datetime.fromisoformat(sample["at"]) - cutoff).total_seconds(),
+                }
+                if result["cutoff_observation"] is None:
+                    result["cutoff_observation"] = snapshot
+                if all(
+                    sample.get(k) == 0
+                    for k in ("positions", "open_orders", "active_protections", "owned_trades", "unresolved")
+                ):
+                    result["final_flat_observation"] = snapshot
+                    break
         return result
     finally:
         db.close()
