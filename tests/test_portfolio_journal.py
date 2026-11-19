@@ -147,6 +147,28 @@ def test_partial_close_delta_once_and_daily_limit(tmp_path):
         assert read_pilot_status(j.path)["attributed_closures"] == 11
 
 
+@pytest.mark.parametrize("status", ["PREPARED", "UNKNOWN", "ACCEPTED"])
+@pytest.mark.parametrize("first,second", [("CLOSE", "PARTIAL_CLOSE"), ("PARTIAL_CLOSE", "CLOSE")])
+def test_unconfirmed_exit_reserves_exposure_across_target_types_and_restarts(tmp_path, status, first, second):
+    path = tmp_path / "pilot.db"
+    with owner(path) as j:
+        observation(j)
+        open_trade(j)
+        op = j.prepare_effect(trade_id="t0", kind=first, operation_key="first", request={"id": "exit1"})
+        if status != "PREPARED":
+            j.finish_effect(op, status, "exit1")
+    with owner(path) as j:
+        with pytest.raises(PortfolioJournalError, match="previous close"):
+            j.prepare_effect(trade_id="t0", kind=second, operation_key="second", request={"id": "exit2"})
+        if first == "PARTIAL_CLOSE":
+            if status != "ACCEPTED":
+                j.reconcile_effect(op, venue_id="exit1")
+            j.reduced("t0", close_order_id="exit1", quantity=D(".4"))
+            assert j.prepare_effect(
+                trade_id="t0", kind=second, operation_key="second", request={"id": "exit2"}
+            )
+
+
 def test_transfers_drawdown_and_sticky_restart(tmp_path):
     path = tmp_path / "pilot.db"
     assert read_pilot_status(path) is None

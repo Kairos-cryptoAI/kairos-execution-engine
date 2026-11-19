@@ -436,6 +436,16 @@ class PortfolioJournal:
                 ).fetchone()
                 if filled:
                     raise PortfolioJournalError("an entry attempt already owns this trade")
+            elif kind in {"CLOSE", "PARTIAL_CLOSE"}:
+                # One exposure backs every pending exit, including exits for another target.
+                unconfirmed = db.execute(
+                    """SELECT 1 FROM effects e LEFT JOIN reductions r ON r.close_order_id=e.venue_id
+                       WHERE e.trade_id=? AND e.kind IN ('CLOSE','PARTIAL_CLOSE')
+                       AND e.status!='REJECTED' AND r.close_order_id IS NULL LIMIT 1""",
+                    (trade_id,),
+                ).fetchone()
+                if unconfirmed:
+                    raise PortfolioJournalError("previous close requires fill and position reconciliation")
             elif db.execute(
                 """SELECT 1 FROM effects WHERE trade_id=? AND kind=?
                                AND status IN ('PREPARED','UNKNOWN')""",
@@ -723,6 +733,36 @@ class PortfolioJournal:
                 (venue_id, _timestamp(), effect_id),
             )
             self._event(db, "EFFECT_RECONCILED", {"effect_id": effect_id, "venue_id": venue_id})
+
+    def close_without_fill(self, effect_id: str, *, order_id: str, venue_status: str) -> None:
+        """Release an exact terminal close attempt whose entire quantity remains unfilled."""
+        if venue_status not in {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}:
+            raise PortfolioJournalError("terminal zero-fill status is required")
+        with self._write() as db:
+            effect = db.execute("SELECT * FROM effects WHERE effect_id=?", (effect_id,)).fetchone()
+            if (
+                not effect
+                or effect["kind"] not in {"CLOSE", "PARTIAL_CLOSE"}
+                or json.loads(effect["request"]).get("id") != order_id
+                or effect["venue_id"] not in {None, order_id}
+                or db.execute("SELECT 1 FROM reductions WHERE close_order_id=?", (order_id,)).fetchone()
+            ):
+                raise PortfolioJournalError("unfilled exit does not match an owned close attempt")
+            if effect["status"] == "REJECTED":
+                return
+            db.execute(
+                "UPDATE effects SET status='REJECTED',venue_id=?,updated_at=? WHERE effect_id=?",
+                (order_id, _timestamp(), effect_id),
+            )
+            self._event(
+                db,
+                "EXIT_TERMINAL_ZERO_FILL",
+                {
+                    "effect_id": effect_id,
+                    "venue_id": order_id,
+                    "venue_status": venue_status,
+                },
+            )
 
     def no_fill(self, trade_id: str, *, entry_order_id: str) -> None:
         """Release a canceled/expired entry only after the broker verified a zero terminal fill."""
