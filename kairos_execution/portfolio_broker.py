@@ -1218,7 +1218,6 @@ class PortfolioBroker:
                 and detail.get("positionVersions") == [version]
                 and detail.get("side") == _exit_side(item)
                 and detail.get("status") == "FILLED"
-                and detail.get("hasOpenedPosition") is False
                 and detail.get("group") == kind
                 and dec(detail["quantity"]) == filled
                 and dec(detail["unFilledQuantity"]) == 0

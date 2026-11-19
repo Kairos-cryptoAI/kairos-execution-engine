@@ -91,33 +91,42 @@ def target_fills(
     cancelled: set[str],
 ) -> dict[str, tuple[str, str, str]]:
     """Require a complete monotonically reducing generation and a unique trigger-to-fill binding."""
-    exit_side = "SELL" if item["side"] == "LONG" else "BUY"
+    entry_side, exit_side = ("BUY", "SELL") if item["side"] == "LONG" else ("SELL", "BUY")
     by_id = {r["id"]: r for r in orders}
     if len(by_id) != len(orders) or item["entry_order_id"] not in by_id:
         raise TargetEvidenceError("ambiguous native target order inventory")
     initial = dec(plan["initial_quantity"])
+    if initial <= 0 or not 0 <= remaining <= initial:
+        raise TargetEvidenceError("remaining exposure exceeds the original target generation")
     seen = Decimal(0)
     closes = {}
     for order_id, order in by_id.items():
         if str(order.get("user")) != account or order.get("instrument") != item["symbol"]:
             raise TargetEvidenceError("foreign order in target generation")
-        amount = dec(order["quantity"]) - dec(order["unFilledQuantity"])
+        quantity, unfilled = dec(order["quantity"]), dec(order["unFilledQuantity"])
+        if not 0 <= unfilled <= quantity:
+            raise TargetEvidenceError("invalid remaining quantity in target generation")
+        amount = quantity - unfilled
         if order_id == item["entry_order_id"]:
             if (
                 amount != initial
-                or order["side"] == exit_side
+                or order["side"] != entry_side
                 or dec(order["filledAvgPrice"]) != dec(item["price"])
             ):
                 raise TargetEvidenceError("target generation entry does not match its fill")
         elif amount:
             if (
                 order["side"] != exit_side
-                or order.get("hasOpenedPosition") is not False
                 or order.get("positionVersions") != [plan["version"]]
                 or order["status"] != "FILLED"
+                or unfilled != 0
             ):
                 raise TargetEvidenceError("unexpected or incomplete fill in target generation")
             seen += amount
+            # EVEDEX can return hasOpenedPosition=True on a partial take that leaves
+            # the original generation open. Prove direction and remaining exposure from fills.
+            if seen > initial:
+                raise TargetEvidenceError("opposing fills exceeded the owned position")
             closes[order_id] = order
     if initial - seen != remaining:
         raise TargetEvidenceError("native fills do not explain current position")

@@ -180,7 +180,7 @@ async def test_resting_ladder_restores_each_fill_once_and_keeps_full_stop(
             "quantity": level["quantity"],
             "unFilledQuantity": "0",
             "group": "take-profit",
-            "hasOpenedPosition": False,
+            "hasOpenedPosition": True,
             "filledAvgPrice": level["price"],
         }
         s.v.held["BTCUSD"] = replace(
@@ -253,7 +253,7 @@ async def test_bracket_closes_before_first_position_read(
         status="FILLED",
         type="MARKET",
         group=kind,
-        hasOpenedPosition=False,
+        hasOpenedPosition=buy,
         quantity=".1",
         unFilledQuantity="0",
         filledAvgPrice="105.01",
@@ -405,4 +405,55 @@ def test_nullable_child_requires_a_unique_generation_fill_and_unique_bound_sibli
     with pytest.raises(TargetEvidenceError):
         match({"trigger": trigger}, {**close, "positionVersions": [5]})
     with pytest.raises(TargetEvidenceError):
-        match({"trigger": trigger}, {**close, "hasOpenedPosition": True})
+        match({"trigger": trigger}, {**close, "side": "SELL", "hasOpenedPosition": True})
+
+
+def test_sol_generation_with_two_partial_fills_that_keep_the_original_position_open():
+    account = "fixture-account"
+    common = dict(
+        user=account,
+        instrument="SOLUSD",
+        status="FILLED",
+        positionVersions=[7],
+        unFilledQuantity="0",
+        hasOpenedPosition=True,
+    )
+    entry = dict(common, id="entry", side="BUY", quantity="0.3", filledAvgPrice="73.78", type="LIMIT")
+    effects, triggers, closes = [], {}, []
+    for key, level, price in (("first", "73.83", "73.84"), ("second", "73.88", "73.87")):
+        request = dict(side="SELL", price=level, quantity="0.1", order="entry")
+        effects.append(dict(kind="PARTIAL_TAKE", status="ACCEPTED", venue_id=key, request=request))
+        triggers[key] = dict(
+            request,
+            id=key,
+            instrument="SOLUSD",
+            type="take-profit",
+            order=None,
+            status="done",
+            triggerOrder=None,
+            triggeredQuantity="0.1",
+        )
+        closes.append(
+            dict(
+                common,
+                id=key,
+                side="SELL",
+                quantity="0.1",
+                filledAvgPrice=price,
+                type="MARKET",
+                group="take-profit",
+            )
+        )
+    item = dict(entry_order_id="entry", symbol="SOLUSD", side="LONG", price="73.78")
+    plan = dict(initial_quantity="0.3", version=7)
+
+    def match(exits, remaining):
+        return target_fills(
+            item, plan, effects, triggers, [*reversed(exits), entry], account, D(remaining), set()
+        )
+
+    assert match(closes, "0.1") == {"first": ("first", "0.1", "73.84"), "second": ("second", "0.1", "73.87")}
+    with pytest.raises(TargetEvidenceError):
+        match([*closes, {**closes[0], "id": "external-reentry", "side": "BUY"}], "0.2")
+    with pytest.raises(TargetEvidenceError):
+        match([*closes, {**closes[0], "id": "over-close", "quantity": "0.2"}], "0")
