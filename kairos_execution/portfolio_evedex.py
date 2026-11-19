@@ -524,9 +524,9 @@ class Evedex:
                     not isinstance(row.get("instrument"), str)
                     or not row["instrument"]
                     or not isinstance(row.get("id"), str)
-                    or not row["id"]
-                    or row.get("user") is None
-                    or not str(row["user"])
+                    or not row["id"].strip()
+                    or type(row.get("user")) not in {str, int}
+                    or not str(row["user"]).strip()
                     or row.get("side") not in {"BUY", "SELL"}
                     or dec(row.get("avgPrice")) <= 0
                 ):
@@ -550,8 +550,8 @@ class Evedex:
                         dec(row.get("avgPrice", 0)),
                         has_stop,
                         stop_id,
-                        row.get("id"),
-                        str(row["user"]) if row.get("user") is not None else None,
+                        row["id"],
+                        str(row["user"]),
                         tuple(attached) if all(isinstance(child, dict) for child in attached) else (),
                     )
                 )

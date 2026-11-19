@@ -492,6 +492,43 @@ async def test_start_reinstalls_both_missing_protections_and_poll_keeps_tight_st
     assert (await s.b.settle(trade))["exit_origin"] == "unknown"
 
 
+@pytest.mark.parametrize(
+    "identity",
+    [
+        {},
+        {"id": "position"},
+        {"user": "test-account"},
+        {"id": " ", "user": "test-account"},
+        {"id": "position", "user": {}},
+        {"id": "position", "user": True},
+    ],
+)
+async def test_native_position_reads_require_position_and_account_identity(system, monkeypatch, identity):
+    s = system
+    reader = Evedex(Mock())
+
+    async def get(method, url, *, private, params):
+        assert method == "GET" and url == f"{TRADING}/api/position" and private
+        return {
+            "list": [
+                {
+                    **identity,
+                    "instrument": "BTCUSD",
+                    "quantity": "0.025",
+                    "side": "BUY",
+                    "avgPrice": "100.51",
+                    "tpslList": [],
+                }
+            ]
+        }
+
+    monkeypatch.setattr(reader, "_request", get)
+    monkeypatch.setattr(s.v, "positions", reader.positions)
+    with pytest.raises(portfolio.EvedexError, match="incomplete open position"):
+        await s.enter()
+    assert not s.v.sent and not s.v.leverages and not s.j.active_trades()
+
+
 @pytest.fixture
 def position_projection(system, monkeypatch):
     """Pinned SDK projections: parent empty, full-position children have no parent/order."""
