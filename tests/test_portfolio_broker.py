@@ -7,7 +7,6 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-from eth_account import Account
 from kairos_core.contracts import RiskTradeDecisionV1
 
 from kairos_execution import portfolio_broker as portfolio
@@ -15,6 +14,8 @@ from kairos_execution.portfolio_evedex import Book, Instrument, Position, Unknow
 from kairos_execution.portfolio_journal import PortfolioJournal
 from kairos_execution.prod_universe import PROD_INSTRUMENTS, PROD_SYMBOL_MAP
 from tests.test_production_lifecycle_binding import _decision
+
+Account = pytest.importorskip("eth_account").Account
 
 
 class Venue:
@@ -428,3 +429,17 @@ async def test_large_clock_lead_skips_without_sending(system, monkeypatch):
     s = system
     monkeypatch.setattr(portfolio, "_now", lambda: s.risk.decided_at_ms - 3000)
     assert await s.enter() is None and not s.v.leverages and not s.j.active_trades()
+
+
+async def test_admission_requires_current_tightened_stop_and_correct_target(system):
+    s = system
+    trade = runner_trade(s, await s.enter())
+    before = dict(s.v.tpsl)
+    await s.b.move_stop(trade, D(97))
+    tight = dict(s.v.tpsl)
+    s.v.tpsl = before  # only the old, looser stop remains
+    assert await s.b.foreign_exposure({"BTCUSD"})
+    s.v.tpsl = {key: row for key, row in tight.items() if row["type"] != "take-profit"}
+    with pytest.raises(portfolio.NeedsOperator, match="confirmed stop and take"):
+        await s.b.prepare_admission({"BTCUSD"})
+    assert len(s.v.sent) == 1

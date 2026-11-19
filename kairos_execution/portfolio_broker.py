@@ -333,15 +333,15 @@ class PortfolioBroker:
                 issues.append("unowned venue protection")
         if check_protected:
             for symbol, item in tracked.items():
-                # A tightened stop can only reduce risk and must belong to the original trade.
-                def covers(r: dict, t: dict = item) -> bool:
-                    price = row_price(r)
-                    if price is None or not self._valid_protection(t, r, "stop-loss", price):
-                        return False
-                    return price >= dec(t["stop"]) if t["side"] == "LONG" else price <= dec(t["stop"])
-
-                if symbol not in seen or not any(covers(r) for r in protections):
-                    issues.append(f"{symbol} awaits flatness or stop reconciliation")
+                stop = self._tightest_stop(item)
+                if (
+                    symbol not in seen
+                    or not any(self._valid_protection(item, r, "stop-loss", stop) for r in protections)
+                    or not any(
+                        self._valid_protection(item, r, "take-profit", dec(item["take"])) for r in protections
+                    )
+                ):
+                    issues.append(f"{symbol} awaits its confirmed stop and take or flatness reconciliation")
         return issues, positions
 
     async def foreign_exposure(self, own: set[str]) -> list[str]:
@@ -440,15 +440,19 @@ class PortfolioBroker:
             position = await self._owned_position(item)
             return bool(position and await self._maintain_protection(item, trade, position))
 
-    async def _maintain_protection(self, item: dict, trade: dict, position: Position) -> bool:
-        # A crash can precede the runner's stop update. Use the tightest acknowledged price.
-        prices = [dec(item["stop"]), dec(trade["stop"])]
+    def _tightest_stop(self, item: dict, runner_stop: Decimal | None = None) -> Decimal:
+        prices = [dec(item["stop"])]
+        if runner_stop is not None:
+            prices.append(runner_stop)
         prices.extend(
             dec(e["request"]["price"])
             for e in self._journal.effects(item["trade_id"])
             if e["kind"] == "STOP" and e["status"] == "ACCEPTED"
         )
-        stop = max(prices) if item["side"] == "LONG" else min(prices)
+        return max(prices) if item["side"] == "LONG" else min(prices)
+
+    async def _maintain_protection(self, item: dict, trade: dict, position: Position) -> bool:
+        stop = self._tightest_stop(item, dec(trade["stop"]))
         rows = await self._protection_rows(item)
         if any(not self._owned_protection(item, r) for r in rows):
             raise NeedsOperator("foreign protection shares a managed instrument")
