@@ -1017,7 +1017,7 @@ async def test_confirmed_protection_with_transient_read_miss_is_closed_and_cance
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("status", "cancelled"), ("side", "SELL"), ("quantity", 0.1)],
+    [("status", "cancelled"), ("side", "BUY"), ("quantity", 0.1)],
 )
 @pytest.mark.asyncio
 async def test_tpsl_follow_up_read_requires_live_side_and_full_position_semantics(

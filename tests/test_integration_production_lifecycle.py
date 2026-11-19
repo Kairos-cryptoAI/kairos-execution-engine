@@ -19,7 +19,7 @@ from uuid import UUID
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from kairos_core.enums import EvedexProfile, OrderRole, TradeExecutionEventType, TradeExitReason
+from kairos_core.enums import EvedexProfile, OrderRole, Side, TradeExecutionEventType, TradeExitReason
 from kairos_persistence import (
     ExecutionJournalRepository,
     TradeLifecycleRepository,
@@ -542,7 +542,7 @@ def _synthetic_authority(
             else ExposureSnapshotV1(
                 context=context,
                 instrument=message["instrument"],
-                position_side=message["side"],
+                position_side="BUY" if source.decision.intent.side is Side.LONG else "SELL",
                 remaining_quantity=5_000_000,
                 parent_order_id=message["order"],
                 observed_at=now - timedelta(milliseconds=100),
