@@ -45,6 +45,10 @@ class NeedsOperator(EvedexError):
     """Venue facts or local ownership cannot safely authorize the next action."""
 
 
+class ProtectionEvidenceError(NeedsOperator):
+    """A fixed, non-sensitive reason the venue did not establish protection ownership."""
+
+
 def account_id_for(wallet_address: str) -> str:
     return "evedex-prod-" + hashlib.sha256(wallet_address.lower().encode()).hexdigest()[:20]
 
@@ -249,12 +253,56 @@ class PortfolioBroker:
 
     async def _protection_rows(self, item: dict) -> list[dict[str, Any]]:
         rows = await self._api.active_tpsl(item["symbol"])
-        if not any(not r.get("order") and not self._owned_protection(item, r) for r in rows):
+        if all(r.get("order") or self._owned_protection(item, r) for r in rows):
             return rows
+        await self._bind_attached(item, rows)
+        if all(self._owned_protection(item, r) for r in rows):
+            return rows
+
+        # A complete pair at the signed prices can precede its parent projection. Geometry
+        # permits one bounded read only. A foreign ID never becomes our protection on this basis.
+        def active_pair(rows: list[dict[str, Any]]) -> bool:
+            expected = {"stop-loss": dec(item["stop"]), "take-profit": dec(item["take"])}
+            return (
+                len(rows) == 2
+                and {r.get("type") for r in rows} == set(expected)
+                and len({r.get("id") for r in rows if isinstance(r.get("id"), str) and r["id"]}) == 2
+                and all(
+                    r.get("instrument") == item["symbol"]
+                    and r.get("side") == _side(item)
+                    and r.get("status") == "active"
+                    and dec(r.get("quantity")) == 0
+                    and row_price(r) == expected[r["type"]]
+                    and r.get("order") in (None, item["entry_order_id"])
+                    for r in rows
+                )
+            )
+
+        if active_pair(rows):
+            original_ids = {r["id"] for r in rows}
+            try:
+                async with asyncio.timeout(1):
+                    await asyncio.sleep(min(self._settle_seconds, 0.1))
+                    refreshed = await self._api.active_tpsl(item["symbol"])
+                    if not active_pair(refreshed) or {r["id"] for r in refreshed} != original_ids:
+                        raise ProtectionEvidenceError(
+                            "active protection pair changed during ownership verification"
+                        )
+                    await self._bind_attached(item, refreshed)
+                    rows = refreshed
+            except TimeoutError as exc:
+                raise ProtectionEvidenceError("parent protection evidence refresh timed out") from exc
+        if any(not self._owned_protection(item, r) for r in rows):
+            raise ProtectionEvidenceError("venue did not link active protection IDs to the owned entry")
+        return rows
+
+    async def _bind_attached(self, item: dict, rows: list[dict[str, Any]]) -> None:
         order_id = item["entry_order_id"]
         parent = await self._api.order_with_protections(item["symbol"], order_id)
-        if not parent or str(parent.get("user", "")) != self._profile.remote_account_id:
-            raise NeedsOperator("exact parent order and its authenticated account could not be verified")
+        if parent is None:
+            return
+        if str(parent.get("user", "")) != self._profile.remote_account_id:
+            raise ProtectionEvidenceError("protection parent does not belong to the authenticated account")
         entry = next(
             e
             for e in self._journal.effects(item["trade_id"])
@@ -263,7 +311,7 @@ class PortfolioBroker:
         self._entry_record(parent, item, order_id, dec(entry["request"]["price"]))
         children = parent.get("tpslList")
         if not isinstance(children, list) or any(not isinstance(c, dict) for c in children):
-            raise NeedsOperator("exact parent order has no verifiable TP/SL projection")
+            raise ProtectionEvidenceError("exact parent order has no verifiable TP/SL projection")
         for child in children:
             kind = child.get("type")
             if kind not in {"stop-loss", "take-profit"}:
@@ -294,7 +342,6 @@ class PortfolioBroker:
                     kind="STOP" if kind == "stop-loss" else "TAKE",
                     price=px,
                 )
-        return rows
 
     def _valid_protection(self, item: dict, row: dict, kind: str, price: Decimal) -> bool:
         return (
@@ -818,19 +865,23 @@ class PortfolioBroker:
             item = opened
             stop, take = dec(item["stop"]), dec(item["take"])
             within_plan = stop < avg < take if item["side"] == "LONG" else take < avg < stop
+            failure = "owned entry exceeded its geometry or protection could not be verified"
             try:
                 protected = (
                     avg * filled <= self._profile.max_notional_usd
                     and within_plan
                     and await self._ensure_entry_protection(item)
                 )
+            except ProtectionEvidenceError as exc:
+                protected = False
+                failure = str(exc)
             except (EvedexError, ValueError, ArithmeticError, RuntimeError):
                 protected = False
             if not protected:
                 current = await self._owned_position(item)
                 if current:
                     await self._close_quantity(item, current, current.quantity)
-                raise NeedsOperator("owned entry exceeded its geometry or protection could not be verified")
+                raise NeedsOperator(failure)
             return {
                 "quantity": filled,
                 "price": avg,

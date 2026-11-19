@@ -560,10 +560,9 @@ class Evedex:
         return value if isinstance(value, dict) else None
 
     async def order_with_protections(self, instrument: str, order_id: str) -> dict[str, Any] | None:
-        """The pinned SDK exposes parent/child IDs on getOrders(withTpSL=true)."""
+        """Read the exact parent across position versions. A position version is not an API version."""
         params: dict[str, Any] = {
             "instrument": instrument,
-            "version": 2,
             "withTpSL": "yes",
             "limit": 100,
             "offset": 0,

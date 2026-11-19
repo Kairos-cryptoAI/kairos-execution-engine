@@ -13,7 +13,7 @@ import pytest
 from kairos_core.contracts import RiskTradeDecisionV1
 
 from kairos_execution import portfolio_broker as portfolio
-from kairos_execution.portfolio_evedex import Book, Instrument, Position, Rejected, Unknown
+from kairos_execution.portfolio_evedex import TRADING, Book, Evedex, Instrument, Position, Rejected, Unknown
 from kairos_execution.portfolio_journal import PortfolioJournal
 from kairos_execution.prod_universe import PROD_INSTRUMENTS, PROD_SYMBOL_MAP
 from tests.test_production_lifecycle_binding import _decision
@@ -403,6 +403,78 @@ async def test_sdk_child_rows_without_order_are_bound_through_exact_order_list(s
     await s.b.close(trade, await s.v.book("BTCUSD"), "TIMEOUT")
     await s.b.settle(trade)
     assert not s.v.tpsl
+
+
+@pytest.mark.parametrize("projection_lags", [False, True])
+async def test_parent_is_found_across_position_versions_and_links_exact_ids(
+    system, monkeypatch, projection_lags
+):
+    s = system
+    s.v.omit_parent = True
+    sdk_projection = s.v.order_with_protections
+    reader = Evedex(Mock())
+    history_reads = []
+
+    async def history(method, url, *, private, params):
+        assert method == "GET" and url == f"{TRADING}/api/order" and private
+        assert params["withTpSL"] == "yes" and params["instrument"] == "BTCUSD"
+        history_reads.append(dict(params))
+        order_id = s.v.sent[0]["id"]
+        parent = await sdk_projection("BTCUSD", order_id)
+        parent["positionVersions"] = [3]
+        if projection_lags and len(history_reads) == 1:
+            parent["tpslList"] = []
+        rows = [parent] if params.get("version") in {None, 3} else []
+        return {"count": len(rows), "list": rows}
+
+    monkeypatch.setattr(reader, "_request", history)
+    monkeypatch.setattr(s.v, "order_with_protections", reader.order_with_protections)
+    assert (await s.enter())["protected"]
+    assert len(history_reads) == 1 + projection_lags
+    assert [e["kind"] for e in s.j.effects(s.risk.trade_id)] == ["LEVERAGE", "ENTRY"]
+    assert {p["venue_id"] for p in s.j.attached(s.risk.trade_id)} == set(s.v.tpsl)
+
+
+@pytest.mark.parametrize(
+    ("mode", "reads", "reason"),
+    [
+        ("different_ids", 2, "link active protection IDs"),
+        ("incomplete", 1, "link active protection IDs"),
+        ("waitOrder", 1, "link active protection IDs"),
+        ("wrong_account", 1, "authenticated account"),
+    ],
+)
+async def test_unverified_children_close_only_the_owned_fill(system, monkeypatch, mode, reads, reason):
+    s = system
+    s.v.omit_parent = True
+    submit = s.v.post_limit_order
+    sdk_projection = s.v.order_with_protections
+    history_reads = []
+
+    async def accept(body):
+        result = await submit(body)
+        if mode == "incomplete":
+            s.v.tpsl.popitem()
+        elif mode == "waitOrder":
+            next(iter(s.v.tpsl.values()))["status"] = "waitOrder"
+        return result
+
+    async def history(symbol, order_id):
+        history_reads.append(order_id)
+        parent = await sdk_projection(symbol, order_id)
+        if mode == "wrong_account":
+            parent["user"] = "other-account"
+        else:
+            parent["tpslList"] = [{**r, "id": "foreign-" + r["id"]} for r in parent["tpslList"]]
+        return parent
+
+    monkeypatch.setattr(s.v, "post_limit_order", accept)
+    monkeypatch.setattr(s.v, "order_with_protections", history)
+    with pytest.raises(portfolio.NeedsOperator, match=reason):
+        await s.enter()
+    assert len(history_reads) == reads and len(s.v.sent) == 1
+    assert not s.j.attached(s.risk.trade_id) and not s.v.held
+    assert [e["kind"] for e in s.j.effects(s.risk.trade_id)] == ["LEVERAGE", "ENTRY", "CLOSE"]
 
 
 async def test_start_reinstalls_both_missing_protections_and_poll_keeps_tight_stop(system):
