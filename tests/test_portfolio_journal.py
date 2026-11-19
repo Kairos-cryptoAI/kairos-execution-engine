@@ -4,7 +4,11 @@ from pathlib import Path
 
 import pytest
 
-from kairos_execution.portfolio_journal import PortfolioJournal, PortfolioJournalError
+from kairos_execution.portfolio_journal import (
+    PortfolioAdmissionRefused,
+    PortfolioJournal,
+    PortfolioJournalError,
+)
 from kairos_execution.portfolio_performance import read_pilot_status
 
 FUTURE = datetime(2099, 1, 1, tzinfo=UTC)
@@ -136,7 +140,7 @@ def test_partial_close_delta_once_and_daily_limit(tmp_path):
         for i in range(1, 12):
             open_trade(j, i)
             j.closed(f"t{i}", exit_origin="system", pnl_basis="execution_fills", net_pnl=D("0.05"))
-        with pytest.raises(PortfolioJournalError, match="daily"):
+        with pytest.raises(PortfolioAdmissionRefused, match="daily"):
             reserve(j, 12)
         assert read_pilot_status(j.path)["attributed_closures"] == 11
 
@@ -165,8 +169,8 @@ def test_stale_read_and_signed_entry_window(tmp_path):
     with owner(tmp_path / "pilot.db") as j:
         deadline = datetime.now(UTC) - timedelta(hours=1)
         observation(j, when=datetime.now(UTC) - timedelta(hours=25), deadline=deadline)
-        with pytest.raises(PortfolioJournalError, match="fresh"):
+        with pytest.raises(PortfolioAdmissionRefused, match="fresh"):
             reserve(j)
         observation(j, deadline=deadline)
-        with pytest.raises(PortfolioJournalError, match="window"):
+        with pytest.raises(PortfolioAdmissionRefused, match="window"):
             reserve(j)

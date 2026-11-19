@@ -39,6 +39,10 @@ class PortfolioJournalError(RuntimeError):
     """An ownership, durability or attribution check refused an operation."""
 
 
+class PortfolioAdmissionRefused(PortfolioJournalError):
+    """A known pre-dispatch portfolio limit prevented opening a new position."""
+
+
 def _timestamp() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -300,7 +304,7 @@ class PortfolioJournal:
         approved_loss, approved_notional = _amount(worst_case_loss), _amount(notional)
         _amount(equity)
         if worst_case_loss > Decimal("0.25") or notional > Decimal("25"):
-            raise PortfolioJournalError("entry exceeds the pilot's loss or notional limit")
+            raise PortfolioAdmissionRefused("entry exceeds the pilot's loss or notional limit")
         with self._write() as db:
             if (
                 self.unresolved_effects()
@@ -316,9 +320,9 @@ class PortfolioJournal:
                 <= now - datetime.fromisoformat(pilot["observed_at"])
                 <= timedelta(seconds=60)
             ):
-                raise PortfolioJournalError("pilot stopped or fresh verified performance unavailable")
+                raise PortfolioAdmissionRefused("pilot stopped or fresh verified performance unavailable")
             if now >= datetime.fromisoformat(pilot["entry_deadline_utc"]):
-                raise PortfolioJournalError("pilot entry window ended")
+                raise PortfolioAdmissionRefused("pilot entry window ended")
             at_risk = sum((Decimal(row["worst_case_loss"]) for row in self.active_trades()), Decimal(0))
             equity = min(equity, Decimal(pilot["conservative_equity"]))
             capital = min(Decimal(100), equity)
@@ -330,15 +334,15 @@ class PortfolioJournal:
                 or at_risk + worst_case_loss > capital * Decimal("0.01")
                 or current_loss + at_risk + worst_case_loss > Decimal(5)
             ):
-                raise PortfolioJournalError("portfolio or session loss budget exhausted")
+                raise PortfolioAdmissionRefused("portfolio or session loss budget exhausted")
             attempts = db.execute(
                 "SELECT count(*) FROM trades WHERE state!='REFUSED' AND created_at>=?",
                 (now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat(),),
             ).fetchone()[0]
             if attempts >= 12:
-                raise PortfolioJournalError("daily portfolio entry limit reached")
+                raise PortfolioAdmissionRefused("daily portfolio entry limit reached")
             if len(self.active_trades()) >= self.max_positions:
-                raise PortfolioJournalError("portfolio has no free slot")
+                raise PortfolioAdmissionRefused("portfolio has no free slot")
             try:
                 db.execute(
                     """INSERT INTO trades(trade_id,decision_id,symbol,side,approved_quantity,leverage,
