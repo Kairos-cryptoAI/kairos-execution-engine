@@ -11,6 +11,7 @@ from __future__ import annotations
 import ctypes
 import os
 import stat
+import sys
 from contextlib import ExitStack, contextmanager
 from ctypes import wintypes
 from pathlib import Path
@@ -30,7 +31,7 @@ def _absolute_path(path: Path) -> Path:
     if not isinstance(path, Path) or ".." in path.parts:
         raise ProtectedFileError("protected file path is invalid")
     path = Path(os.path.abspath(path))
-    if os.name == "nt" and (
+    if sys.platform == "win32" and (
         str(path).startswith(("\\\\?\\", "\\\\.\\"))
         or any(":" in part or part.endswith((".", " ")) for part in path.parts[1:])
     ):
@@ -38,151 +39,151 @@ def _absolute_path(path: Path) -> Path:
     return path
 
 
-class _SecurityAttributes(ctypes.Structure):
-    _fields_ = [
-        ("nLength", wintypes.DWORD),
-        ("lpSecurityDescriptor", ctypes.c_void_p),
-        ("bInheritHandle", wintypes.BOOL),
-    ]
+if sys.platform == "win32":
 
+    class _SecurityAttributes(ctypes.Structure):
+        _fields_ = [
+            ("nLength", wintypes.DWORD),
+            ("lpSecurityDescriptor", ctypes.c_void_p),
+            ("bInheritHandle", wintypes.BOOL),
+        ]
 
-class _Windows:
-    """Only the Win32 operations needed to create and pin local private files."""
+    class _Windows:
+        """Only the Win32 operations needed to create and pin local private files."""
 
-    def __init__(self) -> None:
-        self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-        self.advapi = ctypes.WinDLL("advapi32", use_last_error=True)
-        ptr = ctypes.c_void_p
-        self.kernel.CreateFileW.argtypes = [
-            wintypes.LPCWSTR,
-            wintypes.DWORD,
-            wintypes.DWORD,
-            ctypes.POINTER(_SecurityAttributes),
-            wintypes.DWORD,
-            wintypes.DWORD,
-            wintypes.HANDLE,
-        ]
-        self.kernel.CreateFileW.restype = wintypes.HANDLE
-        self.kernel.CreateDirectoryW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(_SecurityAttributes)]
-        self.kernel.CreateDirectoryW.restype = wintypes.BOOL
-        self.kernel.GetFileInformationByHandleEx.argtypes = [
-            wintypes.HANDLE,
-            ctypes.c_int,
-            ptr,
-            wintypes.DWORD,
-        ]
-        self.kernel.GetFileInformationByHandleEx.restype = wintypes.BOOL
-        self.kernel.GetCurrentProcess.restype = wintypes.HANDLE
-        self.kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-        self.kernel.CloseHandle.restype = wintypes.BOOL
-        self.kernel.LocalFree.argtypes = [ptr]
-        self.kernel.LocalFree.restype = ptr
-        self.advapi.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(ptr)]
-        self.advapi.OpenProcessToken.restype = wintypes.BOOL
-        self.advapi.GetTokenInformation.argtypes = [
-            ptr,
-            wintypes.DWORD,
-            ptr,
-            wintypes.DWORD,
-            ctypes.POINTER(wintypes.DWORD),
-        ]
-        self.advapi.GetTokenInformation.restype = wintypes.BOOL
-        self.advapi.ConvertSidToStringSidW.argtypes = [ptr, ctypes.POINTER(ptr)]
-        self.advapi.ConvertSidToStringSidW.restype = wintypes.BOOL
-        self.advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
-            wintypes.LPCWSTR,
-            wintypes.DWORD,
-            ctypes.POINTER(ptr),
-            ptr,
-        ]
-        self.advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+        def __init__(self) -> None:
+            self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            self.advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+            ptr = ctypes.c_void_p
+            self.kernel.CreateFileW.argtypes = [
+                wintypes.LPCWSTR,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                ctypes.POINTER(_SecurityAttributes),
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.HANDLE,
+            ]
+            self.kernel.CreateFileW.restype = wintypes.HANDLE
+            self.kernel.CreateDirectoryW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(_SecurityAttributes)]
+            self.kernel.CreateDirectoryW.restype = wintypes.BOOL
+            self.kernel.GetFileInformationByHandleEx.argtypes = [
+                wintypes.HANDLE,
+                ctypes.c_int,
+                ptr,
+                wintypes.DWORD,
+            ]
+            self.kernel.GetFileInformationByHandleEx.restype = wintypes.BOOL
+            self.kernel.GetCurrentProcess.restype = wintypes.HANDLE
+            self.kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+            self.kernel.CloseHandle.restype = wintypes.BOOL
+            self.kernel.LocalFree.argtypes = [ptr]
+            self.kernel.LocalFree.restype = ptr
+            self.advapi.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(ptr)]
+            self.advapi.OpenProcessToken.restype = wintypes.BOOL
+            self.advapi.GetTokenInformation.argtypes = [
+                ptr,
+                wintypes.DWORD,
+                ptr,
+                wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD),
+            ]
+            self.advapi.GetTokenInformation.restype = wintypes.BOOL
+            self.advapi.ConvertSidToStringSidW.argtypes = [ptr, ctypes.POINTER(ptr)]
+            self.advapi.ConvertSidToStringSidW.restype = wintypes.BOOL
+            self.advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+                wintypes.LPCWSTR,
+                wintypes.DWORD,
+                ctypes.POINTER(ptr),
+                ptr,
+            ]
+            self.advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+
+        @contextmanager
+        def security(self, *, directory: bool):
+            token, sid_text, descriptor = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
+            try:
+                if not self.advapi.OpenProcessToken(self.kernel.GetCurrentProcess(), 8, ctypes.byref(token)):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                buffer, needed = ctypes.create_string_buffer(1024), wintypes.DWORD()
+                if not self.advapi.GetTokenInformation(token, 1, buffer, len(buffer), ctypes.byref(needed)):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                sid = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0]
+                if not self.advapi.ConvertSidToStringSidW(sid, ctypes.byref(sid_text)):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                identity = ctypes.wstring_at(sid_text)
+                inheritance = "OICI" if directory else ""
+                sddl = f"O:{identity}D:P(A;{inheritance};FA;;;{identity})(A;{inheritance};FR;;;SY)"
+                if not self.advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl, 1, ctypes.byref(descriptor), None
+                ):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                yield _SecurityAttributes(ctypes.sizeof(_SecurityAttributes), descriptor, False)
+            finally:
+                if descriptor:
+                    self.kernel.LocalFree(descriptor)
+                if sid_text:
+                    self.kernel.LocalFree(sid_text)
+                if token:
+                    self.kernel.CloseHandle(token)
+
+        def attributes(self, handle: int) -> int:
+            # FILE_ATTRIBUTE_TAG_INFO: attributes and reparse tag (FileAttributeTagInfo=9).
+            info = (wintypes.DWORD * 2)()
+            if not self.kernel.GetFileInformationByHandleEx(handle, 9, info, ctypes.sizeof(info)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            return info[0]
+
+        def open(self, path: Path, *, directory: bool, write: bool = False, security: Any = None) -> int:
+            access = 0x20000 | (0x80 if directory else (0x40000000 if write else 0x80000000))
+            # Ancestors deny delete/rename; new files deny all sharing until close.
+            sharing = 3 if directory else (0 if write else 1)
+            flags = 0x00200000 | (0x02000000 if directory else 0x80)
+            handle = self.kernel.CreateFileW(
+                str(path),
+                access,
+                sharing,
+                ctypes.byref(security) if security is not None else None,
+                1 if write else 3,
+                flags,
+                None,
+            )
+            if handle == ctypes.c_void_p(-1).value:
+                raise ctypes.WinError(ctypes.get_last_error())
+            try:
+                attributes = self.attributes(handle)
+                if attributes & 0x400 or bool(attributes & 0x10) != directory:
+                    raise ProtectedFileError("protected path contains a link or unexpected file type")
+            except BaseException:
+                self.kernel.CloseHandle(handle)
+                raise
+            return handle
+
+        def mkdir(self, path: Path, security: _SecurityAttributes) -> None:
+            if not self.kernel.CreateDirectoryW(str(path), ctypes.byref(security)):
+                raise ctypes.WinError(ctypes.get_last_error())
 
     @contextmanager
-    def security(self, *, directory: bool):
-        token, sid_text, descriptor = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
-        try:
-            if not self.advapi.OpenProcessToken(self.kernel.GetCurrentProcess(), 8, ctypes.byref(token)):
-                raise ctypes.WinError(ctypes.get_last_error())
-            buffer, needed = ctypes.create_string_buffer(1024), wintypes.DWORD()
-            if not self.advapi.GetTokenInformation(token, 1, buffer, len(buffer), ctypes.byref(needed)):
-                raise ctypes.WinError(ctypes.get_last_error())
-            sid = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0]
-            if not self.advapi.ConvertSidToStringSidW(sid, ctypes.byref(sid_text)):
-                raise ctypes.WinError(ctypes.get_last_error())
-            identity = ctypes.wstring_at(sid_text)
-            inheritance = "OICI" if directory else ""
-            sddl = f"O:{identity}D:P(A;{inheritance};FA;;;{identity})(A;{inheritance};FR;;;SY)"
-            if not self.advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                sddl, 1, ctypes.byref(descriptor), None
-            ):
-                raise ctypes.WinError(ctypes.get_last_error())
-            yield _SecurityAttributes(ctypes.sizeof(_SecurityAttributes), descriptor, False)
-        finally:
-            if descriptor:
-                self.kernel.LocalFree(descriptor)
-            if sid_text:
-                self.kernel.LocalFree(sid_text)
-            if token:
-                self.kernel.CloseHandle(token)
-
-    def attributes(self, handle: int) -> int:
-        # FILE_ATTRIBUTE_TAG_INFO: attributes and reparse tag (FileAttributeTagInfo=9).
-        info = (wintypes.DWORD * 2)()
-        if not self.kernel.GetFileInformationByHandleEx(handle, 9, info, ctypes.sizeof(info)):
-            raise ctypes.WinError(ctypes.get_last_error())
-        return info[0]
-
-    def open(self, path: Path, *, directory: bool, write: bool = False, security: Any = None) -> int:
-        access = 0x20000 | (0x80 if directory else (0x40000000 if write else 0x80000000))
-        # Ancestors deny delete/rename; new files deny all sharing until close.
-        sharing = 3 if directory else (0 if write else 1)
-        flags = 0x00200000 | (0x02000000 if directory else 0x80)
-        handle = self.kernel.CreateFileW(
-            str(path),
-            access,
-            sharing,
-            ctypes.byref(security) if security is not None else None,
-            1 if write else 3,
-            flags,
-            None,
-        )
-        if handle == ctypes.c_void_p(-1).value:
-            raise ctypes.WinError(ctypes.get_last_error())
-        try:
-            attributes = self.attributes(handle)
-            if attributes & 0x400 or bool(attributes & 0x10) != directory:
-                raise ProtectedFileError("protected path contains a link or unexpected file type")
-        except BaseException:
-            self.kernel.CloseHandle(handle)
-            raise
-        return handle
-
-    def mkdir(self, path: Path, security: _SecurityAttributes) -> None:
-        if not self.kernel.CreateDirectoryW(str(path), ctypes.byref(security)):
-            raise ctypes.WinError(ctypes.get_last_error())
-
-
-@contextmanager
-def _windows_parent(path: Path, *, create: bool):
-    api = _Windows()
-    with ExitStack() as stack, api.security(directory=True) as security:
-        current = Path(path.anchor)
-        for part in (None, *path.parent.parts[1:]):
-            if part is not None:
-                current /= part
-            created = False
-            try:
-                handle = api.open(current, directory=True)
-            except OSError as exc:
-                if not create or getattr(exc, "winerror", None) not in (2, 3):
-                    raise
-                api.mkdir(current, security)
-                created = True
-                handle = api.open(current, directory=True)
-            stack.callback(api.kernel.CloseHandle, handle)
-            if created:
-                _assert_private_windows_acl(current, handle=handle)
-        yield api
+    def _windows_parent(path: Path, *, create: bool):
+        api = _Windows()
+        with ExitStack() as stack, api.security(directory=True) as security:
+            current = Path(path.anchor)
+            for part in (None, *path.parent.parts[1:]):
+                if part is not None:
+                    current /= part
+                created = False
+                try:
+                    handle = api.open(current, directory=True)
+                except OSError as exc:
+                    if not create or getattr(exc, "winerror", None) not in (2, 3):
+                        raise
+                    api.mkdir(current, security)
+                    created = True
+                    handle = api.open(current, directory=True)
+                stack.callback(api.kernel.CloseHandle, handle)
+                if created:
+                    _assert_private_windows_acl(current, handle=handle)
+            yield api
 
 
 @contextmanager
@@ -222,7 +223,7 @@ def _validate_open_file(path: Path, descriptor: int, *, windows_handle: int | No
 def _open_private(path: Path, *, write: bool):
     with ExitStack() as stack:
         handle = None
-        if os.name == "nt":
+        if sys.platform == "win32":
             import msvcrt
 
             api = stack.enter_context(_windows_parent(path, create=write))
@@ -286,7 +287,7 @@ def create_private_directory(path: Path) -> None:
     succeeded = False
     try:
         path = _absolute_path(path)
-        if os.name == "nt":
+        if sys.platform == "win32":
             with _windows_parent(path, create=False) as api, api.security(directory=True) as security:
                 api.mkdir(path, security)
                 handle = api.open(path, directory=True)

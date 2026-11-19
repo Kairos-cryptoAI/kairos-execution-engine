@@ -10,13 +10,13 @@ never clamped, offset, retimed against a database, or hidden as monotonic UTC.
 from __future__ import annotations
 
 import ctypes
-import os
+import sys
 import time
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from typing import Any
 
-_WINDOWS = os.name == "nt"
+_WINDOWS = sys.platform == "win32"
 _UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _FILETIME_UNIX_EPOCH_TICKS = 116_444_736_000_000_000
 _FILETIME_TICKS_PER_SECOND = 10_000_000
@@ -31,6 +31,8 @@ def _windows_reader() -> Any:
     # Lazy: importing the module does not load a system library or select a
     # deployment clock. A Windows installation without the precise API refuses
     # instead of silently returning the coarser CPython 3.11 datetime clock.
+    if sys.platform != "win32":
+        raise UtcClockError("Windows precise time is unavailable on this platform")
     library = ctypes.WinDLL("kernel32", use_last_error=True)
     reader = library.GetSystemTimePreciseAsFileTime
     reader.argtypes = [ctypes.POINTER(ctypes.c_ulonglong)]

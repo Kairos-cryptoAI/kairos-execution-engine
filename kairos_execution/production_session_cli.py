@@ -59,7 +59,7 @@ _EXIT_REQUEST_MAX_BYTES = 4096
 
 def _open_exit_request(path: Path) -> int:
     """Open without following a final link or waiting for a pipe writer."""
-    if os.name != "nt":
+    if sys.platform != "win32":
         nofollow, nonblock = getattr(os, "O_NOFOLLOW", None), getattr(os, "O_NONBLOCK", None)
         if nofollow is None or nonblock is None:
             raise OSError("the platform cannot safely open an exit request")
