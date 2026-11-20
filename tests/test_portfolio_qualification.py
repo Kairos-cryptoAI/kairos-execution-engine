@@ -317,6 +317,131 @@ async def test_ladder_final_does_not_qualify_missing_full_case(evidence, tmp_pat
     assert api.protection_unavailable_for("BTCUSD")
 
 
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "early_cancel",
+        "late_creation",
+        "unrelated_generation",
+        "uncertain_cancel",
+        "wrong_remaining",
+        "late_observation",
+        "unbound_stop",
+        "wrong_final",
+        "foreign_child",
+        "changed_history",
+    ],
+)
+async def test_retained_bracket_can_be_proved_across_two_fills_from_terminal_lifetimes(
+    evidence, tmp_path, monkeypatch, fault
+):
+    profile, api, manifest, records = evidence
+    spec = manifest["cases"][-1]
+    assert spec["position_side"] == "SELL"
+    version = spec["position_version"]
+    path = tmp_path / "protection-evidence"
+    capture = json.loads((path / (spec["capture_sha256"] + ".json")).read_bytes())
+    r, history = capture["receipt"], capture["terminal_native_orders"]
+    first, second = spec["exits"]
+    stop = r["stop_move"]["to"]
+    final = r["partial_cover_evidence"][first]["remaining_targets"][0]
+
+    def timestamp(seconds):
+        return f"2026-01-01T10:00:0{seconds}Z"
+
+    spec.update(partial_cover_interval="owned-trigger-lifetimes-v1", partial_cover_verified=False)
+    r["partial_cover_verified"] = False
+    for key in ("close_id", "close_qty", "close_reason", "close_side"):
+        del r[key]
+    del r["partial_cover_evidence"][second]
+    cover = r["partial_cover_evidence"][first]
+    cover.update(at=timestamp("1.5"), remaining_targets=[second, final])
+    r["stop_move"]["confirmed_at"] = timestamp("0.5")
+    r["stop_move_request"] = dict(
+        wire_scope="position", old_id=r["stop_move"]["from"], new_id=stop, after=r["stop_move"]["after"]
+    )
+    r.update(standalone_partial_requests={}, standalone_partial_observations={})
+    for key, price, done in [(first, "98", "1.1"), (second, "97", "2.1")]:
+        row = history[key]
+        row.update(createdAt=timestamp("0.1"), updatedAt=timestamp(done), price=price)
+        r["standalone_partial_requests"][key] = dict(
+            id=key,
+            order=spec["entry_order_id"],
+            wire_scope="position",
+            position_id="position",
+            version=version,
+            side="BUY",
+            quantity=row["quantity"],
+            price=price,
+        )
+        r["standalone_partial_observations"][key] = dict(
+            position_id="position", position_version=version, seen_at=timestamp("0.2")
+        )
+    history[stop].update(
+        createdAt=timestamp("0.3"),
+        updatedAt=timestamp("3.1"),
+        triggeredQuantity="0",
+        cancelledReason="Position closed",
+    )
+    history[final].update(
+        createdAt=timestamp("0.1"),
+        updatedAt=timestamp("3.1"),
+        status="done",
+        triggerOrder=None,
+        triggeredQuantity=".7",
+    )
+    spec["exits"][final] = final
+    records[version][-1].update(id=final, type="MARKET", group="take-profit")
+    other_orders = api.order.side_effect
+    details = {row["id"]: {**row, "positionVersions": [version]} for row in records[version]}
+    api.order.side_effect = lambda oid: details.get(oid) or other_orders(oid)
+    if fault == "early_cancel":
+        history[stop]["updatedAt"] = timestamp("1.8")
+    if fault == "late_creation":
+        history[final]["createdAt"] = timestamp("1.2")
+    if fault == "unrelated_generation":
+        details[second]["positionVersions"] = [version + 1]
+    if fault == "uncertain_cancel":
+        history[stop]["cancelledReason"] = ""
+    if fault == "wrong_remaining":
+        cover["remaining"] = ".7"
+    if fault == "late_observation":
+        cover["at"] = timestamp("2.1")
+    if fault == "unbound_stop":
+        cover["stops"] = [r["stop_move"]["from"]]
+    if fault == "wrong_final":
+        history[final]["quantity"] = ".7"
+    if fault == "foreign_child":
+        details[first]["user"] = "another-account"
+    for row in history.values():
+        row.setdefault("cancelledReason", "")
+        row.setdefault("triggerOrder", None)
+        row.setdefault("triggeredQuantity", "0")
+        row.setdefault("createdAt", timestamp("0.1"))
+        row.setdefault("updatedAt", timestamp("0.4"))
+    capture["terminal_native_lifetimes"] = {key: row.copy() for key, row in history.items()}
+    if fault == "changed_history":
+        capture["terminal_native_lifetimes"][stop]["updatedAt"] = timestamp("3.2")
+    r["child_ids"] = {key: row.copy() for key, row in history.items()}
+    other_history = api.target_history.side_effect
+    api.target_history.side_effect = lambda sym, ids: (
+        {key: history[key] for key in ids} if first in ids else other_history(sym, ids)
+    )
+    payload = json.dumps(capture).encode()
+    spec["capture_sha256"] = hashlib.sha256(payload).hexdigest()
+    (path / (spec["capture_sha256"] + ".json")).write_bytes(payload)
+    (tmp_path / "native-protection.json").write_text(json.dumps(manifest))
+    monkeypatch.setattr(checks, "_require_owner_signature", Mock())
+    if fault:
+        with pytest.raises(ValueError):
+            await api.verify_native_protection(profile)
+        assert not api.native_ladder_qualified_for("BTCUSD")
+    else:
+        await api.verify_native_protection(profile)
+        assert api.native_ladder_qualified_for("BTCUSD")
+
+
 async def test_reviewed_uniform_contract_has_its_own_feature_scope(evidence, tmp_path, monkeypatch):
     profile, api, manifest, _ = evidence
     payload = b"reviewed native protecting-order contract"

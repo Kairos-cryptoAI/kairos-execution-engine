@@ -38,6 +38,7 @@ class Case(_Record):
     stop_move: StopMove | None
     closed_clean: Literal[True]
     partial_cover_verified: bool = False
+    partial_cover_interval: Literal["owned-trigger-lifetimes-v1"] | None = None
     exits: dict[str, str]
 
 
@@ -142,7 +143,166 @@ def _check_capture(case: Case, payload: bytes) -> dict:
                     for child in children
                 ):
                     raise ValueError("partial exit lacks its original reducing stop or remaining target")
+    if case.partial_cover_interval:
+        lifetimes = capture.get("terminal_native_lifetimes")
+        if (
+            case.partial_cover_verified
+            or receipt.get("partial_cover_verified") is not False
+            or not receipt["plan"]["ladder"]
+            or not case.stop_move
+            or receipt.get("close_id")
+            or not isinstance(lifetimes, dict)
+            or set(lifetimes) != set(terminal)
+            or any(
+                receipt.get(k)
+                for k in (
+                    "coverage_missing",
+                    "unbound_early_fill",
+                    "native_increased_position",
+                    "move_refused",
+                )
+            )
+        ):
+            raise ValueError("interval proof requires original observations and the bound terminal lifetimes")
+        return {**receipt, "_signed_lifetimes": lifetimes}
     return receipt
+
+
+def _venue_time(value: str) -> datetime:
+    t = datetime.fromisoformat(value)
+    if t.utcoffset() is None:
+        raise ValueError("trigger interval lacks an absolute time")
+    return t
+
+
+async def _verify_cover_interval(
+    api, case: Case, owner: str, receipt: dict, history: dict, amounts: list
+) -> None:
+    """Verify the already-observed stop and take persisted through the second fill until the final take."""
+    if len(amounts) != 4 or len(case.exits) != 3 or not receipt.get("position_id"):
+        raise ValueError("interval requires one owned entry, two partial fills and one final native exit")
+    lifetime_fields = (
+        "id",
+        "instrument",
+        "type",
+        "side",
+        "quantity",
+        "price",
+        "status",
+        "triggerOrder",
+        "triggeredQuantity",
+        "cancelledReason",
+        "createdAt",
+        "updatedAt",
+    )
+    for target, current in history.items():
+        archived = receipt["_signed_lifetimes"][target]
+        if any(key not in archived or archived[key] != current.get(key) for key in lifetime_fields):
+            raise ValueError("signed trigger lifetimes differ from current authenticated history")
+    version, position_id = case.position_version, receipt["position_id"]
+    (entered, _, initial, _), (t1, exit1, qty1, _), (t2, exit2, qty2, _), (t3, final, qty3, _) = amounts
+    if initial != qty1 + qty2 + qty3:
+        raise ValueError("interval residual disagrees with its full native take")
+    trigger_ids = [case.exits[oid] for oid in (exit1, exit2, final)]
+    first_id, second_id, full_id = trigger_ids
+    partials = {first_id, second_id}
+    stop_id = receipt["stop_move"]["to"]
+    stop = history[stop_id]
+    full = history[full_id]
+    if (
+        len(set(trigger_ids) | {stop_id}) != 4
+        or partials != set(receipt["standalone_partial_ids"])
+        or stop["type"] != "stop-loss"
+        or Decimal(str(stop["quantity"])) != 0
+        or stop["status"] != "cancelled"
+        or stop.get("cancelledReason") != "Position closed"
+        or Decimal(str(stop["triggeredQuantity"])) != 0
+        or full["type"] != "take-profit"
+        or Decimal(str(full["quantity"])) != 0
+        or full["status"] != "done"
+        or Decimal(str(full["triggeredQuantity"])) != qty3
+        or any(
+            history[key]["type"] != "take-profit" or Decimal(str(history[key]["quantity"])) != qty
+            for key, qty in ((first_id, qty1), (second_id, qty2))
+        )
+    ):
+        raise ValueError("interval terminal protection does not explain the native reductions")
+    coverage = receipt["partial_cover_evidence"]
+    if set(coverage) != {exit1}:
+        raise ValueError("interval lacks the unique observed remainder before its second native exit")
+    prior = coverage[exit1]
+    witnessed = _venue_time(prior["at"])
+    move_seen = _venue_time(receipt["stop_move"]["confirmed_at"])
+    moved = receipt.get("stop_move_request", {})
+    if (
+        prior["position_id"] != position_id
+        or prior["position_version"] != version
+        or Decimal(str(prior["remaining"])) != initial - qty1
+        or set(prior["stops"]) != {stop_id}
+        or set(prior["remaining_targets"]) != {second_id, full_id}
+        or moved.get("wire_scope") != "position"
+        or moved.get("new_id") != stop_id
+        or moved.get("old_id") != receipt["stop_move"]["from"]
+        or Decimal(str(moved["after"])) != Decimal(str(stop["price"]))
+        or not (
+            _venue_time(stop["createdAt"])
+            <= move_seen
+            < t1
+            < witnessed
+            < t2
+            < t3
+            <= _venue_time(stop["updatedAt"])
+        )
+        or not (_venue_time(full["createdAt"]) <= t1 < t3 <= _venue_time(full["updatedAt"]))
+        or any((_venue_time(order["updatedAt"]) - t3).total_seconds() > 2 for order in (full, stop))
+        or not (
+            entered < t1 <= _venue_time(history[first_id]["updatedAt"]) < witnessed
+            and t2 <= _venue_time(history[second_id]["updatedAt"]) < t3
+        )
+    ):
+        raise ValueError("dual-observed stop and full take do not cover the native fill interval")
+    ticks = [Decimal(str(history[k]["price"])) for k in trigger_ids]
+    if not (
+        ticks[0] < ticks[1] < ticks[2] if case.position_side == "BUY" else ticks[0] > ticks[1] > ticks[2]
+    ):
+        raise ValueError("interval does not contain three distinct ordered take prices")
+    for key in partials:
+        seen = receipt["standalone_partial_observations"][key]
+        request = next(
+            (r for r in receipt["standalone_partial_requests"].values() if r.get("id") == key), None
+        )
+        if (
+            not request
+            or request.get("wire_scope") != "position"
+            or request.get("order") != case.entry_order_id
+            or request["position_id"] != position_id
+            or request["version"] != version
+            or request["side"] != reducing_side(case.position_side)
+            or Decimal(str(request["quantity"])) != Decimal(str(history[key]["quantity"]))
+            or Decimal(str(request["price"])) != Decimal(str(history[key]["price"]))
+            or seen["position_id"] != position_id
+            or seen["position_version"] != version
+            or not (_venue_time(history[key]["createdAt"]) <= _venue_time(seen["seen_at"]) < t1)
+        ):
+            raise ValueError("interval partial target was not previously bound to the same generation")
+    details = await asyncio.gather(*(api.order(oid) for _, oid, _, _ in amounts[1:]))
+    for detail, (when, oid, qty, _) in zip(details, amounts[1:], strict=True):
+        if (
+            not detail
+            or detail.get("id") != oid
+            or detail.get("positionVersions") != [version]
+            or type(detail["positionVersions"][0]) is not int
+            or str(detail.get("user")) != owner
+            or detail.get("instrument") != case.instrument
+            or detail.get("side") != reducing_side(case.position_side)
+            or detail.get("group") != "take-profit"
+            or detail.get("type") != "MARKET"
+            or detail.get("status") != "FILLED"
+            or Decimal(str(detail["quantity"])) != qty
+            or Decimal(str(detail["unFilledQuantity"])) != 0
+            or _venue_time(detail["updatedAt"]) != when
+        ):
+            raise ValueError("interval execution is absent from the exact owned position generation")
 
 
 async def _case_features(api, case: Case, owner: str, receipt: dict) -> set[tuple[str, str]]:
@@ -261,6 +421,9 @@ async def _case_features(api, case: Case, owner: str, receipt: dict) -> set[tupl
     if case.partial_cover_verified:
         if len(observed_partials) < 2:
             raise ValueError("qualified partial ladder requires distinct reducing fills")
+        features.add((case.position_side, "protected-partial"))
+    if case.partial_cover_interval:
+        await _verify_cover_interval(api, case, owner, receipt, history, amounts)
         features.add((case.position_side, "protected-partial"))
     if case.stop_move:
         move = case.stop_move
