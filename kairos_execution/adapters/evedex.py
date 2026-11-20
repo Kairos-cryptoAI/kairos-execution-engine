@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from kairos_core.contracts import AccountSnapshot, ExecutionReport, OrderIntent, PositionSnapshot
 from kairos_core.enums import OrderSide, OrderStatus, OrderType, TimeInForce
@@ -26,8 +26,10 @@ from kairos_core.enums import OrderSide, OrderStatus, OrderType, TimeInForce
 from ..crypto import EIP712_SCHEMAS, Signer, build_domain, to_eth_number
 from ..live_authorization import (
     LiveMutationAuthorization,
+    LiveMutationAuthorizationError,
     require_live_mutation_authorization,
 )
+from ..native_protection import EVEDEX_NATIVE_PROTECTION_UNAVAILABLE, reducing_side
 from ..ratelimit import TokenBucket
 from ..state_machine import (
     client_order_id,
@@ -215,6 +217,11 @@ class EvedexAdapter(ExchangeAdapter):
                 self._live_authorization,
                 operation=operation,
             )
+            if (self.chain_id == 42161 or urlsplit(self.base).hostname == "trading-api.evedex.com") and (
+                operation in {"place_order", "set_protective_stop"}
+                or operation.startswith(("/api/v2/order/", "/api/tpsl/"))
+            ):
+                raise LiveMutationAuthorizationError(EVEDEX_NATIVE_PROTECTION_UNAVAILABLE)
 
     async def fetch_order_history(self) -> EvedexOrderHistoryReadV1:
         """Read complete bounded history for the JWT-bound account; never a release signal."""
@@ -592,9 +599,7 @@ class EvedexAdapter(ExchangeAdapter):
         message = {
             "instrument": instrument,
             "type": "stop-loss",
-            # EVEDEX TpSl.side is the protected position side, not the side of
-            # the market order that will eventually close that position.
-            "side": position_side.value,
+            "side": reducing_side(position_side.value),
             "quantity": 0,
             "price": to_eth_number(stop_price),
             "order": parent_order_id,
@@ -734,8 +739,8 @@ class EvedexAdapter(ExchangeAdapter):
         stop_type = str(record.get("type", "")).casefold().replace("_", "-")
         if stop_type != "stop-loss":
             raise ValueError("EVEDEX reconciled protective stop has the wrong type")
-        if str(record.get("side", "")).upper() != position_side.value:
-            raise ValueError("EVEDEX reconciled protective stop has the wrong position side")
+        if str(record.get("side", "")).upper() != reducing_side(position_side.value):
+            raise ValueError("EVEDEX reconciled protective stop has the wrong exit side")
         status = str(record.get("status", "")).casefold()
         if status not in {"waitorder", "active"}:
             raise ValueError("EVEDEX reconciled protective stop is not in a protective lifecycle state")
@@ -822,7 +827,7 @@ class EvedexAdapter(ExchangeAdapter):
             # The official contract defines zero as a full-position TP/SL.
             # A partial stop must not make the whole position look protected.
             if quantity == 0:
-                stop_by_position.setdefault((instrument, side), stop_id)
+                stop_by_position.setdefault((instrument, reducing_side(side)), stop_id)
         position_snapshots: list[PositionSnapshot] = []
         for position in positions:
             symbol = str(position.get("instrument", ""))

@@ -555,7 +555,7 @@ class ProductionLiveExitRiskPublisher:
                 or effect.client_order_id != expected_client
                 or stored_client not in {None, expected_client}
                 or payload.get("parent_order_id") != trade.entry_client_order_id
-                or payload.get("side") != trade.side
+                or payload.get("side") != ProductionLiveExitRiskPublisher._reducing_side(trade.side)
                 or payload.get("tpsl_type") != expected_tpsl
                 or payload.get("quantity_hex") != float(0).hex()
                 or payload.get("price_hex") != float(expected_price).hex()
@@ -645,9 +645,7 @@ class ProductionLiveExitRiskPublisher:
             client_order_id=message.get("id"),
             operation=binding.request.operation,
             instrument=message["instrument"],
-            side=evidence.exposure.position_side
-            if protective
-            else self._reducing_side(evidence.exposure.position_side),
+            side=self._reducing_side(evidence.exposure.position_side),
             quantity=message["quantity"],
             cash_quantity=None,
             price=None,

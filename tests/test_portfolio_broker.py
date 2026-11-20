@@ -7,13 +7,23 @@ from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal as D
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from kairos_core.contracts import RiskTradeDecisionV1
 
 from kairos_execution import portfolio_broker as portfolio
-from kairos_execution.portfolio_evedex import TRADING, Book, Evedex, Instrument, Position, Rejected, Unknown
+from kairos_execution.native_protection import EVEDEX_NATIVE_PROTECTION_UNAVAILABLE
+from kairos_execution.portfolio_evedex import (
+    TRADING,
+    Book,
+    Evedex,
+    EvedexError,
+    Instrument,
+    Position,
+    Rejected,
+    Unknown,
+)
 from kairos_execution.portfolio_journal import PortfolioJournal
 from kairos_execution.prod_universe import PROD_INSTRUMENTS, PROD_SYMBOL_MAP
 from tests.test_production_lifecycle_binding import _decision
@@ -22,6 +32,9 @@ Account = pytest.importorskip("eth_account").Account
 
 
 class Venue:
+    # Model a venue with independently qualified reducing brackets and replacement stops.
+    native_protection_unavailable: str | None = None
+
     def __init__(self, clock):
         self.clock = clock
         self.records = {}
@@ -33,6 +46,9 @@ class Venue:
         self.cash = D(100)
         self.drop_ack = False
         self.omit_parent = False
+
+    def native_stop_move_qualified_for(self, instrument):
+        return self.native_protection_unavailable is None
 
     async def server_time_ms(self):
         return self.clock()
@@ -118,7 +134,7 @@ class Venue:
             )
         row = {
             **body,
-            "side": "SELL",
+            "side": "SELL" if position.side == "BUY" else "BUY",
             "status": "FILLED",
             "type": "MARKET",
             "unFilledQuantity": "0",
@@ -226,6 +242,62 @@ def runner_trade(s, fill):
     }
 
 
+async def test_unqualified_bracket_blocks_before_reserving_or_dispatching(system):
+    s = system
+    s.v.native_protection_unavailable = EVEDEX_NATIVE_PROTECTION_UNAVAILABLE
+    assert await s.enter() is None
+    assert s.v.leverages == s.v.sent == s.j.active_trades() == []
+    s.store.journal.assert_called_with("entry_skipped", reason=EVEDEX_NATIVE_PROTECTION_UNAVAILABLE)
+
+
+async def test_unqualified_bracket_keeps_owned_close_available_without_rearming(system):
+    s = system
+    trade = runner_trade(s, await s.enter())
+    s.v.native_protection_unavailable = EVEDEX_NATIVE_PROTECTION_UNAVAILABLE
+    # Both parent-linked, full-size native triggers can be active even on a venue
+    # that later executes them in the same direction as the opening order.
+    assert len(s.v.tpsl) == 2
+    assert EVEDEX_NATIVE_PROTECTION_UNAVAILABLE in await s.b.foreign_exposure({"BTCUSD"})
+    assert not await s.b.ensure_stop(trade)
+    s.v.tpsl.clear()
+    assert await s.b.position_open(trade)
+    assert not await s.b.ensure_stop(trade)
+    assert not await s.b.move_stop(trade, D("96"))
+    assert s.v.tpsl == {}
+    original = s.v.held["BTCUSD"]
+    quantity = original.quantity
+    s.v.held["BTCUSD"] = Position("BTCUSD", "BUY", 2 * quantity, D("100.3"))
+    with pytest.raises(portfolio.NeedsOperator, match="differs from the owned entry"):
+        await s.b.position_open(trade)
+    assert D(s.j.trade(s.risk.trade_id)["quantity"]) == quantity
+    s.v.held["BTCUSD"] = original
+    await s.b.close(trade, await s.v.book("BTCUSD"), "OPERATOR_CLOSE")
+    assert s.v.held == {}
+
+
+@pytest.mark.parametrize("side", ["BUY", "SELL"])
+async def test_production_wire_cannot_open_or_send_full_size_native_trigger(side):
+    api = Evedex(Mock())
+    api._request = AsyncMock(return_value={"id": "accepted"})
+    for kind in ("take-profit", "stop-loss"):
+        trigger = {"instrument": "OPUSD", "side": side, "type": kind, "quantity": "0"}
+        for send, body in (
+            (api.post_limit_order, {"side": side, "tpsl": [trigger]}),
+            (api.post_market_order, {"side": side}),
+            (api.post_tpsl, trigger),
+        ):
+            with pytest.raises(EvedexError, match="not qualified"):
+                await send(body)
+    api._request.assert_not_awaited()
+    body = {"instrument": "OPUSD", "quantity": "1"}
+    assert await api.post_close(body) == {"id": "accepted"}
+    api._request.assert_awaited_once_with(
+        "POST", f"{TRADING}/api/v2/position/OPUSD/close", private=True, body=body
+    )
+    await api.cancel_tpsl("OPUSD", "existing")
+    api._request.assert_awaited_with("DELETE", f"{TRADING}/api/tpsl/OPUSD/existing", private=True)
+
+
 @pytest.mark.parametrize("lost_ack", [False, True])
 async def test_partial_gtc_entry_cancel_protect_management_manual_settlement(system, lost_ack):
     s = system
@@ -255,6 +327,52 @@ async def test_owned_operator_close_records_origin_and_is_idempotent(system):
     assert (await s.b.settle(trade))["exit_origin"] == "operator"
     assert (await s.b.settle(trade))["exit_origin"] == "operator"
     assert len([e for e in s.j.effects(s.risk.trade_id) if e["kind"] == "CLOSE"]) == 1
+
+
+@pytest.mark.parametrize("full", [True, False])
+@pytest.mark.parametrize("status", ["CANCELED", "EXPIRED"])
+async def test_exact_terminal_unfilled_exit_allows_a_fresh_attempt(system, monkeypatch, full, status):
+    s = system
+    trade = runner_trade(s, await s.enter())
+    book = await s.v.book("BTCUSD")
+    send = s.v.post_close
+
+    async def cancel_without_fills(body):
+        record = {**body, "status": status, "unFilledQuantity": body["quantity"], "side": "SELL"}
+        s.v.records[body["id"]] = record
+        return record
+
+    monkeypatch.setattr(s.v, "post_close", cancel_without_fills)
+    if full:
+        with pytest.raises(portfolio.CloseUnfilled):
+            await s.b.close(trade, book, "TIMEOUT")
+    else:
+        assert await s.b.partial_close(trade, book, D(".005")) is None
+    size = D(trade["quantity"])
+    assert s.v.held["BTCUSD"].quantity == D(s.j.active_trade("BTCUSD")["quantity"]) == size
+    await s.b.reconcile_start([trade], None)
+    monkeypatch.setattr(s.v, "post_close", send)
+    if full:
+        await s.b.close(trade, book, "TIMEOUT")
+        assert not s.v.held
+    else:
+        assert await s.b.partial_close(trade, book, D(".005"))
+        assert s.v.held["BTCUSD"].quantity == size - D(".005")
+    exits = [e for e in s.j.effects(s.risk.trade_id) if e["kind"] in {"PARTIAL_CLOSE", "CLOSE"}]
+    assert [e["status"] for e in exits] == ["REJECTED", "ACCEPTED"]
+    assert exits[0]["request"]["id"] != exits[1]["request"]["id"]
+
+
+async def test_partial_close_resynchronizes_stale_runner_quantity_before_another_target(system):
+    s = system
+    trade = runner_trade(s, await s.enter())
+    before = trade["quantity"]
+    book = await s.v.book("BTCUSD")
+    assert await s.b.partial_close(trade, book, D(".005"))
+    trade["quantity"] = before  # crash after the journal confirmed this fill
+    assert await s.b.partial_close(trade, book, D(".005")) is None
+    assert D(trade["quantity"]) == s.v.held["BTCUSD"].quantity
+    assert [e["kind"] for e in s.j.effects(s.risk.trade_id)].count("PARTIAL_CLOSE") == 1
 
 
 async def test_refused_size_leverage_foreign_position_or_protection_never_sends(system):
@@ -585,7 +703,12 @@ def position_projection(system, monkeypatch):
         return {**record, "tpslList": []}
 
     async def order_detail(order_id):
-        return {**s.v.records[order_id], "user": "test-account", "positionVersions": [4]}
+        versions = (
+            [5]
+            if config["fault"] == "wrong_close_version" and s.v.records[order_id]["type"] == "MARKET"
+            else [4]
+        )
+        return {**s.v.records[order_id], "user": "test-account", "positionVersions": versions}
 
     async def get(method, url, *, private, params):
         assert method == "GET" and private
@@ -603,7 +726,7 @@ def position_projection(system, monkeypatch):
                     children[0]["price"] = "17"
                 positions.append(
                     dict(
-                        id="position",
+                        id="replacement" if fault == "replacement" else "position",
                         user="foreign" if fault == "account" else "test-account",
                         instrument=pos.instrument,
                         side=pos.side,
@@ -618,7 +741,7 @@ def position_projection(system, monkeypatch):
         if url == f"{TRADING}/api/position/history":
             rows = (
                 [{"instrument": "BTCUSD", "version": 4, "closeAt": "2026-11-19T10:10:00Z"}]
-                if fault == "closed"
+                if fault == "closed" or not s.v.held
                 else []
             )
             # The real filtered history returns count=1 even for nonexistent versions.
@@ -678,6 +801,91 @@ async def test_position_coverage_rechecks_generation_before_reducing_same_price_
     with pytest.raises(portfolio.PositionIdentityError, match="already closed"):
         await s.b.close(trade, await s.v.book("BTCUSD"), "TIMEOUT")
     assert s.v.held and not any(e["kind"] == "CLOSE" for e in s.j.effects(s.risk.trade_id))
+
+
+@pytest.mark.parametrize("side", ["LONG", "SHORT"])
+async def test_two_scale_outs_then_close_only_reduce_the_owned_generation(system, position_projection, side):
+    s = system
+    await s.b.reconcile_start([], None)
+    entry_id, trade_id = "owned-entry", "existing-trade"
+    buy = side == "LONG"
+    stop, take = (D(95), D(105)) if buy else (D(105), D(95))
+    s.j.reserve_entry(
+        trade_id=trade_id,
+        decision_id="decision",
+        symbol="BTCUSD",
+        side=side,
+        quantity=D(".1"),
+        leverage=1,
+        stop=stop,
+        take=take,
+        worst_case_loss=D(".1"),
+        notional=D(10),
+        equity=D(100),
+    )
+    body = {
+        "id": entry_id,
+        "instrument": "BTCUSD",
+        "side": "BUY" if buy else "SELL",
+        "quantity": ".1",
+        "limitPrice": "100",
+        "tpsl": [
+            {"type": k, "side": "SELL" if buy else "BUY", "quantity": "0", "price": str(p)}
+            for k, p in (("stop-loss", stop), ("take-profit", take))
+        ],
+    }
+    effect = s.j.prepare_effect(
+        trade_id=trade_id, kind="ENTRY", operation_key="enter", request={"id": entry_id, "price": "100"}
+    )
+    await s.v.post_limit_order(body)
+    s.j.finish_effect(effect, "ACCEPTED", entry_id)
+    s.j.opened(trade_id, entry_order_id=entry_id, quantity=D(".1"), price=D(100))
+    trade = {
+        "risk_trade_id": trade_id,
+        "risk_decision_id": "decision",
+        "id": entry_id,
+        "symbol": "BTCUSD",
+        "side": side,
+        "quantity": ".1",
+        "stop": str(stop),
+    }
+    book = await s.v.book("BTCUSD")
+    assert await s.b.move_stop(trade, D(99) if buy else D(101))
+    with pytest.raises(ValueError, match="less risk"):
+        await s.b.move_stop(trade, stop)
+    for qty, remaining in ((D(".025"), D(".075")), (D(".035"), D(".04"))):
+        assert await s.b.partial_close(trade, book, qty)
+        assert s.v.held["BTCUSD"].quantity == D(s.j.trade(trade_id)["quantity"]) == remaining
+    await s.b.close(trade, book, "TIMEOUT")
+    assert not s.v.held
+    exits = [e for e in s.j.effects(trade_id) if e["kind"] in {"PARTIAL_CLOSE", "CLOSE"}]
+    assert [e["kind"] for e in exits] == ["PARTIAL_CLOSE", "PARTIAL_CLOSE", "CLOSE"]
+    assert all(e["request"]["position_version"] == 4 for e in exits)
+    assert all(s.v.records[e["venue_id"]]["side"] == ("SELL" if buy else "BUY") for e in exits)
+
+
+@pytest.mark.parametrize("fault", ["wrong_close_version", "replacement"])
+async def test_partial_close_rejects_fill_or_remainder_from_another_generation(
+    system, position_projection, monkeypatch, fault
+):
+    s = system
+    trade = runner_trade(s, await s.enter())
+    original_quantity = D(trade["quantity"])
+    send = s.v.post_close
+
+    async def swap_after_dispatch(body):
+        receipt = await send(body)
+        position_projection["fault"] = fault
+        return receipt
+
+    monkeypatch.setattr(s.v, "post_close", swap_after_dispatch)
+    with pytest.raises(portfolio.NeedsOperator, match="cannot be confirmed"):
+        await s.b.partial_close(trade, await s.v.book("BTCUSD"), D(".005"))
+    assert D(s.j.trade(s.risk.trade_id)["quantity"]) == original_quantity
+    s.b._position_entries.clear()
+    with pytest.raises(portfolio.NeedsOperator, match="cannot be confirmed"):
+        await s.b.reconcile_start([trade], None)
+    assert [e["kind"] for e in s.j.effects(s.risk.trade_id)].count("PARTIAL_CLOSE") == 1
 
 
 @pytest.mark.parametrize(
@@ -783,3 +991,37 @@ async def test_http_refusal_records_safe_reason_without_venue_response(system, m
     row = refused_effect(s.j)
     assert row["reason"] == reason and row["http_status"] == 422
     assert "private-response" not in str(row) and label not in row.values()
+
+
+@pytest.mark.parametrize("reuses_id", [True, False])
+async def test_stop_move_preserves_the_new_live_order_after_exchange_replacement(system, reuses_id):
+    s = system
+    trade = runner_trade(s, await s.enter())
+    old_key = next(key for key, row in s.v.tpsl.items() if row["type"] == "stop-loss")
+    original = s.v.post_tpsl
+
+    async def replace(body):
+        assert "order" in body and body["order"] is None
+        s.v.tpsl.pop(old_key)
+        if not reuses_id:
+            return await original(body)
+        row = {**body, "status": "active", "id": old_key}
+        s.v.tpsl[old_key] = row
+        return row
+
+    s.v.post_tpsl = replace
+    assert await s.b.move_stop(trade, D("97"))
+    active = list(s.v.tpsl.values())
+    assert {r["type"] for r in active} == {"stop-loss", "take-profit"}
+    assert D(next(r["price"] for r in active if r["type"] == "stop-loss")) == D("97")
+
+
+async def test_qualified_initial_bracket_retained_when_stop_move_unproven(system):
+    s = system
+    s.v.native_stop_move_qualified_for = lambda symbol: False
+    trade = runner_trade(s, await s.enter())
+    original = dict(s.v.tpsl)
+    assert await s.b.ensure_stop(trade)
+    assert not await s.b.move_stop(trade, D("97"))
+    assert not await s.b.ensure_stop({**trade, "stop": "97"})
+    assert s.v.tpsl == original and trade["stop"] == "95"

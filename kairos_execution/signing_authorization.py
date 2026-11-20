@@ -519,17 +519,7 @@ class ProductionSigningAuthorizationVerifier:
         if exposure.instrument != message["instrument"]:
             raise ManagedSigningError("exit instrument differs from authoritative exposure")
         exit_side = "SELL" if exposure.position_side == "BUY" else "BUY"
-        # EVEDEX TP/SL identifies the position being protected. It is not an
-        # additive BUY/SELL order: using the close-order side here would protect
-        # the opposite position. A direct close still requires the reducing side.
-        required_side = (
-            exposure.position_side if request.operation == "New take-profit/stop-loss" else exit_side
-        )
-        if risk.side != required_side or (
-            message.get("side") is not None and message["side"] != required_side
-        ):
-            if request.operation == "New take-profit/stop-loss":
-                raise ManagedSigningError("protection side differs from the protected position side")
+        if risk.side != exit_side or (message.get("side") is not None and message["side"] != exit_side):
             raise ManagedSigningError("exit side is not the reducing side for authoritative exposure")
         quantity = message["quantity"]
         # The reviewed EVEDEX TPSL schema uses zero to protect the entire

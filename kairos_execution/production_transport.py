@@ -21,6 +21,7 @@ from typing import Any
 from uuid import uuid4
 
 from .managed_signer import CustodyBindingV1, reviewed_schema_sha256
+from .native_protection import EVEDEX_NATIVE_PROTECTION_UNAVAILABLE
 from .production_dispatch import _canonical_bytes, _sha256, _WireToken
 from .production_readiness import ProductionContextV1
 
@@ -988,16 +989,16 @@ class ProductionEvedexSdkClient:
         expires_at: datetime | None = None,
         wire_token: _WireToken | None = None,
     ) -> dict[str, Any]:
-        _validate_signed_post(method, path, body)
-        deadline_ms = _market_deadline_ms(path, expires_at)
+        operation, _ = _validate_signed_post(method, path, body)
+        if operation == "/api/v2/order/market" and type(wire_token) is not _WireToken:
+            raise ProductionTransportError("market IPC requires one-use wire authorization")
+        if operation != "close":
+            raise ProductionTransportError(EVEDEX_NATIVE_PROTECTION_UNAVAILABLE)
+        _market_deadline_ms(path, expires_at)
         payload: dict[str, Any] = {"method": method, "path": path, "body": body}
-        if deadline_ms is not None:
-            if type(wire_token) is not _WireToken:
-                raise ProductionTransportError("market IPC requires one-use wire authorization")
-            payload["deadline_ms"] = deadline_ms
-        elif wire_token is not None:
+        if wire_token is not None:
             raise ProductionTransportError("market wire token cannot authorize a different operation")
-        return await self._call("send_signed_post", payload, mutation=True, wire_token=wire_token)
+        return await self._call("send_signed_post", payload, mutation=True)
 
     async def cancel_order(self, *, effect_id: str, instrument: str, order_id: str) -> dict[str, Any]:
         ProductionEvedexTransport._validate_cancel(

@@ -47,7 +47,7 @@ async def test_crashed_tpsl_create_is_found_by_parent_and_reconciled_without_sec
                     "id": "venue-stop-1",
                     "instrument": "BTCUSDT",
                     "type": "stop-loss",
-                    "side": "BUY",
+                    "side": "SELL",
                     "quantity": "0",
                     "price": "64000",
                     "status": "active",

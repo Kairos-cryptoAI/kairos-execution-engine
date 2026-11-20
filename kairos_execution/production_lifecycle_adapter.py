@@ -20,6 +20,7 @@ from kairos_persistence import EffectStatus, EffectType
 
 from .adapters.evedex_sidecar import EvedexSidecarAdapter
 from .market_ioc_admission import MARKET_IOC_ENTRY_CONTRACT, MarketIocAdmission
+from .native_protection import reducing_side
 from .production_lifecycle_binding import (
     ProductionLifecycleBindingV1,
     build_production_lifecycle_binding,
@@ -335,7 +336,7 @@ class ManagedProductionLifecycleAdapter:
             or effect.order_role != role
             or quantity != 0
             or price != expected_price
-            or side != OrderSide(trade.side)
+            or side != OrderSide(reducing_side(trade.side))
             or parent_order_id != trade.entry_client_order_id
         ):
             raise ProductionLifecycleRefused("protection call changed the original exit plan/parent")

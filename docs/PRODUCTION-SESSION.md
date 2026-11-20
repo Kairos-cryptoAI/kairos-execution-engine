@@ -1,5 +1,14 @@
 # One automatically armed production trade
 
+Production entry is suspended following a verified EVEDEX full-position take-profit
+that sold into an existing short and increased its size. An active trigger, its
+parent order and a matching position generation established registration but did
+not constrain the direction of the child market order. The production API exposes
+no reduce-only field on this trigger. Requalification requires venue evidence of
+position-reducing execution for both sides, including partial fills and a position
+closed before the trigger fires. Account reads, cancellation and the explicitly
+signed position-close endpoint remain available.
+
 Status: built 2026-11-13/14 for the live runner (`kairos-autotrader`, `executor =
 "execution_engine"`). Code: `kairos_execution/production_session.py`,
 `kairos_execution/production_session_cli.py`, `kairos_execution/production_report.py`.

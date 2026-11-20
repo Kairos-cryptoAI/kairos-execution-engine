@@ -25,6 +25,7 @@ _EFFECT_KINDS = {
     "ENTRY",
     "STOP",
     "TAKE",
+    "PARTIAL_TAKE",
     "CANCEL_STOP",
     "CANCEL_TAKE",
     "CLOSE",
@@ -140,6 +141,14 @@ CREATE TABLE IF NOT EXISTS attached_protection (
 CREATE TABLE IF NOT EXISTS reductions (
     close_order_id TEXT PRIMARY KEY NOT NULL, trade_id TEXT NOT NULL REFERENCES trades(trade_id),
     quantity TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS native_target_plans (
+    trade_id TEXT PRIMARY KEY REFERENCES trades(trade_id), plan TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS native_target_fills (
+    trigger_id TEXT PRIMARY KEY, order_id TEXT NOT NULL UNIQUE,
+    trade_id TEXT NOT NULL REFERENCES native_target_plans(trade_id),
+    quantity TEXT NOT NULL, price TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS pilot (
     singleton INTEGER PRIMARY KEY CHECK(singleton=1), started_at TEXT NOT NULL, baseline TEXT NOT NULL,
@@ -436,6 +445,16 @@ class PortfolioJournal:
                 ).fetchone()
                 if filled:
                     raise PortfolioJournalError("an entry attempt already owns this trade")
+            elif kind in {"CLOSE", "PARTIAL_CLOSE"}:
+                # One exposure backs every pending exit, including exits for another target.
+                unconfirmed = db.execute(
+                    """SELECT 1 FROM effects e LEFT JOIN reductions r ON r.close_order_id=e.venue_id
+                       WHERE e.trade_id=? AND e.kind IN ('CLOSE','PARTIAL_CLOSE')
+                       AND e.status!='REJECTED' AND r.close_order_id IS NULL LIMIT 1""",
+                    (trade_id,),
+                ).fetchone()
+                if unconfirmed:
+                    raise PortfolioJournalError("previous close requires fill and position reconciliation")
             elif db.execute(
                 """SELECT 1 FROM effects WHERE trade_id=? AND kind=?
                                AND status IN ('PREPARED','UNKNOWN')""",
@@ -599,6 +618,82 @@ class PortfolioJournal:
         row = self._connection().execute("SELECT * FROM pilot WHERE singleton=1").fetchone()
         return dict(row) if row else None
 
+    def native_target_plan(self, trade_id: str) -> dict | None:
+        row = (
+            self._connection()
+            .execute("SELECT plan FROM native_target_plans WHERE trade_id=?", (trade_id,))
+            .fetchone()
+        )
+        return json.loads(row[0]) if row else None
+
+    def bind_native_target_plan(self, trade_id: str, plan: dict) -> None:
+        data = _encode_request(plan)
+        with self._write() as db:
+            previous = self.native_target_plan(trade_id)
+            if previous is not None:
+                if previous != plan:
+                    raise PortfolioJournalError("native target plan changed after fill")
+                return
+            item = self.trade(trade_id)
+            if (
+                not item
+                or item["state"] != "OPEN"
+                or plan["entry_order_id"] != item["entry_order_id"]
+                or Decimal(plan["initial_quantity"]) != Decimal(item["quantity"])
+            ):
+                raise PortfolioJournalError("native target plan requires its exact owned fill")
+            db.execute("INSERT INTO native_target_plans VALUES(?,?)", (trade_id, data))
+            self._event(db, "NATIVE_TARGET_PLAN", {"trade_id": trade_id, "plan": plan})
+
+    def native_target_fills(self, trade_id: str) -> dict[str, tuple[str, str, str]]:
+        return {
+            r[0]: (r[1], r[2], r[3])
+            for r in self._connection().execute(
+                "SELECT trigger_id,order_id,quantity,price FROM native_target_fills WHERE trade_id=?",
+                (trade_id,),
+            )
+        }
+
+    def confirm_native_target_fills(
+        self, trade_id: str, confirmed: dict[str, tuple[str, str, str]], remaining: Decimal
+    ) -> None:
+        with self._write() as db:
+            known = self.native_target_fills(trade_id)
+            if any(confirmed.get(trigger) != fill for trigger, fill in known.items()):
+                raise PortfolioJournalError("previously observed native target fill changed")
+            item = self.trade(trade_id)
+            if not item or item["state"] != "OPEN":
+                raise PortfolioJournalError("cannot account a target on an unowned generation")
+            current = Decimal(item["quantity"])
+            effects = {
+                e["venue_id"]: e
+                for e in self.effects(trade_id)
+                if e["kind"] == "PARTIAL_TAKE" and e["status"] == "ACCEPTED"
+            }
+            for trigger, (order, qty, price) in confirmed.items():
+                if trigger in known:
+                    continue
+                if (
+                    trigger not in effects
+                    or Decimal(effects[trigger]["request"]["quantity"]) != Decimal(qty)
+                    or Decimal(qty) <= 0
+                ):
+                    raise PortfolioJournalError("fill lacks a uniquely acknowledged native target")
+                db.execute(
+                    "INSERT INTO native_target_fills VALUES(?,?,?,?,?)",
+                    (trigger, order, trade_id, qty, price),
+                )
+                current -= Decimal(qty)
+                self._event(
+                    db,
+                    "NATIVE_TARGET_FILLED",
+                    {"trade_id": trade_id, "trigger": trigger, "order": order, "quantity": qty},
+                )
+            if current <= 0 or (remaining and current != remaining):
+                raise PortfolioJournalError("native target quantities conflict with the owned remainder")
+            if len(confirmed) != len(known):
+                db.execute("UPDATE trades SET quantity=? WHERE trade_id=?", (str(current), trade_id))
+
     def record_observation(
         self,
         *,
@@ -723,6 +818,36 @@ class PortfolioJournal:
                 (venue_id, _timestamp(), effect_id),
             )
             self._event(db, "EFFECT_RECONCILED", {"effect_id": effect_id, "venue_id": venue_id})
+
+    def close_without_fill(self, effect_id: str, *, order_id: str, venue_status: str) -> None:
+        """Release an exact terminal close attempt whose entire quantity remains unfilled."""
+        if venue_status not in {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}:
+            raise PortfolioJournalError("terminal zero-fill status is required")
+        with self._write() as db:
+            effect = db.execute("SELECT * FROM effects WHERE effect_id=?", (effect_id,)).fetchone()
+            if (
+                not effect
+                or effect["kind"] not in {"CLOSE", "PARTIAL_CLOSE"}
+                or json.loads(effect["request"]).get("id") != order_id
+                or effect["venue_id"] not in {None, order_id}
+                or db.execute("SELECT 1 FROM reductions WHERE close_order_id=?", (order_id,)).fetchone()
+            ):
+                raise PortfolioJournalError("unfilled exit does not match an owned close attempt")
+            if effect["status"] == "REJECTED":
+                return
+            db.execute(
+                "UPDATE effects SET status='REJECTED',venue_id=?,updated_at=? WHERE effect_id=?",
+                (order_id, _timestamp(), effect_id),
+            )
+            self._event(
+                db,
+                "EXIT_TERMINAL_ZERO_FILL",
+                {
+                    "effect_id": effect_id,
+                    "venue_id": order_id,
+                    "venue_status": venue_status,
+                },
+            )
 
     def no_fill(self, trade_id: str, *, entry_order_id: str) -> None:
         """Release a canceled/expired entry only after the broker verified a zero terminal fill."""

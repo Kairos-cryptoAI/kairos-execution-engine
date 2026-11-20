@@ -57,6 +57,7 @@ from .adapters.evedex_sidecar import EvedexSidecarAdapter
 from .canary_admission import CanaryAdmissionRepository, load_expected_scope
 from .config import ExecSettings
 from .lifecycle_scope import LifecycleAdmissionPolicy, PaperDevCanaryPolicy
+from .native_protection import reducing_side
 from .operator_control import PaperOperatorControl
 from .state_machine import client_order_id
 
@@ -1212,7 +1213,7 @@ class _EvedexProtectedExecutionEngine:
             self._validate_tpsl_record(
                 item,
                 venue_symbol=self._lifecycle_scope.symbol_map[trade.symbol],
-                side=trade.side,
+                side=reducing_side(trade.side),
                 tpsl_type=tpsl_type,
                 price=price,
                 parent_order_id=trade.entry_client_order_id,
@@ -1317,7 +1318,7 @@ class _EvedexProtectedExecutionEngine:
             self._validate_tpsl_record(
                 reconciled_stop,
                 venue_symbol=decision.venue_symbol,
-                side=trade.side,
+                side=reducing_side(trade.side),
                 tpsl_type="STOP_LOSS",
                 price=trade.stop_price,
                 parent_order_id=trade.entry_client_order_id,
@@ -1391,7 +1392,7 @@ class _EvedexProtectedExecutionEngine:
             self._validate_tpsl_record(
                 reconciled_target,
                 venue_symbol=decision.venue_symbol,
-                side=trade.side,
+                side=reducing_side(trade.side),
                 tpsl_type="TAKE_PROFIT",
                 price=trade.target_price,
                 parent_order_id=trade.entry_client_order_id,
@@ -1923,7 +1924,7 @@ class _EvedexProtectedExecutionEngine:
             "client_order_id": client_order_id,
             "parent_order_id": trade.entry_client_order_id,
             "venue_symbol": self._lifecycle_scope.symbol_map[trade.symbol],
-            "side": trade.side,
+            "side": reducing_side(trade.side),
             "tpsl_type": tpsl_type,
             "quantity_hex": float(0).hex(),
             "price_hex": float(price).hex(),
@@ -1955,7 +1956,7 @@ class _EvedexProtectedExecutionEngine:
         response = await self.adapter.create_tpsl(
             effect_id=effect_id,
             symbol=trade.symbol,
-            side=OrderSide(trade.side),
+            side=OrderSide(reducing_side(trade.side)),
             tpsl_type=tpsl_type,
             quantity=0,
             price=price,
@@ -2109,6 +2110,9 @@ class _EvedexProtectedExecutionEngine:
             raise PaperExecutionSafetyError("entry effect is absent but the position is non-flat")
         if effect.effect_type in {EffectType.PROTECTIVE_STOP, EffectType.TAKE_PROFIT}:
             request = effect.request_payload
+            trade = await self.trades.get(effect.trade_id) if effect.trade_id else None
+            if not trade or request.get("side") != reducing_side(trade.side):
+                raise PaperExecutionSafetyError("persisted protection lacks the reducing order side")
             record = self._find_tpsl(
                 venue,
                 tpsl_type=str(request["tpsl_type"]),
@@ -2458,7 +2462,7 @@ class _EvedexProtectedExecutionEngine:
                 self._validate_tpsl_record(
                     record,
                     venue_symbol=decision.venue_symbol,
-                    side=trade.side,
+                    side=reducing_side(trade.side),
                     tpsl_type=tpsl_type,
                     price=price,
                     parent_order_id=trade.entry_client_order_id,
@@ -2911,7 +2915,7 @@ class _EvedexProtectedExecutionEngine:
                 self._validate_tpsl_record(
                     geometry_record,
                     venue_symbol=self._lifecycle_scope.symbol_map[trade.symbol],
-                    side=trade.side,
+                    side=reducing_side(trade.side),
                     tpsl_type=tpsl_type,
                     price=price,
                     parent_order_id=trade.entry_client_order_id,
@@ -2956,7 +2960,7 @@ class _EvedexProtectedExecutionEngine:
                 self._validate_tpsl_record(
                     record,
                     venue_symbol=self._lifecycle_scope.symbol_map[trade.symbol],
-                    side=trade.side,
+                    side=reducing_side(trade.side),
                     tpsl_type=tpsl_type,
                     price=price,
                     parent_order_id=trade.entry_client_order_id,
@@ -3091,7 +3095,7 @@ class _EvedexProtectedExecutionEngine:
                 self._validate_tpsl_record(
                     record,
                     venue_symbol=self._lifecycle_scope.symbol_map[trade.symbol],
-                    side=trade.side,
+                    side=reducing_side(trade.side),
                     tpsl_type=tpsl_type,
                     price=price,
                     parent_order_id=trade.entry_client_order_id,
@@ -4140,7 +4144,7 @@ class _EvedexProtectedExecutionEngine:
         if str(record.get("type", "")).casefold().replace("_", "-") != expected_type:
             raise PaperExecutionSafetyError("reconciled TP/SL has the wrong lifecycle role")
         if str(record.get("side", "")).upper() != side.upper():
-            raise PaperExecutionSafetyError("reconciled TP/SL has the wrong position side")
+            raise PaperExecutionSafetyError("reconciled TP/SL has the wrong exit side")
         if not math.isclose(cls._required_nonnegative_number(record, "quantity"), 0.0, abs_tol=1e-12):
             raise PaperExecutionSafetyError("reconciled TP/SL does not protect the full position")
         reconciled_price = cls._positive(record.get("price"), "TP/SL price")

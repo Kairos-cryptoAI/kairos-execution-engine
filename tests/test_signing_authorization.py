@@ -138,7 +138,7 @@ def fixture(
         geometry = {
             "instrument": "BTCUSD",
             "type": "stop-loss",
-            "side": "BUY",
+            "side": "SELL",
             "quantity": 3,
             "price": 9000,
             "order": PARENT_ID,
@@ -365,14 +365,15 @@ def test_protective_exit_is_independent_of_entry_arm_but_bounded_by_exposure():
 
 
 @pytest.mark.parametrize("position_side", ["BUY", "SELL"])
-def test_protection_side_is_the_position_side_not_the_closing_order_side(position_side):
+def test_protection_requires_the_opposing_order_side_for_both_positions(position_side):
     verifier, request, binding, evidence, now = fixture("New take-profit/stop-loss")
     message = json.loads(request.message_json)
-    message["side"] = position_side
+    exit_side = "SELL" if position_side == "BUY" else "BUY"
+    message["side"] = exit_side
     request = request.model_copy(update={"message_json": json.dumps(message)})
     risk = evidence.risk.model_copy(
         update={
-            "side": position_side,
+            "side": exit_side,
             "effect_id": signing_effect_id(
                 request=request, message=message, decision_id=evidence.risk.decision_id
             ),
@@ -383,7 +384,7 @@ def test_protection_side_is_the_position_side_not_the_closing_order_side(positio
     verifier.verify_request_at(request, binding, now=now)
     exposure = exposure.model_copy(update={"position_side": "SELL" if position_side == "BUY" else "BUY"})
     verifier._source.evidence = evidence.model_copy(update={"risk": risk, "exposure": exposure})
-    with pytest.raises(ManagedSigningError, match="protected position side"):
+    with pytest.raises(ManagedSigningError, match="reducing side"):
         verifier.verify_request_at(request, binding, now=now)
 
 
@@ -466,7 +467,7 @@ def test_protective_exit_refuses_wrong_parent_or_wrong_protected_position_side()
         update={"exposure": evidence.exposure.model_copy(update={"position_side": "SELL"})}
     )
     verifier._source.evidence = wrong_side
-    with pytest.raises(ManagedSigningError, match="protected position side"):
+    with pytest.raises(ManagedSigningError, match="reducing side"):
         verifier.verify_request_at(request, binding, now=now)
 
 

@@ -256,7 +256,7 @@ def build_production_lifecycle_binding(
         message = {
             "instrument": instrument,
             "type": "stop-loss" if role == "STOP_LOSS" else "take-profit",
-            "side": position_side,
+            "side": "SELL" if position_side == "BUY" else "BUY",
             # EVEDEX's zero quantity means protect the whole current position.
             "quantity": 0,
             "price": _exact_evedex_integer(

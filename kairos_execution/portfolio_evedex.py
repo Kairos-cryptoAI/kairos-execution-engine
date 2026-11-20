@@ -23,6 +23,8 @@ from typing import Any
 import aiohttp
 
 from .crypto import EIP712_SCHEMAS
+from .native_protection import EVEDEX_NATIVE_PROTECTION_UNAVAILABLE, reducing_side
+from .portfolio_qualification import qualified_instruments
 
 MARKET_DATA = "https://market-data-api.evedex.com"
 EXCHANGE = "https://exchange-api.evedex.com"
@@ -316,12 +318,56 @@ def _complete_rows(value: Any) -> list[dict[str, Any]]:
     return rows
 
 
+def _same_exposure(actual: Position, expected: Position) -> bool:
+    return bool(expected.venue_id and expected.user) and (
+        actual.venue_id,
+        actual.user,
+        actual.instrument,
+        actual.side,
+        actual.quantity,
+        actual.avg_price,
+    ) == (
+        expected.venue_id,
+        expected.user,
+        expected.instrument,
+        expected.side,
+        expected.quantity,
+        expected.avg_price,
+    )
+
+
 class Evedex:
     """Small async client. ``api_key`` is needed only for private calls."""
 
     def __init__(self, session: aiohttp.ClientSession, api_key: str | None = None) -> None:
         self._session = session
         self._api_key = api_key
+        self._qualified_instruments: frozenset[str] = frozenset()
+        self._ladder_instruments: frozenset[str] = frozenset()
+        self._stop_move_instruments: frozenset[str] = frozenset()
+
+    @property
+    def native_protection_unavailable(self) -> str | None:
+        return None if self._qualified_instruments else EVEDEX_NATIVE_PROTECTION_UNAVAILABLE
+
+    def protection_unavailable_for(self, instrument: str) -> str | None:
+        return None if instrument in self._qualified_instruments else EVEDEX_NATIVE_PROTECTION_UNAVAILABLE
+
+    def native_ladder_qualified_for(self, instrument: str) -> bool:
+        return instrument in self._ladder_instruments
+
+    def native_stop_move_qualified_for(self, instrument: str) -> bool:
+        return instrument in self._stop_move_instruments
+
+    async def verify_native_protection(self, profile) -> None:
+        self._qualified_instruments = frozenset()
+        self._ladder_instruments = frozenset()
+        self._stop_move_instruments = frozenset()
+        (
+            self._qualified_instruments,
+            self._ladder_instruments,
+            self._stop_move_instruments,
+        ) = await qualified_instruments(self, profile)
 
     async def _request(
         self,
@@ -538,6 +584,8 @@ class Evedex:
                     for item in attached
                     if isinstance(item, dict)
                     and item.get("type") == "stop-loss"
+                    and item.get("side") == reducing_side(row["side"])
+                    and dec(item.get("quantity")) == 0
                     and item.get("status") in ACTIVE_TPSL
                 ]
                 has_stop = bool(stops)
@@ -561,36 +609,83 @@ class Evedex:
         return _complete_rows(await self._request("GET", f"{TRADING}/api/order/opened", private=True))
 
     async def position_version_closed(self, instrument: str, version: int) -> bool:
-        """Check the actual filtered history rows. EVEDEX's count can include other versions."""
-        page = await self._request(
-            "GET",
-            f"{TRADING}/api/position/history",
-            private=True,
-            params={"instrument": instrument, "version": version, "limit": 2, "offset": 0},
-        )
-        if not isinstance(page, dict) or not isinstance(page.get("list"), list) or page.get("next"):
-            raise EvedexError("position history lacks its filtered list")
-        rows = _rows(page)
-        if rows and (
-            len(rows) != 1
-            or rows[0].get("instrument") != instrument
-            or rows[0].get("version") != version
-            or not rows[0].get("closeAt")
-        ):
-            raise EvedexError("position history returned an ambiguous generation")
-        return bool(rows)
+        """PROD can return all generations for version zero, even when count is one."""
+        params: dict[str, Any] = {"instrument": instrument, "version": version, "limit": 100, "offset": 0}
+        seen: set[int] = set()
+        for _ in range(100):
+            page = await self._request("GET", f"{TRADING}/api/position/history", private=True, params=params)
+            if not isinstance(page, dict) or not isinstance(page.get("list"), list):
+                raise EvedexError("position history lacks its filtered list")
+            rows = _rows(page)
+            for row in rows:
+                number = row.get("version")
+                if (
+                    row.get("instrument") != instrument
+                    or type(number) is not int
+                    or number < 0
+                    or number in seen
+                    or not row.get("closeAt")
+                    or (version != 0 and number != version)
+                ):
+                    raise EvedexError("position history returned an ambiguous generation")
+                seen.add(number)
+            # This endpoint's count describes a different projection from the rows.
+            if len(rows) < params["limit"] and not page.get("next"):
+                return version in seen
+            if not rows:
+                raise EvedexError("position history pagination did not advance")
+            params["offset"] = len(seen)
+            if page.get("next"):
+                params["next"] = page["next"]
+        raise EvedexError("position history exceeded its pagination bound")
 
     async def position_version_orders(self, instrument: str, version: int) -> list[dict[str, Any]]:
-        """A generation with more than one complete page needs manual reconciliation."""
-        page = await self._request(
-            "GET",
-            f"{TRADING}/api/order",
-            private=True,
-            params={"instrument": instrument, "version": version, "limit": 100, "offset": 0},
-        )
-        if not isinstance(page, dict) or type(page.get("count")) is not int:
-            raise EvedexError("position generation order list lacks a count")
-        return _complete_rows(page)
+        """Read the complete, identity-checked generation, including a terminal page with a cursor."""
+        params: dict[str, Any] = {"instrument": instrument, "version": version, "limit": 100, "offset": 0}
+        records: dict[str, dict[str, Any]] = {}
+        for _ in range(100):
+            page = await self._request("GET", f"{TRADING}/api/order", private=True, params=params)
+            if not isinstance(page, dict) or type(page.get("count")) is not int or page["count"] < 0:
+                raise EvedexError("position generation order list lacks a count")
+            rows = _rows(page)
+            for row in rows:
+                key = row.get("id")
+                if (
+                    not isinstance(key, str)
+                    or not key
+                    or key in records
+                    or row.get("instrument") != instrument
+                ):
+                    raise EvedexError(
+                        "position generation order history contains an invalid or repeated order"
+                    )
+                records[key] = row
+            if len(records) == page["count"]:
+                break
+            if not rows or len(records) > page["count"]:
+                raise EvedexError("incomplete position generation order history")
+            params["offset"] = len(records)
+            if page.get("next"):
+                params["next"] = page["next"]
+        else:
+            raise EvedexError("position generation orders exceeded their pagination bound")
+
+        if version == 0:
+            # The summary omits positionVersions. The order detail is authoritative.
+            for key, row in list(records.items()):
+                detail = await self.order(key)
+                if not detail or any(detail.get(k) != row.get(k) for k in ("id", "instrument", "user")):
+                    raise EvedexError("position generation order detail differs from its summary")
+                versions = detail.get("positionVersions")
+                if not isinstance(versions, list) or any(type(v) is not int or v < 0 for v in versions):
+                    raise EvedexError("position generation order detail has invalid versions")
+                if version in versions and versions != [version]:
+                    raise EvedexError("order spans more than one position generation")
+                if version not in versions:
+                    del records[key]
+                else:
+                    records[key] = detail
+        return list(records.values())
 
     async def order(self, order_id: str) -> dict[str, Any] | None:
         try:
@@ -657,26 +752,166 @@ class Evedex:
                 raise EvedexError("TP/SL pagination bound exceeded")
         return list(result.values())
 
+    async def target_history(self, instrument: str, target_ids: set[str]) -> dict[str, dict]:
+        """Find previously acknowledged immutable child IDs across active and terminal statuses."""
+        found: dict[str, dict] = {}
+        seen: set[str] = set()
+        for page in range(100):
+            params = {"instrument": instrument, "limit": TPSL_PAGE, "offset": page * TPSL_PAGE}
+            body = await self._request("GET", f"{TRADING}/api/tpsl", private=True, params=params)
+            rows = _rows(body)
+            for row in rows:
+                key = row.get("id")
+                if not isinstance(key, str) or not key or key in seen or row.get("instrument") != instrument:
+                    raise EvedexError("native target history is ambiguous")
+                seen.add(key)
+                if key in target_ids:
+                    found[key] = row
+            if set(found) == target_ids or len(rows) < TPSL_PAGE:
+                return found
+        raise EvedexError("native target history exceeded its pagination bound")
+
     # ---- signed writes ------------------------------------------------------
 
+    async def protection_for_fill(self, instrument: str, order_id: str) -> dict | None:
+        """Resolve a terminal trigger by its executed order identity on the private history."""
+        seen: set[str] = set()
+        exact = None
+        links = []
+        for offset in range(0, 100 * TPSL_PAGE, TPSL_PAGE):
+            page = await self._request(
+                "GET",
+                f"{TRADING}/api/tpsl",
+                private=True,
+                params={"instrument": instrument, "status": "done", "limit": TPSL_PAGE, "offset": offset},
+            )
+            rows = _rows(page)
+            for row in rows:
+                key = row.get("id")
+                if (
+                    not key
+                    or key in seen
+                    or row.get("instrument") != instrument
+                    or row.get("status") != "done"
+                ):
+                    raise EvedexError("terminal protection history is ambiguous")
+                seen.add(key)
+                if key == order_id:
+                    exact = row
+                elif row.get("triggerOrder") == order_id:
+                    links.append(row)
+            if not page.get("next") and len(rows) < TPSL_PAGE:
+                if type(page.get("count")) is not int or page["count"] != len(seen):
+                    raise EvedexError("terminal protection history is incomplete or duplicated")
+                if exact is not None:
+                    return exact
+                if len(links) > 1:
+                    raise EvedexError("terminal protection link is ambiguous")
+                return links[0] if links else None
+        raise EvedexError("terminal protection history exceeds the pagination bound")
+
     async def post_limit_order(self, body: dict[str, Any]) -> dict[str, Any]:
+        if reason := self.protection_unavailable_for(body.get("instrument", "")):
+            raise EvedexError(reason)
+        side, attached = body.get("side"), body.get("tpsl")
+        if (
+            side not in {"BUY", "SELL"}
+            or not isinstance(attached, list)
+            or len(attached) != 2
+            or any(
+                not isinstance(r, dict) or r.get("side") != reducing_side(side) or dec(r.get("quantity")) != 0
+                for r in attached
+            )
+            or {r.get("type") for r in attached} != {"stop-loss", "take-profit"}
+        ):
+            raise EvedexError("entry lacks the full opposing stop and take")
+        levels = {r["type"]: dec(r["price"]) for r in attached}
+        limit = dec(body["limitPrice"])
+        if not (
+            0 < levels["stop-loss"] < limit < levels["take-profit"]
+            if side == "BUY"
+            else 0 < levels["take-profit"] < limit < levels["stop-loss"]
+        ):
+            raise EvedexError("attached exits conflict with entry geometry")
         return await self._request("POST", f"{TRADING}/api/v2/order/limit", private=True, body=body)
 
     async def cancel_order(self, order_id: str) -> None:
         await self._request("DELETE", f"{TRADING}/api/order/{order_id}", private=True)
 
     async def post_market_order(self, body: dict[str, Any]) -> dict[str, Any]:
-        return await self._request("POST", f"{TRADING}/api/v2/order/market", private=True, body=body)
+        raise EvedexError(EVEDEX_NATIVE_PROTECTION_UNAVAILABLE)
 
     async def post_close(self, body: dict[str, Any]) -> dict[str, Any]:
         return await self._request(
             "POST", f"{TRADING}/api/v2/position/{body['instrument']}/close", private=True, body=body
         )
 
-    async def post_tpsl(self, body: dict[str, Any]) -> dict[str, Any]:
-        return await self._request(
-            "POST", f"{TRADING}/api/tpsl/{body['instrument']}", private=True, body=body
-        )
+    async def post_tpsl(
+        self, body: dict[str, Any], *, expected: Position | None = None, entry_order_id: str | None = None
+    ) -> dict[str, Any]:
+        instrument = body.get("instrument", "")
+        if reason := self.protection_unavailable_for(instrument):
+            raise EvedexError(reason)
+        positions = [pos for pos in await self.positions() if pos.instrument == instrument]
+        if (
+            len(positions) != 1
+            or body.get("side") != reducing_side(positions[0].side)
+            or "order" not in body
+            or body["order"] is not None
+            or expected is None
+            or not _same_exposure(positions[0], expected)
+            or body.get("type") not in {"stop-loss", "take-profit"}
+            or dec(body.get("price")) <= 0
+            or dec(body.get("quantity")) != 0
+        ):
+            raise EvedexError("protective order does not reduce the open position")
+        if body["type"] == "stop-loss" and not self.native_stop_move_qualified_for(instrument):
+            parent = await self.order_with_protections(instrument, entry_order_id) if entry_order_id else None
+            if not (
+                parent
+                and parent.get("id") == entry_order_id
+                and parent.get("instrument") == instrument
+                and parent.get("side") == positions[0].side
+                and any(
+                    row.get("type") == "stop-loss"
+                    and row.get("side") == body["side"]
+                    and dec(row.get("quantity")) == 0
+                    and dec(row.get("price")) == dec(body["price"])
+                    for row in parent.get("tpslList") or ()
+                )
+            ):
+                raise EvedexError("unqualified stop move differs from the owned parent bracket")
+        return await self._request("POST", f"{TRADING}/api/tpsl/{instrument}", private=True, body=body)
+
+    async def post_partial_target(
+        self, body: dict[str, Any], *, expected: Position | None = None
+    ) -> dict[str, Any]:
+        instrument = body.get("instrument", "")
+        if not self.native_ladder_qualified_for(instrument):
+            raise EvedexError("native partial targets have not been qualified for this instrument")
+        positions = [p for p in await self.positions() if p.instrument == instrument]
+        if (
+            len(positions) != 1
+            or body.get("side") != reducing_side(positions[0].side)
+            or "order" not in body
+            or body["order"] is not None
+            or expected is None
+            or not _same_exposure(positions[0], expected)
+            or body.get("type") != "take-profit"
+            or dec(body.get("price")) <= 0
+            or not 0 < dec(body.get("quantity")) < positions[0].quantity
+        ):
+            raise EvedexError("partial target does not reduce the open position")
+        allocated = Decimal(0)
+        for row in await self.active_tpsl(instrument):
+            quantity = dec(row["quantity"])
+            if quantity < 0 or row.get("side") != body["side"]:
+                raise EvedexError("existing trigger conflicts with the position being reduced")
+            if row.get("type") == "take-profit":
+                allocated += quantity
+        if allocated + dec(body["quantity"]) >= positions[0].quantity:
+            raise EvedexError("partial targets would consume the final protected remainder")
+        return await self._request("POST", f"{TRADING}/api/tpsl/{instrument}", private=True, body=body)
 
     async def set_leverage(self, instrument: str, leverage: int) -> None:
         """Change the account's leverage setting for one instrument (an API-key call, not signed)."""

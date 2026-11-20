@@ -5,14 +5,17 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
+import subprocess  # nosec B404 - catches a timeout in detached-owner signature verification
 import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from decimal import Decimal
+from functools import partial
 from typing import Any
 
 from kairos_core.contracts import RiskTradeDecisionV1
 
+from .native_protection import EVEDEX_NATIVE_PROTECTION_UNAVAILABLE, reducing_side
 from .one_canary_account import EvedexCanaryAccountSource
 from .portfolio_evedex import (
     Book,
@@ -30,6 +33,13 @@ from .portfolio_evedex import (
 from .portfolio_journal import PortfolioAdmissionRefused, PortfolioJournal, RefusalReason
 from .portfolio_performance import observe_pilot
 from .portfolio_profile import PortfolioProfile, verify_profile
+from .portfolio_targets import (
+    TargetEvidenceError,
+    partial_target_spec,
+    sized_targets,
+    target_fills,
+    target_matches,
+)
 from .prod_universe import PROD_SYMBOL_MAP
 
 PORTFOLIO_API_VERSION = 1
@@ -39,6 +49,18 @@ TERMINAL = {"FILLED", "CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}
 
 class EntryExpired(EvedexError):
     """This approval no longer authorizes an executable entry."""
+
+
+class CloseUnfilled(EvedexError):
+    """An exact close was canceled, rejected or expired without reducing the position."""
+
+
+class SettlementPending(EvedexError):
+    """The owned close is terminal and flat, but its indexed position history is pending."""
+
+    def __init__(self, symbol: str) -> None:
+        self.symbol = symbol
+        super().__init__(f"waiting for EVEDEX to publish the closed {symbol} position generation")
 
 
 class NeedsOperator(EvedexError):
@@ -95,6 +117,10 @@ def _side(trade: dict) -> str:
     return {"LONG": "BUY", "SHORT": "SELL"}[trade["side"]]
 
 
+def _exit_side(trade: dict) -> str:
+    return reducing_side(_side(trade))
+
+
 def _now() -> int:
     return time.time_ns() // 1_000_000
 
@@ -139,6 +165,22 @@ class PortfolioBroker:
         # Only immutable terminal entry facts are cached. Active children, the live position,
         # generation fills and closure are checked on every use of position-level cover.
         self._position_entries: dict[str, tuple[int, Decimal, Decimal, str]] = {}
+
+    @property
+    def native_protection_unavailable(self) -> str | None:
+        return getattr(self._api, "native_protection_unavailable", EVEDEX_NATIVE_PROTECTION_UNAVAILABLE)
+
+    def protection_unavailable_for(self, instrument: str) -> str | None:
+        check = getattr(self._api, "protection_unavailable_for", None)
+        return check(instrument) if check is not None else self.native_protection_unavailable
+
+    def native_ladder_qualified_for(self, instrument: str) -> bool:
+        check = getattr(self._api, "native_ladder_qualified_for", None)
+        return check is not None and check(instrument) is True
+
+    def native_stop_move_qualified_for(self, instrument: str) -> bool:
+        check = getattr(self._api, "native_stop_move_qualified_for", None)
+        return check is not None and check(instrument) is True
 
     def pilot_status(self) -> dict[str, Any] | None:
         return self._journal.pilot_status()
@@ -217,8 +259,10 @@ class PortfolioBroker:
 
     async def account_reads(self) -> tuple[Decimal, Decimal, list[Position], list[dict[str, Any]]]:
         await self._identity()
-        balance, available = await self._api.balance()
-        return balance, available, await self._api.positions(), await self._api.open_orders()
+        (balance, available), positions, orders = await asyncio.gather(
+            self._api.balance(), self._api.positions(), self._api.open_orders()
+        )
+        return balance, available, positions, orders
 
     async def position(self, instrument: str, max_age: float = 0.0) -> Position | None:
         found = [p for p in await self._api.positions() if p.instrument == instrument]
@@ -246,8 +290,10 @@ class PortfolioBroker:
         parent = row.get("order")
         if parent and parent != item.get("entry_order_id"):
             return False
-        if row.get("side") != _side(item) or dec(row.get("quantity")) != 0:
+        if row.get("side") != _exit_side(item):
             return False
+        if dec(row.get("quantity")) != 0:
+            return any(target_matches(item, e, row) for e in self._journal.effects(item["trade_id"]))
         kind = "STOP" if row["type"] == "stop-loss" else "TAKE"
         price = row_price(row)
         initial_price = dec(item["stop"] if kind == "STOP" else item["take"])
@@ -267,10 +313,18 @@ class PortfolioBroker:
         )
 
     async def _protection_rows(
-        self, item: dict, rows: list[dict[str, Any]] | None = None, position: Position | None = None
+        self,
+        item: dict,
+        rows: list[dict[str, Any]] | None = None,
+        position: Position | None = None,
+        *,
+        clear_waiting: bool = False,
     ) -> list[dict[str, Any]]:
         if rows is None:
             rows = await self._api.active_tpsl(item["symbol"])
+        if clear_waiting and any(r.get("status") == "waitOrder" for r in rows):
+            rows = await self._clear_waiting_requests(item, rows)
+            position = None  # cancellation can change the position's own protection projection
         if all(r.get("order") or self._owned_protection(item, r) for r in rows):
             return rows
         if item.get("entry_order_id") in self._position_entries:
@@ -292,7 +346,7 @@ class PortfolioBroker:
                 and len({r.get("id") for r in rows if isinstance(r.get("id"), str) and r["id"]}) == 2
                 and all(
                     r.get("instrument") == item["symbol"]
-                    and r.get("side") == _side(item)
+                    and r.get("side") == _exit_side(item)
                     and r.get("status") == "active"
                     and dec(r.get("quantity")) == 0
                     and row_price(r) == expected[r["type"]]
@@ -364,7 +418,7 @@ class PortfolioBroker:
             px = dec(item["stop"] if kind == "stop-loss" else item["take"])
             if (
                 child.get("instrument") != item["symbol"]
-                or child.get("side") != _side(item)
+                or child.get("side") != _exit_side(item)
                 or row_price(child) != px
                 or dec(child.get("quantity")) != 0
             ):
@@ -374,7 +428,7 @@ class PortfolioBroker:
                 for r in rows
                 if r.get("id") == child.get("id")
                 and r.get("type") == kind
-                and r.get("side") == _side(item)
+                and r.get("side") == _exit_side(item)
                 and r.get("instrument") == item["symbol"]
                 and row_price(r) == px
                 and dec(r.get("quantity")) == 0
@@ -433,7 +487,7 @@ class PortfolioBroker:
                 and all(
                     r.get("instrument") == item["symbol"]
                     and r.get("type") == kind
-                    and r.get("side") == _side(item)
+                    and r.get("side") == _exit_side(item)
                     and r.get("status") == "active"
                     and r.get("order") in (None, item["entry_order_id"])
                     and not r.get("triggerOrder")
@@ -495,11 +549,31 @@ class PortfolioBroker:
             raise PositionIdentityError("entry position generation is already closed")
         # Prove that only our entry and acknowledged reductions compose this generation.
         # The live position has no version field, and its current economics alone can repeat.
+        reductions = self._owned_reductions(item, effects)
+        self._validate_generation_balance(item, orders, entry, filled, average, reductions, position.quantity)
+        self._position_entries[item["entry_order_id"]] = cached
+
+    def _owned_reductions(self, item: dict, effects: list[dict]) -> dict[str, Decimal]:
         reductions = {
             e["venue_id"]: dec(e["request"]["quantity"])
             for e in effects
             if e["status"] == "ACCEPTED" and e["kind"] == "PARTIAL_CLOSE"
         }
+        reductions.update(
+            {oid: dec(qty) for oid, qty, _ in self._journal.native_target_fills(item["trade_id"]).values()}
+        )
+        return reductions
+
+    def _validate_generation_balance(
+        self,
+        item: dict,
+        orders: list[dict],
+        entry: dict,
+        filled: Decimal,
+        average: Decimal,
+        reductions: dict[str, Decimal],
+        remaining: Decimal,
+    ) -> None:
         expected_fills = {item["entry_order_id"]: filled, **reductions}
         actual_fills = {}
         seen_orders: set[str] = set()
@@ -510,7 +584,7 @@ class PortfolioBroker:
                 or not key
                 or key in seen_orders
                 or order.get("instrument") != item["symbol"]
-                or str(order.get("user", "")) != position.user
+                or str(order.get("user", "")) != self._profile.remote_account_id
             ):
                 raise PositionIdentityError("position generation order list is ambiguous")
             seen_orders.add(key)
@@ -522,17 +596,18 @@ class PortfolioBroker:
                         "generation entry average price conflicts with its exact fill"
                     )
             if key in reductions and (
-                order.get("side") != ("SELL" if _side(item) == "BUY" else "BUY")
-                or str(order.get("status", "")).upper() != "FILLED"
+                order.get("side") != _exit_side(item)
+                or order.get("status") != "FILLED"
+                or dec(order.get("unFilledQuantity")) != 0
+                or dec(order.get("filledAvgPrice")) <= 0
             ):
                 raise PositionIdentityError("generation reduction conflicts with its acknowledged fill")
             if amount != 0:
                 actual_fills[key] = amount
-        if actual_fills != expected_fills or filled - sum(reductions.values()) != position.quantity:
+        if actual_fills != expected_fills or filled - sum(reductions.values()) != remaining:
             raise PositionIdentityError(
                 "position generation contains fills outside the owned entry and reductions"
             )
-        self._position_entries[item["entry_order_id"]] = cached
 
     def _usable_protection(self, item: dict, row: dict) -> bool:
         return (
@@ -543,7 +618,7 @@ class PortfolioBroker:
         return (
             self._usable_protection(item, row)
             and row["type"] == kind
-            and row.get("side") == _side(item)
+            and row.get("side") == _exit_side(item)
             and row_price(row) == price
             and dec(row.get("quantity")) == 0
             and row.get("status") in {"active", "process"}
@@ -570,11 +645,18 @@ class PortfolioBroker:
         issues = []
         if set(tracked) != own or any(t["state"] != "OPEN" for t in tracked.values()):
             issues.append("runner and execution ownership require reconciliation")
-        if self._journal.unresolved_effects():
+        unresolved = self._journal.unresolved_effects()
+        if unresolved:
             issues.append("a venue request has an unresolved outcome")
         seen: set[str] = set()
         for pos in positions:
             item = tracked.get(pos.instrument)
+            if (
+                item
+                and not self._match_position(item, pos)
+                and self._journal.native_target_plan(item["trade_id"])
+            ):
+                await self._reconcile_native_targets(item, pos)
             if not item or pos.instrument in seen or not self._match_position(item, pos):
                 issues.append(f"unowned or mismatched position in {pos.instrument}")
             seen.add(pos.instrument)
@@ -595,9 +677,18 @@ class PortfolioBroker:
             if not item or any(not self._usable_protection(item, r) for r in scope):
                 issues.append("unowned venue protection")
             projected.extend(scope)
-        if check_protected:
+        if check_protected and any(self.protection_unavailable_for(symbol) for symbol in tracked):
+            issues.append(EVEDEX_NATIVE_PROTECTION_UNAVAILABLE)
+        elif check_protected:
             for symbol, item in tracked.items():
                 stop = self._tightest_stop(item)
+                waiting_for_ack = issues == ["a venue request has an unresolved outcome"] and all(
+                    e["trade_id"] == item["trade_id"] and e["kind"] == "CLOSE" for e in unresolved
+                )
+                if symbol not in seen and (not issues or waiting_for_ack) and self._full_close(item):
+                    # Even when the index has just caught up, the runner still owns this slot.
+                    await self._verify_terminal_close(item)
+                    raise SettlementPending(symbol)
                 if (
                     symbol not in seen
                     or not any(
@@ -620,6 +711,19 @@ class PortfolioBroker:
 
     async def reconcile_start(self, trades: list[dict], pending: dict | None) -> None:
         await self._identity()
+        if isinstance(self._api, Evedex):
+            try:
+                await self._api.verify_native_protection(self._profile)
+            except (
+                OSError,
+                ArithmeticError,
+                ValueError,
+                KeyError,
+                TypeError,
+                EvedexError,
+                subprocess.TimeoutExpired,
+            ) as exc:
+                self._store.journal("native_protection_qualification_refused", error=type(exc).__name__)
         # Reconcile old GTC acknowledgements before inspecting runner state. Never place the entry again.
         for item in self._journal.active_trades():
             if item["state"] == "OPEN":
@@ -683,6 +787,9 @@ class PortfolioBroker:
         position = await self._owned_position(item)
         if position:
             await self._close_quantity(item, position, position.quantity, origin="unknown")
+        elif await self._completed_entry_bracket(item, order, filled, dec(item["price"])):
+            # A process exit between recording the entry and its proven native close is recoverable.
+            return
         await self.settle(
             {
                 "id": order_id,
@@ -700,32 +807,231 @@ class PortfolioBroker:
                 continue
             r = effect["request"]
             if dec(item["quantity"]) == dec(r["before"]):
-                await self._confirm_close(item, r["id"], dec(r["before"]), dec(r["quantity"]))
+                try:
+                    await self._confirm_close(item, r["id"], dec(r["before"]), dec(r["quantity"]))
+                except CloseUnfilled:
+                    pass  # This attempt is terminal; the caller will re-read the owned position.
             break
+
+    def _full_close(self, item: dict) -> dict | None:
+        closes = [
+            e
+            for e in self._journal.effects(item["trade_id"])
+            if e["kind"] == "CLOSE" and e["status"] != "REJECTED"
+        ]
+        if len(closes) > 1:
+            raise PositionIdentityError("multiple full closes claim the same generation")
+        return closes[0] if closes else None
+
+    async def reconcile_settlement(self, symbol: str) -> None:
+        """Read-only retry for a previously observed terminal close, including a restart orphan."""
+        async with self._lock:
+            item = self._journal.active_trade(symbol)
+            if not item or item["state"] != "OPEN":
+                raise PositionIdentityError("pending settlement lost its owned journal entry")
+            await self._verify_terminal_close(item)
+
+    async def _verify_terminal_close(self, item: dict) -> None:
+        """Distinguish a lagging history index from an unexplained disappearance of exposure."""
+        symbol, trade_id, entry_id = item["symbol"], item["trade_id"], item["entry_order_id"]
+        effects = self._journal.effects(trade_id)
+        close = self._full_close(item)
+        entries = [
+            e
+            for e in effects
+            if e["kind"] == "ENTRY" and e["status"] == "ACCEPTED" and e["venue_id"] == entry_id
+        ]
+        if not close or len(entries) != 1:
+            raise PositionIdentityError("flat generation lacks a unique owned entry and close")
+        request = close["request"]
+        close_id, version = request["id"], request.get("position_version")
+        quantity = dec(item["quantity"])
+        if (
+            close_id == entry_id
+            or close["venue_id"] not in (None, close_id)
+            or dec(request["before"]) != quantity
+            or dec(request["quantity"]) != quantity
+            or quantity <= 0
+            or any(e["status"] in {"UNKNOWN", "PREPARED"} and e != close for e in effects)
+        ):
+            raise PositionIdentityError("journaled close does not account for the remaining position")
+        reductions = self._owned_reductions(item, effects)
+        if close_id in reductions:
+            raise PositionIdentityError("close order identity conflicts with a recorded reduction")
+        reductions[close_id] = quantity
+        native_fills = self._journal.native_target_fills(trade_id)
+        plan = self._journal.native_target_plan(trade_id)
+        bound = {r["venue_id"] for r in self._journal.attached(trade_id)}
+        bound.update(
+            e["venue_id"]
+            for e in effects
+            if e["kind"] in {"STOP", "TAKE", "PARTIAL_TAKE"} and e["status"] == "ACCEPTED"
+        )
+        if plan:
+            bound.update(plan["full_ids"])
+            if plan["version"] != version or plan["position_id"] != request.get("position_id"):
+                raise PositionIdentityError("close and protection refer to different owned generations")
+
+        async def snapshot():
+            await self._identity()
+            entry, exit_order, positions, resting, active = await asyncio.gather(
+                self._api.order(entry_id),
+                self._api.order(close_id),
+                self._api.positions(),
+                self._api.open_orders(),
+                self._api.active_tpsl(symbol),
+            )
+            if (
+                any(p.instrument == symbol for p in positions)
+                or any(r.get("instrument") == symbol for r in resting)
+                or active
+            ):
+                raise PositionIdentityError("settling instrument has a position or a resting order")
+            if not entry or not exit_order:
+                raise PositionIdentityError("terminal generation lacks its exact entry or close")
+            versions = entry.get("positionVersions")
+            if (
+                not isinstance(versions, list)
+                or len(versions) != 1
+                or type(versions[0]) is not int
+                or versions[0] < 0
+                or (version is not None and versions != [version])
+                or exit_order.get("positionVersions") != versions
+                or type(exit_order["positionVersions"][0]) is not int
+                or any(str(r.get("user", "")) != self._profile.remote_account_id for r in (entry, exit_order))
+                or exit_order.get("id") != close_id
+                or exit_order.get("instrument") != symbol
+                or exit_order.get("side") != _exit_side(item)
+                or exit_order.get("group") != "manually"
+                or exit_order.get("status") != "FILLED"
+                or dec(exit_order["quantity"]) != quantity
+                or dec(exit_order["unFilledQuantity"]) != 0
+                or dec(exit_order["filledAvgPrice"]) <= 0
+            ):
+                raise PositionIdentityError(
+                    "terminal close differs from the journaled account, generation or quantity"
+                )
+            status, filled = self._entry_record(entry, item, entry_id, dec(entries[0]["request"]["price"]))
+            if status not in TERMINAL or dec(entry["filledAvgPrice"]) != dec(item["price"]):
+                raise PositionIdentityError("terminal generation entry conflicts with its original fill")
+            orders = await self._api.position_version_orders(symbol, versions[0])
+            self._validate_generation_balance(
+                item, orders, entries[0], filled, dec(item["price"]), reductions, Decimal(0)
+            )
+            if bound:
+                history = await self._api.target_history(symbol, bound)
+                if set(history) != bound:
+                    raise ProtectionEvidenceError("terminal generation is missing bound protection history")
+                for key, row in history.items():
+                    native = native_fills.get(key)
+                    if (
+                        row.get("id") != key
+                        or row.get("instrument") != symbol
+                        or row.get("side") != _exit_side(item)
+                        or row.get("status") != ("done" if native else "cancelled")
+                        or dec(row.get("triggeredQuantity") or 0) != (dec(native[1]) if native else 0)
+                    ):
+                        raise ProtectionEvidenceError("a bound protection has an unexplained terminal state")
+            return versions[0], dec(exit_order["filledAvgPrice"])
+
+        try:
+            first = await snapshot()
+            second = await snapshot()
+        except (ArithmeticError, KeyError, TypeError, ValueError) as exc:
+            raise PositionIdentityError(
+                "terminal generation has malformed ownership or quantity evidence"
+            ) from exc
+        if first != second:
+            raise PositionIdentityError("terminal generation changed between observations")
+        if not await self._api.position_version_closed(symbol, second[0]):
+            raise SettlementPending(symbol)
 
     async def position_open(self, trade: dict) -> bool:
         await self.refresh_performance()
         async with self._lock:
             item = self._owned(trade, allow_closed=True)
             position = await self._owned_position(item)
+            if self._journal.native_target_plan(item["trade_id"]):
+                trade["native_partial_targets"] = True
+                trade["quantity"] = item["quantity"]
+                trade["native_target_fills"] = list(
+                    self._journal.native_target_fills(item["trade_id"]).values()
+                )
             return bool(position and await self._maintain_protection(item, trade, position))
 
     def _tightest_stop(self, item: dict, runner_stop: Decimal | None = None) -> Decimal:
         prices = [dec(item["stop"])]
         if runner_stop is not None:
             prices.append(runner_stop)
+        effects = self._journal.effects(item["trade_id"])
+        cancelled = {
+            e["request"]["id"] for e in effects if e["kind"] == "CANCEL_STOP" and e["status"] == "ACCEPTED"
+        }
         prices.extend(
             dec(e["request"]["price"])
-            for e in self._journal.effects(item["trade_id"])
-            if e["kind"] == "STOP" and e["status"] == "ACCEPTED"
+            for e in effects
+            if e["kind"] == "STOP" and e["status"] == "ACCEPTED" and e["venue_id"] not in cancelled
         )
         return max(prices) if item["side"] == "LONG" else min(prices)
 
     async def _maintain_protection(self, item: dict, trade: dict, position: Position) -> bool:
+        if self.protection_unavailable_for(item["symbol"]):
+            # The caller already matched this live position. Keep it visible to the software
+            # exits and explicit close path without adding or treating an unsafe trigger as cover.
+            return True
+        rows = await self._protection_rows(item, position=position, clear_waiting=True)
+        scoped = {
+            e["venue_id"]: e["request"]
+            for e in self._journal.effects(item["trade_id"])
+            if e["status"] == "ACCEPTED"
+            and e["request"].get("wire_scope") == "position"
+            and e["request"].get("position_id")
+        }
+        if scoped:
+            fresh = await self._owned_position(item)
+            if fresh is None:
+                return False
+            await self._require_position_generation(item, fresh)
+            version = self._position_entries[item["entry_order_id"]][0]
+            if any(r["position_id"] != fresh.venue_id or r["version"] != version for r in scoped.values()):
+                raise PositionIdentityError("standalone protection belongs to another position generation")
+            for row in rows:
+                if (
+                    row["id"] in scoped
+                    and row.get("status") == "active"
+                    and not any(
+                        child.get("id") == row["id"]
+                        and child.get("status") == "active"
+                        and child.get("type") == row["type"]
+                        and child.get("side") == row["side"]
+                        and row_price(child) == row_price(row)
+                        and dec(child["quantity"]) == dec(row["quantity"])
+                        for child in fresh.protections
+                    )
+                ):
+                    raise ProtectionEvidenceError("standalone protection is absent from the owned position")
         stop = self._tightest_stop(item, dec(trade["stop"]))
-        rows = await self._protection_rows(item, position=position)
         if any(not self._usable_protection(item, r) for r in rows):
             raise NeedsOperator("foreign protection shares a managed instrument")
+        if plan := self._journal.native_target_plan(item["trade_id"]):
+            filled = self._journal.native_target_fills(item["trade_id"])
+            placements = [e for e in self._journal.effects(item["trade_id"]) if e["kind"] == "PARTIAL_TAKE"]
+            planned = {(r["price"], r["quantity"]) for r in plan["levels"]}
+            accepted = {
+                (e["request"]["price"], e["request"]["quantity"])
+                for e in placements
+                if e["status"] == "ACCEPTED"
+            }
+            if len(placements) != len(planned) or planned != accepted:
+                raise ProtectionEvidenceError(
+                    "native target placement stopped before all levels were confirmed"
+                )
+            pending = [e for e in placements if e["venue_id"] not in filled]
+            if any(
+                not any(target_matches(item, e, r) and r.get("status") == "active" for r in rows)
+                for e in pending
+            ):
+                raise ProtectionEvidenceError("a pending native target is missing from the owned position")
         try:
             protected = await self._ensure_price(item, "stop-loss", stop, rows) and await self._ensure_price(
                 item, "take-profit", dec(item["take"]), rows
@@ -878,8 +1184,16 @@ class PortfolioBroker:
         leverage: int = 1,
         *,
         decision: RiskTradeDecisionV1,
+        partial_targets: list[dict] | None = None,
     ) -> dict[str, Any] | None:
         async with self._lock:
+            if reason := self.protection_unavailable_for(candidate.instrument):
+                self._store.journal("entry_skipped", reason=reason)
+                return None
+            if partial_targets and not self.native_ladder_qualified_for(candidate.instrument):
+                self._store.journal("entry_skipped", reason="native partial targets are unqualified")
+                return None
+            target_spec = partial_target_spec(partial_targets, instrument) if partial_targets else None
             active = {t["symbol"] for t in self._journal.active_trades()}
             issues, positions = await self._inspect(active, check_protected=True)
             if issues:
@@ -941,7 +1255,7 @@ class PortfolioBroker:
                 return None
             order_id = new_order_id()
             attached = [
-                {"type": kind, "side": _side(item), "quantity": "0", "price": plain(px)}
+                {"type": kind, "side": _exit_side(item), "quantity": "0", "price": plain(px)}
                 for kind, px in (("stop-loss", stop), ("take-profit", take))
             ]
             body = self._signer.bounded_entry(
@@ -963,6 +1277,8 @@ class PortfolioBroker:
                 "stop": plain(stop),
                 "take": plain(take),
             }
+            if target_spec:
+                request["partial_targets"] = target_spec
             try:
                 await self._effect(
                     item,
@@ -1012,6 +1328,125 @@ class PortfolioBroker:
         ):
             raise NeedsOperator("entry has an inconsistent status or remaining quantity")
         return status, supplied - remaining
+
+    async def _completed_entry_bracket(
+        self, item: dict, record: dict, filled: Decimal, avg: Decimal
+    ) -> dict[str, Any] | None:
+        """An attached full bracket can close the position before the first open-position read."""
+        symbol, order_id = item["symbol"], item["entry_order_id"]
+        versions = record.get("positionVersions")
+        if not (
+            isinstance(versions, list)
+            and len(versions) == 1
+            and type(versions[0]) is int
+            and versions[0] >= 0
+            and str(record.get("user", "")) == self._profile.remote_account_id
+            and avg > 0
+            and hasattr(self._api, "protection_for_fill")
+        ):
+            return None
+        version = versions[0]
+
+        async def observation():
+            if not await self._api.position_version_closed(symbol, version):
+                return None
+            rows, flat, active = await asyncio.gather(
+                self._api.position_version_orders(symbol, version),
+                self._flat_without_resting_order(symbol),
+                self._api.active_tpsl(symbol),
+            )
+            if not flat or active or len(rows) != 2:
+                return None
+            entry = next((r for r in rows if r.get("id") == order_id), None)
+            child = next((r for r in rows if r.get("id") and r["id"] != order_id), None)
+            if not entry or not child or child.get("group") not in {"stop-loss", "take-profit"}:
+                return None
+            if any(
+                str(r.get("user")) != self._profile.remote_account_id or r.get("instrument") != symbol
+                for r in rows
+            ):
+                return None
+            if any(
+                record.get(k) != entry.get(k)
+                for k in ("side", "status", "quantity", "unFilledQuantity", "filledAvgPrice")
+            ):
+                return None
+            detail, trigger = await asyncio.gather(
+                self._api.order(child["id"]),
+                self._api.protection_for_fill(symbol, child["id"]),
+            )
+            if not detail or not trigger:
+                return None
+            kind = child["group"]
+            px = dec(item["stop"] if kind == "stop-loss" else item["take"])
+            if not (
+                detail.get("id") == child["id"]
+                and str(detail.get("user")) == self._profile.remote_account_id
+                and detail.get("instrument") == symbol
+                and detail.get("positionVersions") == [version]
+                and detail.get("side") == _exit_side(item)
+                and detail.get("status") == "FILLED"
+                and detail.get("group") == kind
+                and dec(detail["quantity"]) == filled
+                and dec(detail["unFilledQuantity"]) == 0
+                and dec(detail["filledAvgPrice"]) > 0
+                and all(
+                    detail.get(k) == child.get(k)
+                    for k in ("side", "status", "quantity", "unFilledQuantity", "filledAvgPrice")
+                )
+                and trigger.get("status") == "done"
+                and trigger.get("instrument") == symbol
+                and trigger.get("side") == _exit_side(item)
+                and trigger.get("type") == kind
+                and dec(trigger["price"]) == px
+                and dec(trigger["quantity"]) == 0
+                and dec(trigger["triggeredQuantity"]) == filled
+                and (trigger.get("id") == child["id"] or trigger.get("triggerOrder") == child["id"])
+                and trigger.get("order") in (None, order_id)
+                and trigger.get("triggerOrder") in (None, order_id, child["id"])
+            ):
+                return None
+            if order_id not in (trigger.get("triggerOrder"), trigger.get("order")):
+                parent = await self._api.order_with_protections(symbol, order_id)
+                if not (
+                    parent
+                    and parent.get("id") == order_id
+                    and str(parent.get("user")) == self._profile.remote_account_id
+                    and any(
+                        r.get("id") == trigger["id"]
+                        and r.get("type") == kind
+                        and r.get("side") == _exit_side(item)
+                        and row_price(r) == px
+                        and dec(r["quantity"]) == 0
+                        for r in parent.get("tpslList", [])
+                    )
+                ):
+                    return None
+            return trigger["id"], child["id"], kind, dec(detail["filledAvgPrice"])
+
+        first = await observation()
+        if first is None or first != await observation():
+            return None
+        self._journal.opened(item["trade_id"], entry_order_id=order_id, quantity=filled, price=avg)
+        self._journal.closed(item["trade_id"], exit_origin="system")
+        self._position_entries.pop(order_id, None)
+        self._store.journal(
+            "portfolio_bracket_completed_at_entry",
+            trade_id=item["trade_id"],
+            symbol=symbol,
+            generation=version,
+            exit_trigger_id=first[0],
+            exit_order_id=first[1],
+        )
+        return {
+            "order_id": order_id,
+            "trade_id": item["trade_id"],
+            "price": avg,
+            "quantity": filled,
+            "protected": True,
+            "closed_at_entry": "STOP" if first[2] == "stop-loss" else "TAKE",
+            "exit_price": first[3],
+        }
 
     async def _confirm_entry(self, item: dict, order_id: str, price: Decimal) -> dict[str, Any] | None:
         trade_id, symbol = item["trade_id"], item["symbol"]
@@ -1065,6 +1500,8 @@ class PortfolioBroker:
                 self._journal.no_fill(trade_id, entry_order_id=order_id)
                 return None
             avg = dec(record.get("filledAvgPrice"))
+            if pos is None and (completed := await self._completed_entry_bracket(item, record, filled, avg)):
+                return completed
             if (
                 pos is None
                 or pos.side != _side(item)
@@ -1093,6 +1530,8 @@ class PortfolioBroker:
                 protected = False
                 failure = str(exc)
             except PositionIdentityError:
+                if completed := await self._completed_entry_bracket(item, record, filled, avg):
+                    return completed
                 raise
             except (EvedexError, ValueError, ArithmeticError, RuntimeError):
                 protected = False
@@ -1115,17 +1554,230 @@ class PortfolioBroker:
                     ):
                         self._journal.closed(trade_id, exit_origin="system")
                         self._position_entries.pop(order_id, None)
+                elif completed := await self._completed_entry_bracket(item, record, filled, avg):
+                    return completed
                 raise NeedsOperator(failure)
+            if spec := entry["request"].get("partial_targets"):
+                try:
+                    await self._place_native_targets(item, pos, spec)
+                except (EvedexError, ValueError, ArithmeticError) as exc:
+                    if completed := await self._completed_entry_bracket(item, record, filled, avg):
+                        return completed
+                    raise ProtectionEvidenceError("native partial target plan needs reconciliation") from exc
             return {
                 "quantity": filled,
                 "price": avg,
                 "order_id": order_id,
                 "protected": True,
                 "trade_id": trade_id,
+                "native_partial_targets": bool(entry["request"].get("partial_targets")),
             }
         raise NeedsOperator("entry outcome needs order-specific reconciliation")
 
+    async def _place_native_targets(self, item: dict, position: Position, spec: dict) -> None:
+        # Only the complete fill, with its original full-size stop and final target, can arm levels.
+        if not self.native_ladder_qualified_for(item["symbol"]):
+            raise ProtectionEvidenceError("native partial targets are unqualified")
+        await self._require_position_generation(item, position)
+        version = self._position_entries[item["entry_order_id"]][0]
+        levels = sized_targets(
+            spec, item["side"], position.avg_price, dec(item["stop"]), dec(item["take"]), position.quantity
+        )
+        projection = await self._protection_rows(item, position=position)
+        full_ids = []
+        for kind, col in (("stop-loss", "stop"), ("take-profit", "take")):
+            owned = [r["id"] for r in projection if self._valid_protection(item, r, kind, dec(item[col]))]
+            if len(owned) != 1:
+                raise ProtectionEvidenceError("native target plan requires its unique full-position bracket")
+            full_ids.extend(owned)
+        self._journal.bind_native_target_plan(
+            item["trade_id"],
+            {
+                "entry_order_id": item["entry_order_id"],
+                "position_id": position.venue_id,
+                "version": version,
+                "initial_quantity": plain(position.quantity),
+                "levels": levels,
+                "full_ids": full_ids,
+            },
+        )
+        for level in levels:
+            current = await self.position(item["symbol"])
+            if current is None or current.venue_id != position.venue_id:
+                raise ProtectionEvidenceError("position changed before native target placement")
+            await self._require_position_generation(item, current)
+            body = self._signer.tpsl(
+                instrument=item["symbol"],
+                kind="take-profit",
+                side=_exit_side(item),
+                quantity=dec(level["quantity"]),
+                price=dec(level["price"]),
+            )
+            request = {
+                **level,
+                "order": item["entry_order_id"],
+                "side": _exit_side(item),
+                "version": version,
+                "position_id": position.venue_id,
+                "wire_scope": "position",
+            }
+            await self._effect(
+                item,
+                "PARTIAL_TAKE",
+                level["price"],
+                request,
+                partial(self._api.post_partial_target, body, expected=current)
+                if isinstance(self._api, Evedex)
+                else partial(self._api.post_partial_target, body),
+                returned_id=True,
+            )
+            # Confirm the new ID independently on both the active list and the exact same position.
+            fresh = await self.position(item["symbol"])
+            if fresh is None or fresh.venue_id != position.venue_id or not self._match_position(item, fresh):
+                raise ProtectionEvidenceError("native target position changed before acknowledgement")
+            await self._require_position_generation(item, fresh)
+            rows = await self._protection_rows(item, position=fresh, clear_waiting=True)
+            placements = [e for e in self._journal.effects(item["trade_id"]) if e["kind"] == "PARTIAL_TAKE"]
+            if not all(
+                sum(target_matches(item, e, row) and row.get("status") == "active" for row in records) == 1
+                for e in placements
+                for records in (rows, fresh.protections)
+            ):
+                raise ProtectionEvidenceError("native partial target lacks dual ownership confirmation")
+            if not all(
+                any(self._valid_protection(item, r, kind, dec(item[col])) for r in rows)
+                for kind, col in (("stop-loss", "stop"), ("take-profit", "take"))
+            ):
+                raise ProtectionEvidenceError(
+                    "full-size stop or final target disappeared during scale-out setup"
+                )
+
+    async def _reconcile_native_targets(self, item: dict, position: Position | None) -> None:
+        plan = self._journal.native_target_plan(item["trade_id"])
+        if not plan or item["state"] != "OPEN":
+            return
+        symbol, version = item["symbol"], plan["version"]
+        remaining = position.quantity if position else Decimal(0)
+        if position and (
+            position.venue_id != plan["position_id"]
+            or position.user != self._profile.remote_account_id
+            or position.side != _side(item)
+            or position.avg_price != dec(item["price"])
+        ):
+            raise PositionIdentityError("native targets belong to a different position generation")
+        all_effects = self._journal.effects(item["trade_id"])
+        effects = [e for e in all_effects if e["kind"] == "PARTIAL_TAKE"]
+        cancelled = {
+            e["request"]["id"]
+            for e in all_effects
+            if e["kind"] == "CANCEL_TAKE" and e["status"] == "ACCEPTED"
+        }
+        if any(e["status"] != "ACCEPTED" for e in effects):
+            raise ProtectionEvidenceError("native target request still needs reconciliation")
+        child_ids = {e["venue_id"] for e in effects}
+        if len(child_ids) != len(effects):
+            raise ProtectionEvidenceError("native target IDs are not unique")
+        related_ids = (
+            child_ids
+            | set(plan["full_ids"])
+            | {
+                e["venue_id"]
+                for e in all_effects
+                if e["kind"] in {"STOP", "TAKE"} and e["status"] == "ACCEPTED"
+            }
+        )
+
+        # A confirmed close only reduces ownership once, even when both levels fill between polls.
+        async def snapshot():
+            history, rows, closed = await asyncio.gather(
+                self._api.target_history(symbol, related_ids),
+                self._api.position_version_orders(symbol, version),
+                self._api.position_version_closed(symbol, version),
+            )
+            if position is None and not closed and self._full_close(item):
+                await self._verify_terminal_close(item)
+                closed = True  # The indexed close arrived during the independent observations.
+            if closed != (position is None):
+                raise PositionIdentityError("native target position generation changed")
+            if set(history) != related_ids:
+                raise ProtectionEvidenceError("native trigger history is missing a bound sibling")
+            # Version-list records do not always include positionVersions. Re-read each exact fill.
+            details = await asyncio.gather(*(self._api.order(r["id"]) for r in rows))
+            if any(
+                not d
+                or d["id"] != r["id"]
+                or d.get("positionVersions") != [version]
+                or any(
+                    d.get(k) != r.get(k)
+                    for k in ("instrument", "status", "side", "quantity", "unFilledQuantity")
+                )
+                for d, r in zip(details, rows, strict=True)
+            ):
+                raise PositionIdentityError("native target child lacks an exact generation order")
+            fills = target_fills(
+                item, plan, effects, history, details, self._profile.remote_account_id, remaining, cancelled
+            )
+            triggers = {
+                key: tuple(
+                    row.get(k)
+                    for k in (
+                        "status",
+                        "side",
+                        "price",
+                        "quantity",
+                        "triggerOrder",
+                        "triggeredQuantity",
+                        "updatedAt",
+                    )
+                )
+                for key, row in history.items()
+            }
+            orders = {
+                row["id"]: tuple(
+                    row.get(k)
+                    for k in (
+                        "status",
+                        "side",
+                        "quantity",
+                        "unFilledQuantity",
+                        "filledAvgPrice",
+                        "group",
+                        "updatedAt",
+                    )
+                )
+                for row in details
+            }
+            return fills, triggers, orders
+
+        try:
+            first = await snapshot()
+            second = await snapshot()
+        except (TargetEvidenceError, ValueError, ArithmeticError, KeyError, TypeError) as exc:
+            raise ProtectionEvidenceError("cannot identify the terminal native target fill") from exc
+        fresh = await self.position(symbol)
+        if (
+            first != second
+            or ((fresh is None) != (position is None))
+            or (
+                fresh
+                and (
+                    fresh.venue_id != plan["position_id"]
+                    or fresh.quantity != remaining
+                    or fresh.user != self._profile.remote_account_id
+                    or fresh.side != _side(item)
+                )
+            )
+        ):
+            raise PositionIdentityError("native target ownership changed between observations")
+        self._journal.confirm_native_target_fills(item["trade_id"], second[0], remaining)
+        updated = self._journal.trade(item["trade_id"])
+        if updated is None:
+            raise PositionIdentityError("missing owned journal entry after native fill")
+        item["quantity"] = updated["quantity"]
+
     async def _ensure_entry_protection(self, item: dict, *, position: Position | None = None) -> bool:
+        if self.protection_unavailable_for(item["symbol"]):
+            return False
         # Attached and separately placed protection must refer to the same entry.
         rows = await self._protection_rows(item, position=position)
         if all(self._usable_protection(item, r) for r in rows) and all(
@@ -1140,11 +1792,19 @@ class PortfolioBroker:
     async def _ensure_price(
         self, item: dict, kind: str, price: Decimal, rows: list[dict[str, Any]] | None = None
     ) -> bool:
+        if self.protection_unavailable_for(item["symbol"]):
+            return False
         rows = rows if rows is not None else await self._protection_rows(item)
         if any(not self._usable_protection(item, r) for r in rows):
             raise NeedsOperator("an unowned protection shares this instrument")
         if any(self._valid_protection(item, r, kind, price) for r in rows):
             return True
+        if (
+            kind == "stop-loss"
+            and price != dec(item["stop"])
+            and not self.native_stop_move_qualified_for(item["symbol"])
+        ):
+            return False
         if item["state"] != "OPEN":
             return False  # cancel the GTC remainder and reconcile its terminal fill first
         current = await self._owned_position(item)
@@ -1157,23 +1817,88 @@ class PortfolioBroker:
         ):
             await self._require_position_generation(item, current)
         body = self._signer.tpsl(
-            instrument=item["symbol"], kind=kind, side=_side(item), quantity=Decimal(0), price=price
+            instrument=item["symbol"], kind=kind, side=_exit_side(item), quantity=Decimal(0), price=price
         )
-        body["order"] = item["entry_order_id"]
+        identity = self._position_entries.get(item["entry_order_id"])
+        request = {
+            "order": item["entry_order_id"],
+            "price": plain(price),
+            "side": _exit_side(item),
+            "version": identity[0] if identity else None,
+            "position_id": current.venue_id,
+            "wire_scope": "position",
+        }
         try:
-            await self._effect(
+            response = await self._effect(
                 item,
                 "STOP" if kind == "stop-loss" else "TAKE",
                 plain(price),
-                {"order": item["entry_order_id"], "price": plain(price), "side": _side(item)},
-                lambda: self._api.post_tpsl(body),
+                request,
+                partial(self._api.post_tpsl, body, expected=current, entry_order_id=item["entry_order_id"])
+                if isinstance(self._api, Evedex)
+                else partial(self._api.post_tpsl, body),
                 returned_id=True,
             )
         except Rejected:
             return False
-        return any(
-            self._valid_protection(item, r, kind, price) for r in await self._api.active_tpsl(item["symbol"])
+        fresh, rows = await asyncio.gather(
+            self.position(item["symbol"]), self._api.active_tpsl(item["symbol"])
         )
+        if fresh is None or not self._match_position(item, fresh) or fresh.venue_id != current.venue_id:
+            return False
+        rows = await self._protection_rows(item, rows, fresh, clear_waiting=True)
+        projections = [rows]
+        if identity is not None:
+            await self._require_position_generation(item, fresh)
+            projections.append(list(fresh.protections))
+        return all(
+            sum(
+                r["id"] == response["id"]
+                and r.get("status") == "active"
+                and self._valid_protection(item, r, kind, price)
+                for r in projection
+            )
+            == 1
+            for projection in projections
+        )
+
+    async def _clear_waiting_requests(self, item: dict, rows: list[dict]) -> list[dict]:
+        # Only our individually acknowledged post-fill requests can be stranded waiting for an order.
+        # An entry-attached trigger in waitOrder can still be armed by its unfinished GTC.
+        effects = self._journal.effects(item["trade_id"])
+        placements = {
+            e["venue_id"]: e
+            for e in effects
+            if e["kind"] in {"PARTIAL_TAKE", "STOP", "TAKE"}
+            and e["status"] == "ACCEPTED"
+            and e["request"].get("order") == item["entry_order_id"]
+        }
+        candidates = {
+            r["id"]
+            for r in rows
+            if r.get("status") == "waitOrder"
+            and r.get("id") in placements
+            and self._owned_protection(item, r)
+        }
+        if not candidates:
+            return rows
+        refreshed = await self._api.active_tpsl(item["symbol"])
+        cancelled = {
+            e["request"]["id"]
+            for e in effects
+            if e["kind"] in {"CANCEL_TAKE", "CANCEL_STOP"} and e["status"] == "ACCEPTED"
+        }
+        for row in refreshed:
+            if (
+                row.get("id") in candidates
+                and row.get("status") == "waitOrder"
+                and row["id"] not in cancelled
+            ):
+                await self._cancel_protection(item, row)
+        after = await self._api.active_tpsl(item["symbol"])
+        if any(r.get("id") in candidates and r.get("status") == "waitOrder" for r in after):
+            raise ProtectionEvidenceError("acknowledged waiting protection has not cleared")
+        return after
 
     async def _cancel_protection(self, item: dict, row: dict) -> None:
         if not self._owned_protection(item, row):
@@ -1186,6 +1911,10 @@ class PortfolioBroker:
 
     async def _owned_position(self, item: dict) -> Position | None:
         position = await self.position(item["symbol"])
+        if (
+            position is None or not self._match_position(item, position)
+        ) and self._journal.native_target_plan(item["trade_id"]):
+            await self._reconcile_native_targets(item, position)
         if position and not self._match_position(item, position):
             raise NeedsOperator("position quantity, side or price differs from the owned entry")
         return position
@@ -1206,6 +1935,8 @@ class PortfolioBroker:
             item = self._owned(trade)
             if not await self._owned_position(item):
                 return False
+            if not self.native_stop_move_qualified_for(item["symbol"]):
+                return False
             previous = dec(trade["stop"])
             stops = [
                 r
@@ -1216,22 +1947,49 @@ class PortfolioBroker:
             if not (stop > max(known) if item["side"] == "LONG" else stop < min(known)):
                 raise ValueError("a stop may only move toward less risk")
             if not await self._ensure_price(item, "stop-loss", stop):
+                current = await self._owned_position(item)
+                if current:
+                    await self._maintain_protection(item, trade, current)
+                return False
+            # A full-position replacement can cancel the old stop or reuse its
+            # identity. Cancel only an old level still present after the move.
+            active = {r["id"]: r for r in await self._api.active_tpsl(item["symbol"])}
+            if not any(self._valid_protection(item, r, "stop-loss", stop) for r in active.values()):
                 return False
             for row in stops:
-                if row_price(row) != stop:
-                    await self._cancel_protection(item, row)
+                previous_row = active.get(row["id"])
+                if previous_row is not None and row_price(previous_row) != stop:
+                    await self._cancel_protection(item, previous_row)
             trade["stop"] = str(stop)
             return True
 
     async def _close_quantity(
         self, item: dict, pos: Position, quantity: Decimal, *, origin: str = "system"
     ) -> Decimal:
+        if self._journal.native_target_plan(item["trade_id"]):
+            if quantity != pos.quantity:
+                raise NeedsOperator("native target plan is the sole owner of partial reductions")
+            await self._require_position_generation(item, pos)
+            for row in await self._protection_rows(item, position=pos):
+                if dec(row.get("quantity")) > 0:
+                    await self._cancel_protection(item, row)
+            if any(dec(row.get("quantity")) > 0 for row in await self._api.active_tpsl(item["symbol"])):
+                raise NeedsOperator("native partial targets are still resting before position close")
+            remainder = await self._owned_position(item)
+            if remainder is None:
+                return Decimal(0)
+            pos, quantity = remainder, remainder.quantity
+        identity = {}
         if (
             pos.venue_id is not None
             or pos.user is not None
             or item["entry_order_id"] in self._position_entries
         ):
             await self._require_position_generation(item, pos)
+            identity = {
+                "position_version": self._position_entries[item["entry_order_id"]][0],
+                "position_id": pos.venue_id,
+            }
         full = quantity == pos.quantity
         if not 0 < quantity <= pos.quantity or dec(plain(quantity)) != quantity:
             raise NeedsOperator("close quantity is outside owned exposure")
@@ -1244,12 +2002,13 @@ class PortfolioBroker:
             await self._effect(
                 item,
                 kind,
-                f"{pos.quantity}:{quantity}",
+                order_id,
                 {
                     "id": order_id,
                     "quantity": plain(quantity),
                     "before": plain(pos.quantity),
                     "origin": origin,
+                    **identity,
                 },
                 lambda: self._api.post_close(body),
                 expected_id=order_id,
@@ -1263,56 +2022,135 @@ class PortfolioBroker:
                 raise
         return await self._confirm_close(item, order_id, pos.quantity, quantity)
 
+    async def _close_fill_matches(
+        self, item: dict, effect: dict, order: dict | None, after: Position | None
+    ) -> bool:
+        request = effect["request"]
+        quantity = dec(request["quantity"])
+        remaining = dec(request["before"]) - quantity
+        if not (
+            order
+            and order.get("id") == request["id"]
+            and order.get("instrument") == item["symbol"]
+            and order.get("side") == _exit_side(item)
+            and order.get("status") == "FILLED"
+            and dec(order.get("quantity")) == quantity
+            and dec(order.get("unFilledQuantity")) == 0
+            and dec(order.get("filledAvgPrice")) > 0
+        ):
+            return False
+        if after is None:
+            if remaining != 0:
+                return False
+        elif (
+            remaining <= 0
+            or after.side != _side(item)
+            or after.avg_price != dec(item["price"])
+            or after.quantity != remaining
+        ):
+            return False
+
+        version = request.get("position_version")
+        if version is None:
+            if not isinstance(self._api, Evedex) and "positionVersions" not in order and "user" not in order:
+                return True  # Adapter without exchange position identities.
+            # Recover a close recorded by an older runner using the immutable entry receipt.
+            entry = await self._api.order(item["entry_order_id"])
+            versions = entry.get("positionVersions") if entry else None
+            if not (
+                entry
+                and entry.get("id") == item["entry_order_id"]
+                and entry.get("instrument") == item["symbol"]
+                and str(entry.get("user", "")) == self._profile.remote_account_id
+                and isinstance(versions, list)
+                and len(versions) == 1
+            ):
+                return False
+            version = versions[0]
+        if (
+            type(version) is not int
+            or version < 0
+            or str(order.get("user", "")) != self._profile.remote_account_id
+            or order.get("positionVersions") != [version]
+            or type(order["positionVersions"][0]) is not int
+        ):
+            return False
+        if after is not None and (
+            after.user != self._profile.remote_account_id
+            or (request.get("position_id") is not None and after.venue_id != request["position_id"])
+        ):
+            return False
+        # A matching symbol, average and size can belong to an identical replacement position.
+        closed = await self._api.position_version_closed(item["symbol"], version)
+        if remaining == 0 and not closed:
+            await self._verify_terminal_close(item)
+            return True
+        return closed == (remaining == 0)
+
     async def _confirm_close(self, item: dict, order_id: str, before: Decimal, quantity: Decimal) -> Decimal:
         full = before == quantity
         kind = "CLOSE" if full else "PARTIAL_CLOSE"
+        effect = next(
+            e
+            for e in self._journal.effects(item["trade_id"])
+            if e["kind"] == kind and e["request"]["id"] == order_id
+        )
         for _ in range(15):
-            order = await self._api.order(order_id)
-            after = await self.position(item["symbol"])
+            order, after = await asyncio.gather(self._api.order(order_id), self.position(item["symbol"]))
+            request = effect["request"]
             if (
                 order
+                and order.get("status") in TERMINAL - {"FILLED"}
                 and order.get("id") == order_id
                 and order.get("instrument") == item["symbol"]
-                and order.get("side") == ("SELL" if _side(item) == "BUY" else "BUY")
-                and order.get("status") == "FILLED"
-                and dec(order.get("quantity")) == quantity
-                and dec(order.get("unFilledQuantity")) == 0
-                and dec(order.get("filledAvgPrice")) > 0
+                and order.get("side") == _exit_side(item)
+                and dec(order.get("quantity")) == dec(order.get("unFilledQuantity")) == quantity
+                and after is not None
+                and self._match_position(item, after)
+                and after.quantity == before
+                and after.venue_id == request.get("position_id", after.venue_id)
+                and (after.user is None or after.user == self._profile.remote_account_id)
+                and ("user" not in order or str(order["user"]) == self._profile.remote_account_id)
             ):
-                remaining_matches = (full and after is None) or (
-                    not full
-                    and after
-                    and after.side == _side(item)
-                    and after.avg_price == dec(item["price"])
-                    and after.quantity == before - quantity
+                self._journal.close_without_fill(
+                    effect["effect_id"], order_id=order_id, venue_status=order["status"]
                 )
-                if remaining_matches:
-                    effect = next(
-                        e
-                        for e in self._journal.effects(item["trade_id"])
-                        if e["kind"] == kind and e["request"]["id"] == order_id
-                    )
-                    if effect["status"] in {"UNKNOWN", "PREPARED"}:
-                        self._journal.reconcile_effect(effect["effect_id"], venue_id=order_id)
-                    if not full:
-                        self._journal.reduced(item["trade_id"], close_order_id=order_id, quantity=quantity)
-                    return dec(order["filledAvgPrice"])
+                raise CloseUnfilled("terminal exit had zero filled quantity")
+            if order and await self._close_fill_matches(item, effect, order, after):
+                if effect["status"] in {"UNKNOWN", "PREPARED"}:
+                    self._journal.reconcile_effect(effect["effect_id"], venue_id=order_id)
+                if not full:
+                    self._journal.reduced(item["trade_id"], close_order_id=order_id, quantity=quantity)
+                return dec(order["filledAvgPrice"])
             await asyncio.sleep(self._settle_seconds)
         raise NeedsOperator("close cannot be confirmed against its exact order and position")
 
     async def partial_close(self, trade: dict, book: Book, quantity: Decimal) -> Decimal | None:
         async with self._lock:
             item = self._owned(trade)
+            if self._journal.native_target_plan(item["trade_id"]):
+                raise NeedsOperator("native target plan is the sole owner of partial exits")
+            await self._recover_exit(item)
+            item = self._owned(trade)
             pos = await self._owned_position(item)
+            if pos and trade.get("quantity") is not None and dec(trade["quantity"]) != pos.quantity:
+                trade["quantity"] = plain(pos.quantity)
+                return None  # Recompute the target against the recovered reduction on the next poll.
             if not pos or quantity >= pos.quantity:
                 return None
-            price = await self._close_quantity(item, pos, quantity)
+            try:
+                price = await self._close_quantity(item, pos, quantity)
+            except CloseUnfilled:
+                return None
             trade["quantity"] = plain(pos.quantity - quantity)
             return price
 
     async def close(self, trade: dict, book: Book, reason: str) -> None:
         async with self._lock:
             item = self._owned(trade, allow_closed=True)
+            if item["state"] == "OPEN":
+                await self._recover_exit(item)
+                item = self._owned(trade, allow_closed=True)
             pos = await self._owned_position(item)
             if pos:
                 await self._close_quantity(
@@ -1340,22 +2178,17 @@ class PortfolioBroker:
             if item["state"] != "CLOSED":
                 if not await self._flat_without_resting_order(item["symbol"]):
                     raise NeedsOperator("cannot settle a position or resting order")
+                if self._journal.native_target_plan(item["trade_id"]):
+                    await self._reconcile_native_targets(item, None)
                 await self._remove_leftovers(item)
                 origin = "unknown"
                 for effect in self._journal.effects(item["trade_id"]):
                     if effect["kind"] != "CLOSE" or effect["status"] != "ACCEPTED":
                         continue
                     record = await self._api.order(effect["venue_id"])
-                    if (
-                        record
-                        and record.get("id") == effect["venue_id"]
-                        and record.get("status") == "FILLED"
-                        and record.get("instrument") == item["symbol"]
-                        and record.get("side") == ("SELL" if _side(item) == "BUY" else "BUY")
-                        and dec(record.get("quantity")) == dec(item["quantity"])
-                        and dec(record.get("unFilledQuantity")) == 0
-                    ):
-                        origin = effect["request"].get("origin", "unknown")
+                    if not await self._close_fill_matches(item, effect, record, None):
+                        raise PositionIdentityError("journaled full close conflicts with settlement evidence")
+                    origin = effect["request"].get("origin", "unknown")
                 self._journal.closed(item["trade_id"], exit_origin=origin)
                 settled = self._journal.trade(item["trade_id"])
                 if not settled:

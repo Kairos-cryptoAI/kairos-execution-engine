@@ -35,7 +35,9 @@ from kairos_risk.live import LiveRiskLimitsV1  # type: ignore[import-untyped]
 from pydantic import BaseModel, ConfigDict
 
 from .local_custody import CoincurveTypedDataVerifier, LocalEncryptedKeystoreBackend
+from .native_protection import EVEDEX_NATIVE_PROTECTION_UNAVAILABLE
 from .production_lifecycle import ProductionLifecycleConfigV1
+from .production_observation import PROD_EXCHANGE_ORIGIN
 from .production_owner import OWNER_KEY_FILE, OWNER_POLICY_FILE
 from .production_provisioning import ProvisionedDatabaseV1
 from .production_readiness import OwnerArmKeyV1, ReceiptReferenceV1
@@ -245,8 +247,10 @@ async def run(
     limits = candidate_limits(config.limits, candidate)
     if limits is None:
         return {"outcome": "REFUSED", "trade_id": None, "detail": "adaptive risk allows no entry"}
-    manifest = ProvisionedDatabaseV1.load(config.manifest)
     settings = ProductionLifecycleConfigV1.model_validate_json(config.settings.read_text(encoding="utf-8"))
+    if settings.expected_health.exchange_url == PROD_EXCHANGE_ORIGIN:
+        return {"outcome": "REFUSED", "trade_id": None, "detail": EVEDEX_NATIVE_PROTECTION_UNAVAILABLE}
+    manifest = ProvisionedDatabaseV1.load(config.manifest)
     binding = settings.custody_binding
     references = tuple(
         ReceiptReferenceV1.model_validate_json(json.dumps(item)) for item in _list(config.references)

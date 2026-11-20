@@ -30,6 +30,7 @@ const PROD_PROFILE = Object.freeze({
 });
 
 const HTTP_ORIGINS = new Set([new URL(PROD_PROFILE.exchangeURI).origin, new URL(PROD_PROFILE.authURI).origin]);
+const ENTRY_DISABLED = "EVEDEX native stop-loss/take-profit is not qualified to reduce positions on production";
 export const PROD_HISTORY_OPENAPI_SOURCE = "https://exchange-api.evedex.com/api/openapi.json";
 const FUNDING_TRANSFER_TYPES = new Set([
   "deposit", "withdraw", "faucet", "faucetLiquidity", "realizedPnl", "orderFillFee",
@@ -108,6 +109,13 @@ function validateProdHttpUrl(request) {
   return url;
 }
 
+function validateMarketDeadline(wall, deadlineMs) {
+  if (!Number.isSafeInteger(wall) || !Number.isSafeInteger(deadlineMs) ||
+      deadlineMs <= wall || deadlineMs - wall > 30_000) {
+    throw new Error("market signing deadline is absent, expired, or outside its bound");
+  }
+}
+
 export class PinnedProdRestClient extends RestClient {
   constructor({ adapter, clock = () => Date.now() } = {}) {
     super({});
@@ -123,10 +131,8 @@ export class PinnedProdRestClient extends RestClient {
 
   beginMarketDeadline(body, deadlineMs) {
     const wall = this.clock();
-    if (this.marketDeadline || !Number.isSafeInteger(wall) || !Number.isSafeInteger(deadlineMs) ||
-        deadlineMs <= wall || deadlineMs - wall > 30_000) {
-      throw new Error("market signing deadline is absent, expired, or outside its bound");
-    }
+    if (this.marketDeadline) throw new Error("market deadline already active");
+    validateMarketDeadline(wall, deadlineMs);
     this.marketDeadline = Object.freeze({
       body: JSON.stringify(body, Object.keys(body).sort()),
       deadlineMs, wall, monotonic: performance.now(), remainingMs: deadlineMs - wall,
@@ -258,10 +264,10 @@ export class PinnedProdRestClient extends RestClient {
       // Reserve at the single actual HTTP-send boundary, not at SDK dispatch
       // or authentication. Failed/ambiguous sends are spent, never refunded.
       if (operation === "place_market") this.#assertMarketDeadline(request);
+      if (operation !== "close_position" && operation !== "cancel_order" && operation !== "cancel_tpsl") {
+        throw new Error(ENTRY_DISABLED);
+      }
       this.mutationBudget.reserve(operation);
-    }
-    if (method === "POST" && url.pathname === "/api/v2/order/market") {
-      this.#assertMarketDeadline(request);
     }
     try {
       const response = await axios.request(config);
@@ -356,6 +362,7 @@ function text(value, field) {
 
 function validateBody(path, body) {
   if (!body || typeof body !== "object" || Array.isArray(body)) throw new TypeError("signed body must be an object");
+  if (typeof path !== "string" || path.includes("{")) throw new TypeError("signed operation requires a concrete production route");
   const operation = OPERATIONS.get(path);
   if (!operation) {
     const closeMatch = /^\/api\/v2\/position\/([A-Z0-9]{1,32})\/close$/.exec(path);
@@ -490,16 +497,12 @@ export class EvedexProdSdkGateway {
     if (method !== "POST") throw new TypeError("only exact signed POST operations are supported");
     const validated = validateBody(path, body);
     this.#requirePreflight();
-    if (path !== "/api/v2/order/market") {
-      if (deadline_ms !== undefined) throw new TypeError("market deadline cannot authorize another operation");
-      return validated.operation.call(this.account.exchangeGateway, validated.body);
+    if (path === "/api/v2/order/market") validateMarketDeadline(this.clock(), deadline_ms);
+    if (validated.operation !== OPERATIONS.get("/api/v2/position/{instrument}/close")) {
+      throw new Error(ENTRY_DISABLED);
     }
-    this.httpClient.beginMarketDeadline(validated.body, deadline_ms);
-    try {
-      return await validated.operation.call(this.account.exchangeGateway, validated.body);
-    } finally {
-      this.httpClient.endMarketDeadline();
-    }
+    if (deadline_ms !== undefined) throw new TypeError("market deadline cannot authorize a position close");
+    return validated.operation.call(this.account.exchangeGateway, validated.body);
   }
 
   async cancelOrder({ instrument, orderId }) {

@@ -28,6 +28,27 @@ Account-specific profiles, signatures and execution journals are local runtime f
 The November 2026 pilot admits new entries before 22 November at 21:00 UTC. Existing
 positions remain under management through their exit.
 
+EVEDEX's trading terminal submits SELL protection for a BUY position and BUY
+protection for a SELL position. The earlier adapter followed an SDK example
+that used the entry direction for the children. Those orders increased short
+exposure when triggered. The portfolio broker now submits and reconciles the
+opposing order direction. [EVEDEX trading terminal](https://exchange.evedex.com/)
+and [SDK examples](https://github.com/evedex-official/exchange-bot-sdk).
+
+At startup the broker verifies an optional detached owner signature on
+`native-protection.json` beside the portfolio journal. The signed record binds
+the account, adapter revision and archived probe captures to closed position
+generations on EVEDEX. The broker reads the authenticated order history and
+checks whether stops and targets reduced both long and short positions.
+Initial brackets qualify after all four full exits have been witnessed. Tightening
+a stop requires separate long and short replacement evidence. Resting partial
+targets require two reductions on each side, each with active cover and a
+remaining target. An owner-reviewed venue contract can extend a verified sample to
+the explicitly listed instruments. Store captures under `protection-evidence`
+in the private portfolio directory. Missing or incomplete evidence blocks new
+entries for the affected instruments. Account reads and explicit closes remain
+available. [EVEDEX TP/SL rules](https://docs.evedex.com/key-features-and-components/trading-platform-and-matching-engine/take-profit-and-stop-loss-tp-sl).
+
 ## Service authority modes
 
 - `DRY_RUN` keeps the existing synthetic adapter path unchanged.

@@ -125,6 +125,50 @@ def _signed_tpsl():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("side", ["BUY", "SELL"])
+async def test_native_client_refuses_entry_and_full_position_brackets_but_allows_close(tmp_path, side):
+    client = ProductionEvedexSdkClient(
+        node_executable=tmp_path / "node", api_key_file=tmp_path / "key", expected_account_id="acct"
+    )
+    client._call = AsyncMock(return_value={"id": "close"})
+    tpsl = {**_signed_tpsl(), "side": side, "quantity": "0"}
+    common = {
+        "id": "order",
+        "instrument": "BTCUSD",
+        "leverage": 1,
+        "chainId": 42161,
+        "signature": tpsl["signature"],
+    }
+    blocked = [
+        ("/api/v2/order/limit", {**common, "side": side, "quantity": "1", "limitPrice": "60000"}),
+        ("/api/v2/order/market", {**common, "side": side, "timeInForce": "IOC", "cashQuantity": "10"}),
+        ("/api/tpsl/BTCUSD", tpsl),
+        ("/api/tpsl/BTCUSD", {**tpsl, "type": "take-profit"}),
+    ]
+    for path, body in blocked:
+        deadline = datetime.now(UTC) + timedelta(seconds=2)
+        token = None
+        if path == "/api/v2/order/market":
+            token = _WireToken(
+                seal=_WIRE_SEAL,
+                method="POST",
+                path=path,
+                body_sha256=_sha256(_canonical_bytes(body)),
+                expires_at=deadline,
+            )
+        with pytest.raises(ProductionTransportError, match="not qualified to reduce"):
+            await client.send_signed_post(
+                method="POST", path=path, body=body, wire_token=token, expires_at=deadline if token else None
+            )
+    client._call.assert_not_awaited()
+    close = {**common, "quantity": "1"}
+    assert await client.send_signed_post(method="POST", path="/api/v2/position/BTCUSD/close", body=close) == {
+        "id": "close"
+    }
+    assert client._call.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_preflight_binds_exact_exchange_id_and_enables_typed_sdk_surface_only():
     client = FakeClient()
     transport = ProductionEvedexTransport(context=CONTEXT, custody_binding=BINDING, client=client)
