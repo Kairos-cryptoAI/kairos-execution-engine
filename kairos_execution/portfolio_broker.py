@@ -55,6 +55,14 @@ class CloseUnfilled(EvedexError):
     """An exact close was canceled, rejected or expired without reducing the position."""
 
 
+class SettlementPending(EvedexError):
+    """The owned close is terminal and flat, but its indexed position history is pending."""
+
+    def __init__(self, symbol: str) -> None:
+        self.symbol = symbol
+        super().__init__(f"waiting for EVEDEX to publish the closed {symbol} position generation")
+
+
 class NeedsOperator(EvedexError):
     """Venue facts or local ownership cannot safely authorize the next action."""
 
@@ -541,6 +549,11 @@ class PortfolioBroker:
             raise PositionIdentityError("entry position generation is already closed")
         # Prove that only our entry and acknowledged reductions compose this generation.
         # The live position has no version field, and its current economics alone can repeat.
+        reductions = self._owned_reductions(item, effects)
+        self._validate_generation_balance(item, orders, entry, filled, average, reductions, position.quantity)
+        self._position_entries[item["entry_order_id"]] = cached
+
+    def _owned_reductions(self, item: dict, effects: list[dict]) -> dict[str, Decimal]:
         reductions = {
             e["venue_id"]: dec(e["request"]["quantity"])
             for e in effects
@@ -549,6 +562,18 @@ class PortfolioBroker:
         reductions.update(
             {oid: dec(qty) for oid, qty, _ in self._journal.native_target_fills(item["trade_id"]).values()}
         )
+        return reductions
+
+    def _validate_generation_balance(
+        self,
+        item: dict,
+        orders: list[dict],
+        entry: dict,
+        filled: Decimal,
+        average: Decimal,
+        reductions: dict[str, Decimal],
+        remaining: Decimal,
+    ) -> None:
         expected_fills = {item["entry_order_id"]: filled, **reductions}
         actual_fills = {}
         seen_orders: set[str] = set()
@@ -559,7 +584,7 @@ class PortfolioBroker:
                 or not key
                 or key in seen_orders
                 or order.get("instrument") != item["symbol"]
-                or str(order.get("user", "")) != position.user
+                or str(order.get("user", "")) != self._profile.remote_account_id
             ):
                 raise PositionIdentityError("position generation order list is ambiguous")
             seen_orders.add(key)
@@ -571,16 +596,18 @@ class PortfolioBroker:
                         "generation entry average price conflicts with its exact fill"
                     )
             if key in reductions and (
-                order.get("side") != _exit_side(item) or str(order.get("status", "")).upper() != "FILLED"
+                order.get("side") != _exit_side(item)
+                or order.get("status") != "FILLED"
+                or dec(order.get("unFilledQuantity")) != 0
+                or dec(order.get("filledAvgPrice")) <= 0
             ):
                 raise PositionIdentityError("generation reduction conflicts with its acknowledged fill")
             if amount != 0:
                 actual_fills[key] = amount
-        if actual_fills != expected_fills or filled - sum(reductions.values()) != position.quantity:
+        if actual_fills != expected_fills or filled - sum(reductions.values()) != remaining:
             raise PositionIdentityError(
                 "position generation contains fills outside the owned entry and reductions"
             )
-        self._position_entries[item["entry_order_id"]] = cached
 
     def _usable_protection(self, item: dict, row: dict) -> bool:
         return (
@@ -618,7 +645,8 @@ class PortfolioBroker:
         issues = []
         if set(tracked) != own or any(t["state"] != "OPEN" for t in tracked.values()):
             issues.append("runner and execution ownership require reconciliation")
-        if self._journal.unresolved_effects():
+        unresolved = self._journal.unresolved_effects()
+        if unresolved:
             issues.append("a venue request has an unresolved outcome")
         seen: set[str] = set()
         for pos in positions:
@@ -654,6 +682,13 @@ class PortfolioBroker:
         elif check_protected:
             for symbol, item in tracked.items():
                 stop = self._tightest_stop(item)
+                waiting_for_ack = issues == ["a venue request has an unresolved outcome"] and all(
+                    e["trade_id"] == item["trade_id"] and e["kind"] == "CLOSE" for e in unresolved
+                )
+                if symbol not in seen and (not issues or waiting_for_ack) and self._full_close(item):
+                    # Even when the index has just caught up, the runner still owns this slot.
+                    await self._verify_terminal_close(item)
+                    raise SettlementPending(symbol)
                 if (
                     symbol not in seen
                     or not any(
@@ -777,6 +812,139 @@ class PortfolioBroker:
                 except CloseUnfilled:
                     pass  # This attempt is terminal; the caller will re-read the owned position.
             break
+
+    def _full_close(self, item: dict) -> dict | None:
+        closes = [
+            e
+            for e in self._journal.effects(item["trade_id"])
+            if e["kind"] == "CLOSE" and e["status"] != "REJECTED"
+        ]
+        if len(closes) > 1:
+            raise PositionIdentityError("multiple full closes claim the same generation")
+        return closes[0] if closes else None
+
+    async def reconcile_settlement(self, symbol: str) -> None:
+        """Read-only retry for a previously observed terminal close, including a restart orphan."""
+        async with self._lock:
+            item = self._journal.active_trade(symbol)
+            if not item or item["state"] != "OPEN":
+                raise PositionIdentityError("pending settlement lost its owned journal entry")
+            await self._verify_terminal_close(item)
+
+    async def _verify_terminal_close(self, item: dict) -> None:
+        """Distinguish a lagging history index from an unexplained disappearance of exposure."""
+        symbol, trade_id, entry_id = item["symbol"], item["trade_id"], item["entry_order_id"]
+        effects = self._journal.effects(trade_id)
+        close = self._full_close(item)
+        entries = [
+            e
+            for e in effects
+            if e["kind"] == "ENTRY" and e["status"] == "ACCEPTED" and e["venue_id"] == entry_id
+        ]
+        if not close or len(entries) != 1:
+            raise PositionIdentityError("flat generation lacks a unique owned entry and close")
+        request = close["request"]
+        close_id, version = request["id"], request.get("position_version")
+        quantity = dec(item["quantity"])
+        if (
+            close_id == entry_id
+            or close["venue_id"] not in (None, close_id)
+            or dec(request["before"]) != quantity
+            or dec(request["quantity"]) != quantity
+            or quantity <= 0
+            or any(e["status"] in {"UNKNOWN", "PREPARED"} and e != close for e in effects)
+        ):
+            raise PositionIdentityError("journaled close does not account for the remaining position")
+        reductions = self._owned_reductions(item, effects)
+        if close_id in reductions:
+            raise PositionIdentityError("close order identity conflicts with a recorded reduction")
+        reductions[close_id] = quantity
+        native_fills = self._journal.native_target_fills(trade_id)
+        plan = self._journal.native_target_plan(trade_id)
+        bound = {r["venue_id"] for r in self._journal.attached(trade_id)}
+        bound.update(
+            e["venue_id"]
+            for e in effects
+            if e["kind"] in {"STOP", "TAKE", "PARTIAL_TAKE"} and e["status"] == "ACCEPTED"
+        )
+        if plan:
+            bound.update(plan["full_ids"])
+            if plan["version"] != version or plan["position_id"] != request.get("position_id"):
+                raise PositionIdentityError("close and protection refer to different owned generations")
+
+        async def snapshot():
+            await self._identity()
+            entry, exit_order, positions, resting, active = await asyncio.gather(
+                self._api.order(entry_id),
+                self._api.order(close_id),
+                self._api.positions(),
+                self._api.open_orders(),
+                self._api.active_tpsl(symbol),
+            )
+            if (
+                any(p.instrument == symbol for p in positions)
+                or any(r.get("instrument") == symbol for r in resting)
+                or active
+            ):
+                raise PositionIdentityError("settling instrument has a position or a resting order")
+            if not entry or not exit_order:
+                raise PositionIdentityError("terminal generation lacks its exact entry or close")
+            versions = entry.get("positionVersions")
+            if (
+                not isinstance(versions, list)
+                or len(versions) != 1
+                or type(versions[0]) is not int
+                or versions[0] < 0
+                or (version is not None and versions != [version])
+                or exit_order.get("positionVersions") != versions
+                or type(exit_order["positionVersions"][0]) is not int
+                or any(str(r.get("user", "")) != self._profile.remote_account_id for r in (entry, exit_order))
+                or exit_order.get("id") != close_id
+                or exit_order.get("instrument") != symbol
+                or exit_order.get("side") != _exit_side(item)
+                or exit_order.get("group") != "manually"
+                or exit_order.get("status") != "FILLED"
+                or dec(exit_order["quantity"]) != quantity
+                or dec(exit_order["unFilledQuantity"]) != 0
+                or dec(exit_order["filledAvgPrice"]) <= 0
+            ):
+                raise PositionIdentityError(
+                    "terminal close differs from the journaled account, generation or quantity"
+                )
+            status, filled = self._entry_record(entry, item, entry_id, dec(entries[0]["request"]["price"]))
+            if status not in TERMINAL or dec(entry["filledAvgPrice"]) != dec(item["price"]):
+                raise PositionIdentityError("terminal generation entry conflicts with its original fill")
+            orders = await self._api.position_version_orders(symbol, versions[0])
+            self._validate_generation_balance(
+                item, orders, entries[0], filled, dec(item["price"]), reductions, Decimal(0)
+            )
+            if bound:
+                history = await self._api.target_history(symbol, bound)
+                if set(history) != bound:
+                    raise ProtectionEvidenceError("terminal generation is missing bound protection history")
+                for key, row in history.items():
+                    native = native_fills.get(key)
+                    if (
+                        row.get("id") != key
+                        or row.get("instrument") != symbol
+                        or row.get("side") != _exit_side(item)
+                        or row.get("status") != ("done" if native else "cancelled")
+                        or dec(row.get("triggeredQuantity") or 0) != (dec(native[1]) if native else 0)
+                    ):
+                        raise ProtectionEvidenceError("a bound protection has an unexplained terminal state")
+            return versions[0], dec(exit_order["filledAvgPrice"])
+
+        try:
+            first = await snapshot()
+            second = await snapshot()
+        except (ArithmeticError, KeyError, TypeError, ValueError) as exc:
+            raise PositionIdentityError(
+                "terminal generation has malformed ownership or quantity evidence"
+            ) from exc
+        if first != second:
+            raise PositionIdentityError("terminal generation changed between observations")
+        if not await self._api.position_version_closed(symbol, second[0]):
+            raise SettlementPending(symbol)
 
     async def position_open(self, trade: dict) -> bool:
         await self.refresh_performance()
@@ -1526,6 +1694,9 @@ class PortfolioBroker:
                 self._api.position_version_orders(symbol, version),
                 self._api.position_version_closed(symbol, version),
             )
+            if position is None and not closed and self._full_close(item):
+                await self._verify_terminal_close(item)
+                closed = True  # The indexed close arrived during the independent observations.
             if closed != (position is None):
                 raise PositionIdentityError("native target position generation changed")
             if set(history) != related_ids:
@@ -1910,7 +2081,11 @@ class PortfolioBroker:
         ):
             return False
         # A matching symbol, average and size can belong to an identical replacement position.
-        return await self._api.position_version_closed(item["symbol"], version) == (remaining == 0)
+        closed = await self._api.position_version_closed(item["symbol"], version)
+        if remaining == 0 and not closed:
+            await self._verify_terminal_close(item)
+            return True
+        return closed == (remaining == 0)
 
     async def _confirm_close(self, item: dict, order_id: str, before: Decimal, quantity: Decimal) -> Decimal:
         full = before == quantity
@@ -2011,10 +2186,9 @@ class PortfolioBroker:
                     if effect["kind"] != "CLOSE" or effect["status"] != "ACCEPTED":
                         continue
                     record = await self._api.order(effect["venue_id"])
-                    if dec(effect["request"]["quantity"]) == dec(item["quantity"]) and (
-                        await self._close_fill_matches(item, effect, record, None)
-                    ):
-                        origin = effect["request"].get("origin", "unknown")
+                    if not await self._close_fill_matches(item, effect, record, None):
+                        raise PositionIdentityError("journaled full close conflicts with settlement evidence")
+                    origin = effect["request"].get("origin", "unknown")
                 self._journal.closed(item["trade_id"], exit_origin=origin)
                 settled = self._journal.trade(item["trade_id"])
                 if not settled:
